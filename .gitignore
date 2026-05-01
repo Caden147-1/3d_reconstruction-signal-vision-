@@ -1,0 +1,33 @@
+# Raw capture data
+*.sess/
+*.dat
+*.dat.tmpdownload
+pic/
+
+# Generated outputs
+processed/
+reconstruction_dataset/
+colmap_workspace/
+
+# Local COLMAP binary/package
+colmap-x64-windows-cuda/
+colmap/
+
+# COLMAP reconstruction artifacts
+database.db
+sparse/
+dense/
+stereo/
+*.ply
+*.bin
+
+# Python caches and local environment
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/

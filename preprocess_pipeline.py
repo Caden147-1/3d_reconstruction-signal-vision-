@@ -1,0 +1,1127 @@
+"""Preprocess classroom raw .sess data into WiFi, PDR, and image-ready tables.
+
+The script intentionally uses only the Python standard library so it can run on
+the raw-data folder without dependency setup.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import math
+import statistics
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+from colmap_bridge import prepare_colmap_workspace
+from image_mapping import build_image_wifi_tables
+from reconstruction_export import export_reconstruction_dataset
+
+
+FILL_RSSI = -110
+DEFAULT_BASE_STEP_M = 0.70
+
+
+@dataclass
+class Event:
+    session: str
+    elapsed_ts: int
+    epoch_ts: int
+    event: str
+
+
+@dataclass
+class Segment:
+    session: str
+    segment_id: int
+    start_elapsed_ts: int
+    start_epoch_ts: int
+    end_elapsed_ts: int
+    end_epoch_ts: int
+    start_event: str
+    end_event: str
+
+    @property
+    def duration_s(self) -> float:
+        return (self.end_elapsed_ts - self.start_elapsed_ts) / 1000.0
+
+
+@dataclass
+class SensorSample:
+    elapsed_ts: int
+    epoch_ts: int
+    vals: List[float]
+    acc: Optional[int] = None
+
+
+@dataclass
+class Step:
+    session: str
+    segment_id: int
+    step_index: int
+    elapsed_ts: int
+    epoch_ts: int
+    peak_accel: float
+    accel_range: float
+    step_length_m: float
+    heading_rad: float
+    heading_deg: float
+    pdr_x: float
+    pdr_y: float
+
+
+def normalize_mac(mac: str) -> str:
+    return "".join(ch for ch in mac.upper() if ch.isalnum())
+
+
+def safe_float(value: Any, default: float = math.nan) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def parse_tab_json(path: Path) -> Iterable[Tuple[int, int, Any]]:
+    if not path.exists():
+        return
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        for line_no, line in enumerate(handle, start=1):
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            parts = line.split("\t", 2)
+            if len(parts) != 3:
+                print(f"[warn] skip malformed line {path}:{line_no}")
+                continue
+            try:
+                elapsed_ts = int(parts[0])
+                epoch_ts = int(parts[1])
+                payload = json.loads(parts[2])
+            except (ValueError, json.JSONDecodeError) as exc:
+                print(f"[warn] skip unparsable line {path}:{line_no}: {exc}")
+                continue
+            yield elapsed_ts, epoch_ts, payload
+
+
+def read_events(session_dir: Path) -> List[Event]:
+    rows: List[Event] = []
+    for elapsed_ts, epoch_ts, payload in parse_tab_json(session_dir / "movements.dat"):
+        rows.append(
+            Event(
+                session=session_dir.name,
+                elapsed_ts=elapsed_ts,
+                epoch_ts=epoch_ts,
+                event=str(payload),
+            )
+        )
+    return rows
+
+
+def build_segments(events: Sequence[Event]) -> List[Segment]:
+    segments: List[Segment] = []
+    start: Optional[Event] = None
+    for event in events:
+        if event.event in {"START", "RESTART"}:
+            start = event
+        elif event.event in {"CHECKPOINT_PAUSE", "STOP"} and start is not None:
+            segments.append(
+                Segment(
+                    session=event.session,
+                    segment_id=len(segments) + 1,
+                    start_elapsed_ts=start.elapsed_ts,
+                    start_epoch_ts=start.epoch_ts,
+                    end_elapsed_ts=event.elapsed_ts,
+                    end_epoch_ts=event.epoch_ts,
+                    start_event=start.event,
+                    end_event=event.event,
+                )
+            )
+            start = None
+    return segments
+
+
+def read_sensor(session_dir: Path, system_id: int) -> List[SensorSample]:
+    samples: List[SensorSample] = []
+    path = session_dir / f"{system_id}.dat"
+    for elapsed_ts, epoch_ts, payload in parse_tab_json(path):
+        vals = payload.get("vals", []) if isinstance(payload, dict) else []
+        if not isinstance(vals, list):
+            continue
+        samples.append(
+            SensorSample(
+                elapsed_ts=elapsed_ts,
+                epoch_ts=epoch_ts,
+                vals=[safe_float(v) for v in vals],
+                acc=payload.get("acc") if isinstance(payload, dict) else None,
+            )
+        )
+    return samples
+
+
+def median(values: Sequence[float], default: float = 0.0) -> float:
+    return statistics.median(values) if values else default
+
+
+def pstdev(values: Sequence[float], default: float = 0.0) -> float:
+    return statistics.pstdev(values) if len(values) > 1 else default
+
+
+def moving_average(points: Sequence[Tuple[int, int, float]], radius: int = 2) -> List[Tuple[int, int, float]]:
+    if not points:
+        return []
+    smoothed: List[Tuple[int, int, float]] = []
+    for idx, (elapsed_ts, epoch_ts, _value) in enumerate(points):
+        lo = max(0, idx - radius)
+        hi = min(len(points), idx + radius + 1)
+        avg = sum(item[2] for item in points[lo:hi]) / (hi - lo)
+        smoothed.append((elapsed_ts, epoch_ts, avg))
+    return smoothed
+
+
+def sensor_magnitude(sample: SensorSample) -> Optional[float]:
+    if len(sample.vals) < 3 or any(math.isnan(v) for v in sample.vals[:3]):
+        return None
+    x, y, z = sample.vals[:3]
+    return math.sqrt(x * x + y * y + z * z)
+
+
+def detect_steps_in_segment(
+    linear_accel: Sequence[SensorSample],
+    segment: Segment,
+    min_step_interval_ms: int = 320,
+) -> List[Tuple[int, int, float, float]]:
+    """Return (elapsed_ts, epoch_ts, peak_accel, accel_range) for detected steps."""
+    raw_points: List[Tuple[int, int, float]] = []
+    for sample in linear_accel:
+        if sample.elapsed_ts < segment.start_elapsed_ts or sample.elapsed_ts > segment.end_elapsed_ts:
+            continue
+        mag = sensor_magnitude(sample)
+        if mag is not None:
+            raw_points.append((sample.elapsed_ts, sample.epoch_ts, mag))
+
+    if len(raw_points) < 12:
+        return []
+
+    points = moving_average(raw_points, radius=2)
+    values = [value for _elapsed_ts, _epoch_ts, value in points]
+    med = median(values)
+    deviations = [abs(value - med) for value in values]
+    mad = median(deviations, default=pstdev(values, default=0.1))
+    # Keep the threshold robust: high enough to avoid tiny hand jitter, but still
+    # adaptive for short walks where only a few steps are present.
+    threshold = med + max(0.65, 1.7 * mad)
+
+    candidates: List[Tuple[int, int, float, float]] = []
+    last_step_ts = -10**12
+    for idx in range(1, len(points) - 1):
+        elapsed_ts, epoch_ts, value = points[idx]
+        prev_value = points[idx - 1][2]
+        next_value = points[idx + 1][2]
+        if value < threshold or value < prev_value or value <= next_value:
+            continue
+        if elapsed_ts - last_step_ts < min_step_interval_ms:
+            if candidates and value > candidates[-1][2]:
+                # Replace a weaker peak inside the same step interval.
+                window_values = local_window_values(points, idx, width_ms=350)
+                accel_range = value - min(window_values)
+                candidates[-1] = (elapsed_ts, epoch_ts, value, accel_range)
+                last_step_ts = elapsed_ts
+            continue
+        window_values = local_window_values(points, idx, width_ms=350)
+        accel_range = value - min(window_values)
+        candidates.append((elapsed_ts, epoch_ts, value, accel_range))
+        last_step_ts = elapsed_ts
+
+    return candidates
+
+
+def local_window_values(points: Sequence[Tuple[int, int, float]], center_idx: int, width_ms: int) -> List[float]:
+    center_ts = points[center_idx][0]
+    half_width = width_ms // 2
+    return [
+        value
+        for elapsed_ts, _epoch_ts, value in points
+        if center_ts - half_width <= elapsed_ts <= center_ts + half_width
+    ] or [points[center_idx][2]]
+
+
+def quaternion_to_yaw(vals: Sequence[float]) -> Optional[float]:
+    """Convert Android-style quaternion values [x, y, z, w] to yaw radians."""
+    if len(vals) < 4 or any(math.isnan(v) for v in vals[:4]):
+        return None
+    x, y, z, w = vals[:4]
+    norm = math.sqrt(x * x + y * y + z * z + w * w)
+    if norm == 0:
+        return None
+    x, y, z, w = x / norm, y / norm, z / norm, w / norm
+    siny_cosp = 2.0 * (w * z + x * y)
+    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+    return math.atan2(siny_cosp, cosy_cosp)
+
+
+def read_heading_samples(session_dir: Path) -> List[Tuple[int, int, float]]:
+    # Prefer GameRotationVector (systemId 11). It is magnetometer-free and often
+    # smoother for relative PDR. Fall back to RotationVector (systemId 8).
+    heading_samples: List[Tuple[int, int, float]] = []
+    for system_id in (11, 8):
+        heading_samples.clear()
+        for sample in read_sensor(session_dir, system_id):
+            yaw = quaternion_to_yaw(sample.vals)
+            if yaw is not None:
+                heading_samples.append((sample.elapsed_ts, sample.epoch_ts, yaw))
+        if heading_samples:
+            return heading_samples
+    return []
+
+
+def interpolate_angle(samples: Sequence[Tuple[int, int, float]], target_elapsed_ts: int) -> float:
+    if not samples:
+        return 0.0
+    if target_elapsed_ts <= samples[0][0]:
+        return samples[0][2]
+    if target_elapsed_ts >= samples[-1][0]:
+        return samples[-1][2]
+
+    lo = 0
+    hi = len(samples) - 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if samples[mid][0] < target_elapsed_ts:
+            lo = mid + 1
+        else:
+            hi = mid - 1
+
+    right = samples[lo]
+    left = samples[lo - 1]
+    span = right[0] - left[0]
+    if span <= 0:
+        return left[2]
+    ratio = (target_elapsed_ts - left[0]) / span
+    diff = wrap_angle(right[2] - left[2])
+    return wrap_angle(left[2] + ratio * diff)
+
+
+def wrap_angle(angle: float) -> float:
+    while angle <= -math.pi:
+        angle += 2.0 * math.pi
+    while angle > math.pi:
+        angle -= 2.0 * math.pi
+    return angle
+
+
+def compute_pdr(
+    session_dir: Path,
+    segments: Sequence[Segment],
+    base_step_m: float,
+    heading_offset_deg: float,
+) -> List[Step]:
+    linear_accel = read_sensor(session_dir, 7)
+    headings = read_heading_samples(session_dir)
+
+    detected: List[Tuple[Segment, int, int, float, float]] = []
+    for segment in segments:
+        for elapsed_ts, epoch_ts, peak_accel, accel_range in detect_steps_in_segment(linear_accel, segment):
+            detected.append((segment, elapsed_ts, epoch_ts, peak_accel, accel_range))
+
+    ranges = [max(item[4], 0.05) for item in detected]
+    median_range = median(ranges, default=1.0)
+    heading_offset = math.radians(heading_offset_deg)
+    x = 0.0
+    y = 0.0
+    steps: List[Step] = []
+
+    for step_index, (segment, elapsed_ts, epoch_ts, peak_accel, accel_range) in enumerate(detected, start=1):
+        normalized_range = max(accel_range, 0.05) / max(median_range, 0.05)
+        step_length = base_step_m * (normalized_range ** 0.25)
+        step_length = min(1.10, max(0.35, step_length))
+        heading = wrap_angle(interpolate_angle(headings, elapsed_ts) + heading_offset)
+
+        # Android yaw zero is roughly "north"; this convention leaves the final
+        # frame arbitrary until checkpoint anchors rotate/translate it.
+        x += step_length * math.sin(heading)
+        y += step_length * math.cos(heading)
+        steps.append(
+            Step(
+                session=session_dir.name,
+                segment_id=segment.segment_id,
+                step_index=step_index,
+                elapsed_ts=elapsed_ts,
+                epoch_ts=epoch_ts,
+                peak_accel=peak_accel,
+                accel_range=accel_range,
+                step_length_m=step_length,
+                heading_rad=heading,
+                heading_deg=math.degrees(heading),
+                pdr_x=x,
+                pdr_y=y,
+            )
+        )
+    return steps
+
+
+def nearest_pdr_position(steps: Sequence[Step], elapsed_ts: int) -> Tuple[float, float, int]:
+    before = [step for step in steps if step.elapsed_ts <= elapsed_ts]
+    if not before:
+        return 0.0, 0.0, 0
+    step = before[-1]
+    return step.pdr_x, step.pdr_y, step.step_index
+
+
+def write_csv(path: Path, fieldnames: Sequence[str], rows: Iterable[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def write_json(path: Path, obj: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(obj, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+
+
+def build_wifi_tables(
+    session_dirs: Sequence[Path],
+    output_dir: Path,
+    min_detection_rate: float,
+    min_mean_rssi: float,
+    max_rssi_std: float,
+    min_scan_count: int,
+) -> Dict[str, Any]:
+    long_rows: List[Dict[str, Any]] = []
+    scan_rows: List[Dict[str, Any]] = []
+    ap_stats_by_session: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    selected_by_session: Dict[str, List[str]] = {}
+    session_scan_counts: Dict[str, int] = {}
+
+    for session_dir in session_dirs:
+        session = session_dir.name
+        wifi_path = session_dir / "wifiScanner.dat"
+        scan_count = 0
+        stats: Dict[str, Dict[str, Any]] = {}
+
+        for scan_index, (elapsed_ts, epoch_ts, payload) in enumerate(parse_tab_json(wifi_path), start=1):
+            if not isinstance(payload, list):
+                continue
+            scan_count += 1
+            per_scan: Dict[str, float] = {}
+            meta_by_mac: Dict[str, Dict[str, Any]] = {}
+            for entry_index, ap in enumerate(payload):
+                if not isinstance(ap, dict) or not ap.get("mac"):
+                    continue
+                mac = normalize_mac(str(ap.get("mac", "")))
+                if not mac:
+                    continue
+                rssi = safe_float(ap.get("dbm"))
+                name = str(ap.get("name", ""))
+                freq = ap.get("freq", "")
+                elap_ts = ap.get("elap_ts", "")
+                long_rows.append(
+                    {
+                        "session": session,
+                        "scan_index": scan_index,
+                        "entry_index": entry_index,
+                        "scan_elapsed_ts": elapsed_ts,
+                        "scan_epoch_ts": epoch_ts,
+                        "ap_elapsed_ts": elap_ts,
+                        "mac": mac,
+                        "ssid": name,
+                        "freq": freq,
+                        "rssi": "" if math.isnan(rssi) else round(rssi, 3),
+                    }
+                )
+                if math.isnan(rssi):
+                    continue
+                if mac not in per_scan or rssi > per_scan[mac]:
+                    per_scan[mac] = rssi
+                    meta_by_mac[mac] = {"ssid": name, "freq": freq}
+
+                stat = stats.setdefault(
+                    mac,
+                    {
+                        "rssis": [],
+                        "scan_indices": set(),
+                        "names": {},
+                        "freqs": {},
+                        "first_elapsed_ts": elapsed_ts,
+                        "last_elapsed_ts": elapsed_ts,
+                    },
+                )
+                stat["rssis"].append(rssi)
+                stat["scan_indices"].add(scan_index)
+                stat["names"][name] = stat["names"].get(name, 0) + 1
+                stat["freqs"][freq] = stat["freqs"].get(freq, 0) + 1
+                stat["last_elapsed_ts"] = elapsed_ts
+
+            scan_rows.append(
+                {
+                    "session": session,
+                    "scan_index": scan_index,
+                    "elapsed_ts": elapsed_ts,
+                    "epoch_ts": epoch_ts,
+                    "rssi_by_mac": per_scan,
+                    "meta_by_mac": meta_by_mac,
+                }
+            )
+
+        session_scan_counts[session] = scan_count
+        ap_stats_by_session[session] = {}
+        selected_by_session[session] = []
+        for mac, stat in stats.items():
+            rssis = stat["rssis"]
+            scan_indices = stat["scan_indices"]
+            mean_rssi = sum(rssis) / len(rssis)
+            std_rssi = pstdev(rssis)
+            detection_rate = len(scan_indices) / scan_count if scan_count else 0.0
+            top_name = most_common_key(stat["names"])
+            top_freq = most_common_key(stat["freqs"])
+            row = {
+                "session": session,
+                "mac": mac,
+                "ssid": top_name,
+                "freq": top_freq,
+                "scan_count": len(scan_indices),
+                "entry_count": len(rssis),
+                "total_scans": scan_count,
+                "detection_rate": detection_rate,
+                "mean_rssi": mean_rssi,
+                "median_rssi": median(rssis),
+                "std_rssi": std_rssi,
+                "min_rssi": min(rssis),
+                "max_rssi": max(rssis),
+                "first_elapsed_ts": stat["first_elapsed_ts"],
+                "last_elapsed_ts": stat["last_elapsed_ts"],
+            }
+            ap_stats_by_session[session][mac] = row
+            if (
+                len(scan_indices) >= min_scan_count
+                and detection_rate >= min_detection_rate
+                and mean_rssi >= min_mean_rssi
+                and std_rssi <= max_rssi_std
+            ):
+                selected_by_session[session].append(mac)
+
+        selected_by_session[session].sort(
+            key=lambda mac: (
+                -ap_stats_by_session[session][mac]["detection_rate"],
+                -ap_stats_by_session[session][mac]["mean_rssi"],
+                mac,
+            )
+        )
+
+    ap_stats_rows: List[Dict[str, Any]] = []
+    for session, stats in ap_stats_by_session.items():
+        for mac, row in sorted(
+            stats.items(),
+            key=lambda item: (-item[1]["detection_rate"], -item[1]["mean_rssi"], item[0]),
+        ):
+            ap_stats_rows.append(format_stat_row(row))
+
+    selected_union = sorted({mac for macs in selected_by_session.values() for mac in macs})
+    selected_meta: Dict[str, Dict[str, Any]] = {}
+    for session, macs in selected_by_session.items():
+        for mac in macs:
+            stat = ap_stats_by_session[session][mac]
+            selected_meta.setdefault(
+                mac,
+                {
+                    "mac": mac,
+                    "ssid_by_session": {},
+                    "freq_by_session": {},
+                    "sessions": [],
+                },
+            )
+            selected_meta[mac]["ssid_by_session"][session] = stat["ssid"]
+            selected_meta[mac]["freq_by_session"][session] = stat["freq"]
+            selected_meta[mac]["sessions"].append(session)
+
+    write_csv(
+        output_dir / "wifi_long.csv",
+        [
+            "session",
+            "scan_index",
+            "entry_index",
+            "scan_elapsed_ts",
+            "scan_epoch_ts",
+            "ap_elapsed_ts",
+            "mac",
+            "ssid",
+            "freq",
+            "rssi",
+        ],
+        long_rows,
+    )
+
+    write_csv(
+        output_dir / "ap_stats.csv",
+        [
+            "session",
+            "mac",
+            "ssid",
+            "freq",
+            "scan_count",
+            "entry_count",
+            "total_scans",
+            "detection_rate",
+            "mean_rssi",
+            "median_rssi",
+            "std_rssi",
+            "min_rssi",
+            "max_rssi",
+            "first_elapsed_ts",
+            "last_elapsed_ts",
+            "selected",
+        ],
+        (
+            {
+                **row,
+                "selected": int(row["mac"] in selected_by_session.get(row["session"], [])),
+            }
+            for row in ap_stats_rows
+        ),
+    )
+
+    wide_fieldnames = ["session", "scan_index", "elapsed_ts", "epoch_ts"] + [
+        f"ap_{mac}" for mac in selected_union
+    ]
+    wide_rows: List[Dict[str, Any]] = []
+    for scan in scan_rows:
+        session = scan["session"]
+        selected_for_session = set(selected_by_session.get(session, []))
+        row = {
+            "session": session,
+            "scan_index": scan["scan_index"],
+            "elapsed_ts": scan["elapsed_ts"],
+            "epoch_ts": scan["epoch_ts"],
+        }
+        for mac in selected_union:
+            row[f"ap_{mac}"] = (
+                round(scan["rssi_by_mac"].get(mac, FILL_RSSI), 3)
+                if mac in selected_for_session
+                else FILL_RSSI
+            )
+        wide_rows.append(row)
+
+    write_csv(output_dir / "wifi_wide_selected.csv", wide_fieldnames, wide_rows)
+
+    selection_obj = {
+        "thresholds": {
+            "min_detection_rate": min_detection_rate,
+            "min_mean_rssi": min_mean_rssi,
+            "max_rssi_std": max_rssi_std,
+            "min_scan_count": min_scan_count,
+            "missing_rssi_fill": FILL_RSSI,
+        },
+        "session_scan_counts": session_scan_counts,
+        "selected_ap_count_by_session": {
+            session: len(macs) for session, macs in selected_by_session.items()
+        },
+        "selected_aps_by_session": selected_by_session,
+        "selected_ap_union_count": len(selected_union),
+        "selected_ap_union": selected_union,
+        "selected_ap_metadata": selected_meta,
+    }
+    write_json(output_dir / "selected_aps.json", selection_obj)
+    return selection_obj
+
+
+def most_common_key(counts: Dict[Any, int]) -> Any:
+    if not counts:
+        return ""
+    return max(counts.items(), key=lambda item: (item[1], str(item[0])))[0]
+
+
+def format_stat_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    formatted = dict(row)
+    for key in ("detection_rate", "mean_rssi", "median_rssi", "std_rssi", "min_rssi", "max_rssi"):
+        formatted[key] = round(float(formatted[key]), 6)
+    return formatted
+
+
+def build_pdr_tables(
+    session_dirs: Sequence[Path],
+    output_dir: Path,
+    base_step_m: float,
+    heading_offset_deg: float,
+) -> Dict[str, Any]:
+    event_rows: List[Dict[str, Any]] = []
+    segment_rows: List[Dict[str, Any]] = []
+    step_rows: List[Dict[str, Any]] = []
+    path_rows: List[Dict[str, Any]] = []
+    anchor_rows: List[Dict[str, Any]] = []
+    summary: Dict[str, Any] = {}
+
+    for session_dir in session_dirs:
+        session = session_dir.name
+        events = read_events(session_dir)
+        segments = build_segments(events)
+        steps = compute_pdr(session_dir, segments, base_step_m, heading_offset_deg)
+
+        summary[session] = {
+            "movement_event_count": len(events),
+            "segment_count": len(segments),
+            "step_count": len(steps),
+            "distance_m": round(sum(step.step_length_m for step in steps), 6),
+        }
+
+        for event in events:
+            event_rows.append(
+                {
+                    "session": session,
+                    "elapsed_ts": event.elapsed_ts,
+                    "epoch_ts": event.epoch_ts,
+                    "event": event.event,
+                }
+            )
+            x, y, step_index = nearest_pdr_position(steps, event.elapsed_ts)
+            anchor_rows.append(
+                {
+                    "session": session,
+                    "anchor_id": f"{session}__{event.event}_{event.elapsed_ts}",
+                    "event": event.event,
+                    "elapsed_ts": event.elapsed_ts,
+                    "epoch_ts": event.epoch_ts,
+                    "nearest_step_index": step_index,
+                    "pdr_x": round(x, 6),
+                    "pdr_y": round(y, 6),
+                    "room_x": "",
+                    "room_y": "",
+                    "comment": "fill room_x/room_y if this event is a known classroom checkpoint",
+                }
+            )
+            path_rows.append(
+                {
+                    "session": session,
+                    "point_type": event.event,
+                    "segment_id": "",
+                    "step_index": step_index,
+                    "elapsed_ts": event.elapsed_ts,
+                    "epoch_ts": event.epoch_ts,
+                    "pdr_x": round(x, 6),
+                    "pdr_y": round(y, 6),
+                    "step_length_m": "",
+                    "heading_deg": "",
+                }
+            )
+
+        for segment in segments:
+            segment_steps = [step for step in steps if step.segment_id == segment.segment_id]
+            segment_rows.append(
+                {
+                    "session": session,
+                    "segment_id": segment.segment_id,
+                    "start_elapsed_ts": segment.start_elapsed_ts,
+                    "start_epoch_ts": segment.start_epoch_ts,
+                    "end_elapsed_ts": segment.end_elapsed_ts,
+                    "end_epoch_ts": segment.end_epoch_ts,
+                    "start_event": segment.start_event,
+                    "end_event": segment.end_event,
+                    "duration_s": round(segment.duration_s, 3),
+                    "detected_steps": len(segment_steps),
+                    "distance_m": round(sum(step.step_length_m for step in segment_steps), 6),
+                }
+            )
+
+        for step in steps:
+            row = {
+                "session": session,
+                "segment_id": step.segment_id,
+                "step_index": step.step_index,
+                "elapsed_ts": step.elapsed_ts,
+                "epoch_ts": step.epoch_ts,
+                "peak_accel": round(step.peak_accel, 6),
+                "accel_range": round(step.accel_range, 6),
+                "step_length_m": round(step.step_length_m, 6),
+                "heading_rad": round(step.heading_rad, 9),
+                "heading_deg": round(step.heading_deg, 6),
+                "pdr_x": round(step.pdr_x, 6),
+                "pdr_y": round(step.pdr_y, 6),
+            }
+            step_rows.append(row)
+            path_rows.append(
+                {
+                    "session": session,
+                    "point_type": "STEP",
+                    "segment_id": step.segment_id,
+                    "step_index": step.step_index,
+                    "elapsed_ts": step.elapsed_ts,
+                    "epoch_ts": step.epoch_ts,
+                    "pdr_x": round(step.pdr_x, 6),
+                    "pdr_y": round(step.pdr_y, 6),
+                    "step_length_m": round(step.step_length_m, 6),
+                    "heading_deg": round(step.heading_deg, 6),
+                }
+            )
+
+    write_csv(
+        output_dir / "movement_events.csv",
+        ["session", "elapsed_ts", "epoch_ts", "event"],
+        event_rows,
+    )
+    write_csv(
+        output_dir / "movement_segments.csv",
+        [
+            "session",
+            "segment_id",
+            "start_elapsed_ts",
+            "start_epoch_ts",
+            "end_elapsed_ts",
+            "end_epoch_ts",
+            "start_event",
+            "end_event",
+            "duration_s",
+            "detected_steps",
+            "distance_m",
+        ],
+        segment_rows,
+    )
+    write_csv(
+        output_dir / "pdr_steps.csv",
+        [
+            "session",
+            "segment_id",
+            "step_index",
+            "elapsed_ts",
+            "epoch_ts",
+            "peak_accel",
+            "accel_range",
+            "step_length_m",
+            "heading_rad",
+            "heading_deg",
+            "pdr_x",
+            "pdr_y",
+        ],
+        step_rows,
+    )
+    path_rows.sort(key=lambda row: (row["session"], int(row["elapsed_ts"]), str(row["point_type"])))
+    write_csv(
+        output_dir / "pdr_path.csv",
+        [
+            "session",
+            "point_type",
+            "segment_id",
+            "step_index",
+            "elapsed_ts",
+            "epoch_ts",
+            "pdr_x",
+            "pdr_y",
+            "step_length_m",
+            "heading_deg",
+        ],
+        path_rows,
+    )
+    write_csv(
+        output_dir / "alignment_anchor_template.csv",
+        [
+            "session",
+            "anchor_id",
+            "event",
+            "elapsed_ts",
+            "epoch_ts",
+            "nearest_step_index",
+            "pdr_x",
+            "pdr_y",
+            "room_x",
+            "room_y",
+            "comment",
+        ],
+        anchor_rows,
+    )
+    write_json(output_dir / "pdr_summary.json", summary)
+    return summary
+
+
+def write_readme(output_dir: Path) -> None:
+    content = """# Processed Classroom Raw Data
+
+Generated by `preprocess_raw_data.py`.
+
+## Main Outputs
+
+- `wifi_long.csv`: one row per observed AP entry in every WiFi scan.
+- `ap_stats.csv`: AP frequency, RSSI strength/stability, and selected flag.
+- `selected_aps.json`: AP filtering thresholds and selected MAC lists.
+- `wifi_wide_selected.csv`: one row per WiFi scan, selected AP RSSI columns only; missing RSSI is `-110`.
+- `movement_events.csv`: START / RESTART / CHECKPOINT_PAUSE / STOP events.
+- `movement_segments.csv`: active walking segments inferred from movement events.
+- `pdr_steps.csv`: detected PDR steps with heading, step length, and relative position.
+- `pdr_path.csv`: event and step points in one relative trajectory table.
+- `wifi_pdr_features.csv`: selected WiFi RSSI table plus interpolated relative PDR position per scan.
+- `image_wifi_long.csv`: one row per ordered image, with its bound WiFi checkpoint feature row.
+- `image_wifi_points.csv`: one row per WiFi checkpoint, with the eight ordered images in columns.
+- `image_wifi_summary.json`: image/WiFi count checks and mapping status.
+- `alignment_anchor_template.csv`: fill `room_x` and `room_y` for known classroom checkpoints, then use those anchors to align/repair coordinates.
+
+## Image/WiFi Mapping
+
+Photos are sorted by filename number. By default every `CHECKPOINT_PAUSE` event
+is treated as one WiFi point, and every point consumes 8 images from `pic`.
+The nearest WiFi scan row is copied into the image mapping outputs.
+
+## Coordinate Note
+
+The raw files in this folder do not contain explicit classroom `x/y` labels. The PDR
+trajectory is therefore relative. To unify it into the classroom coordinate system,
+fill the anchor template with known checkpoint coordinates, then fit a similarity
+or affine transform from `pdr_x,pdr_y` to `room_x,room_y`.
+"""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "README.md").write_text(content, encoding="utf-8")
+
+
+def build_wifi_pdr_feature_table(output_dir: Path) -> Dict[str, Any]:
+    wifi_path = output_dir / "wifi_wide_selected.csv"
+    pdr_path = output_dir / "pdr_path.csv"
+    fused_path = output_dir / "wifi_pdr_features.csv"
+    if not wifi_path.exists() or not pdr_path.exists():
+        return {"rows": 0, "status": "missing_input"}
+
+    pdr_by_session: Dict[str, List[Dict[str, Any]]] = {}
+    with pdr_path.open("r", newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            try:
+                elapsed_ts = int(row["elapsed_ts"])
+                pdr_x = float(row["pdr_x"])
+                pdr_y = float(row["pdr_y"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            pdr_by_session.setdefault(row["session"], []).append(
+                {
+                    "elapsed_ts": elapsed_ts,
+                    "pdr_x": pdr_x,
+                    "pdr_y": pdr_y,
+                    "point_type": row.get("point_type", ""),
+                    "step_index": row.get("step_index", ""),
+                }
+            )
+
+    for rows in pdr_by_session.values():
+        rows.sort(key=lambda row: row["elapsed_ts"])
+
+    fused_rows: List[Dict[str, Any]] = []
+    with wifi_path.open("r", newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        wifi_fields = reader.fieldnames or []
+        fieldnames = wifi_fields + [
+            "pdr_x",
+            "pdr_y",
+            "pdr_interp_status",
+            "pdr_interp_gap_ms",
+            "pdr_left_type",
+            "pdr_right_type",
+        ]
+        for row in reader:
+            session = row.get("session", "")
+            try:
+                elapsed_ts = int(row["elapsed_ts"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            pdr_x, pdr_y, status, gap_ms, left_type, right_type = interpolate_pdr_position(
+                pdr_by_session.get(session, []),
+                elapsed_ts,
+            )
+            fused_row = dict(row)
+            fused_row.update(
+                {
+                    "pdr_x": "" if pdr_x is None else round(pdr_x, 6),
+                    "pdr_y": "" if pdr_y is None else round(pdr_y, 6),
+                    "pdr_interp_status": status,
+                    "pdr_interp_gap_ms": gap_ms,
+                    "pdr_left_type": left_type,
+                    "pdr_right_type": right_type,
+                }
+            )
+            fused_rows.append(fused_row)
+
+    write_csv(fused_path, fieldnames, fused_rows)
+    return {"rows": len(fused_rows), "status": "ok"}
+
+
+def interpolate_pdr_position(
+    points: Sequence[Dict[str, Any]],
+    target_elapsed_ts: int,
+) -> Tuple[Optional[float], Optional[float], str, str, str, str]:
+    if not points:
+        return None, None, "no_pdr_points", "", "", ""
+    if target_elapsed_ts <= points[0]["elapsed_ts"]:
+        point = points[0]
+        gap = abs(point["elapsed_ts"] - target_elapsed_ts)
+        return point["pdr_x"], point["pdr_y"], "before_path", str(gap), point["point_type"], point["point_type"]
+    if target_elapsed_ts >= points[-1]["elapsed_ts"]:
+        point = points[-1]
+        gap = abs(target_elapsed_ts - point["elapsed_ts"])
+        return point["pdr_x"], point["pdr_y"], "after_path", str(gap), point["point_type"], point["point_type"]
+
+    lo = 0
+    hi = len(points) - 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if points[mid]["elapsed_ts"] < target_elapsed_ts:
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    right = points[lo]
+    left = points[lo - 1]
+    span = right["elapsed_ts"] - left["elapsed_ts"]
+    if span <= 0:
+        return left["pdr_x"], left["pdr_y"], "exact_or_duplicate", "0", left["point_type"], right["point_type"]
+    ratio = (target_elapsed_ts - left["elapsed_ts"]) / span
+    pdr_x = left["pdr_x"] + ratio * (right["pdr_x"] - left["pdr_x"])
+    pdr_y = left["pdr_y"] + ratio * (right["pdr_y"] - left["pdr_y"])
+    return pdr_x, pdr_y, "interpolated", str(span), left["point_type"], right["point_type"]
+
+
+def find_session_dirs(root: Path) -> List[Path]:
+    return sorted(path for path in root.iterdir() if path.is_dir() and path.suffix == ".sess")
+
+
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path, default=Path.cwd(), help="Folder containing .sess directories.")
+    parser.add_argument("--output", type=Path, default=Path("processed"), help="Output folder.")
+    parser.add_argument("--min-detection-rate", type=float, default=0.20)
+    parser.add_argument("--min-mean-rssi", type=float, default=-90.0)
+    parser.add_argument("--max-rssi-std", type=float, default=10.0)
+    parser.add_argument("--min-scan-count", type=int, default=5)
+    parser.add_argument("--base-step-m", type=float, default=DEFAULT_BASE_STEP_M)
+    parser.add_argument("--heading-offset-deg", type=float, default=0.0)
+    parser.add_argument("--pic-dir", type=Path, default=Path("pic"), help="Folder containing ordered photos.")
+    parser.add_argument("--images-per-wifi-point", type=int, default=8)
+    parser.add_argument("--point-event", default="CHECKPOINT_PAUSE")
+    parser.add_argument("--skip-image-wifi", action="store_true", help="Do not build image/WiFi mapping outputs.")
+    parser.add_argument("--reconstruction-output", type=Path, default=Path("reconstruction_dataset"))
+    parser.add_argument("--skip-reconstruction-export", action="store_true")
+    parser.add_argument("--camera-height-m", type=float, default=1.50)
+    parser.add_argument("--slot-yaw-start-deg", type=float, default=0.0)
+    parser.add_argument("--slot-yaw-step-deg", type=float, default=45.0)
+    parser.add_argument("--colmap-workspace", type=Path, default=Path("colmap_workspace"))
+    parser.add_argument("--colmap-dir", type=Path, default=Path("colmap-x64-windows-cuda"))
+    parser.add_argument("--colmap-exe", type=Path)
+    parser.add_argument("--skip-colmap-prepare", action="store_true")
+    parser.add_argument("--colmap-camera-model", default="SIMPLE_RADIAL")
+    parser.add_argument("--colmap-matcher", choices=["exhaustive", "sequential"], default="exhaustive")
+    parser.add_argument("--colmap-quality", choices=["low", "medium", "high", "extreme"], default="high")
+    parser.add_argument("--colmap-dense-max-image-size", type=int, default=2000)
+    return parser.parse_args(argv)
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = parse_args(argv)
+    root = args.root.resolve()
+    output_dir = (root / args.output).resolve() if not args.output.is_absolute() else args.output
+    session_dirs = find_session_dirs(root)
+    if not session_dirs:
+        raise SystemExit(f"No .sess directories found under {root}")
+
+    print(f"[info] root: {root}")
+    print(f"[info] output: {output_dir}")
+    print(f"[info] sessions: {', '.join(path.name for path in session_dirs)}")
+
+    selection = build_wifi_tables(
+        session_dirs=session_dirs,
+        output_dir=output_dir,
+        min_detection_rate=args.min_detection_rate,
+        min_mean_rssi=args.min_mean_rssi,
+        max_rssi_std=args.max_rssi_std,
+        min_scan_count=args.min_scan_count,
+    )
+    pdr_summary = build_pdr_tables(
+        session_dirs=session_dirs,
+        output_dir=output_dir,
+        base_step_m=args.base_step_m,
+        heading_offset_deg=args.heading_offset_deg,
+    )
+    fused_summary = build_wifi_pdr_feature_table(output_dir)
+    image_summary = (
+        {"status": "skipped"}
+        if args.skip_image_wifi
+        else build_image_wifi_tables(
+            root=root,
+            session_dirs=session_dirs,
+            output_dir=output_dir,
+            pic_dir=args.pic_dir,
+            images_per_point=args.images_per_wifi_point,
+            point_event=args.point_event,
+        )
+    )
+    reconstruction_output_dir = (
+        (root / args.reconstruction_output).resolve()
+        if not args.reconstruction_output.is_absolute()
+        else args.reconstruction_output
+    )
+    reconstruction_summary = (
+        {"status": "skipped"}
+        if args.skip_reconstruction_export or args.skip_image_wifi
+        else export_reconstruction_dataset(
+            root=root,
+            processed_dir=output_dir,
+            output_dir=reconstruction_output_dir,
+            camera_height_m=args.camera_height_m,
+            slot_yaw_start_deg=args.slot_yaw_start_deg,
+            slot_yaw_step_deg=args.slot_yaw_step_deg,
+            copy_images=True,
+        )
+    )
+    colmap_workspace_dir = (
+        (root / args.colmap_workspace).resolve()
+        if not args.colmap_workspace.is_absolute()
+        else args.colmap_workspace
+    )
+    colmap_summary = (
+        {"status": "skipped"}
+        if args.skip_colmap_prepare or reconstruction_summary.get("status") == "skipped"
+        else prepare_colmap_workspace(
+            root=root,
+            reconstruction_dir=reconstruction_output_dir,
+            workspace_dir=colmap_workspace_dir,
+            colmap_dir=args.colmap_dir,
+            colmap_exe=args.colmap_exe,
+            camera_model=args.colmap_camera_model,
+            single_camera=True,
+            use_gpu=True,
+            matcher=args.colmap_matcher,
+            quality=args.colmap_quality,
+            dense_max_image_size=args.colmap_dense_max_image_size,
+        )
+    )
+    write_readme(output_dir)
+    write_json(
+        output_dir / "processing_summary.json",
+        {
+            "root": str(root),
+            "sessions": [path.name for path in session_dirs],
+            "wifi": {
+                "selected_ap_count_by_session": selection["selected_ap_count_by_session"],
+                "selected_ap_union_count": selection["selected_ap_union_count"],
+            },
+            "pdr": pdr_summary,
+            "wifi_pdr_features": fused_summary,
+            "image_wifi": image_summary,
+            "reconstruction_export": reconstruction_summary,
+            "colmap_workspace": colmap_summary,
+        },
+    )
+
+    print("[info] selected APs:", selection["selected_ap_count_by_session"])
+    print("[info] selected AP union:", selection["selected_ap_union_count"])
+    for session, summary in pdr_summary.items():
+        print(
+            f"[info] {session}: {summary['segment_count']} segments, "
+            f"{summary['step_count']} steps, {summary['distance_m']} m"
+        )
+    print("[info] wifi_pdr_features:", fused_summary)
+    print("[info] image_wifi:", image_summary)
+    print("[info] reconstruction_export:", reconstruction_summary)
+    print("[info] colmap_workspace:", colmap_summary)
+    print("[done] preprocessing complete")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
