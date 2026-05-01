@@ -195,6 +195,10 @@ This folder is generated from `processed/image_wifi_long.csv` and
 - `wifi_fingerprint_library.csv`: one row per WiFi point, with selected AP RSSI columns.
 - `wifi_boundary_seed.csv`: convex hull of WiFi/PDR point positions, useful as a rough
   boundary seed rather than a final room outline.
+- `wifi_localization_model.json`: generated later by the WiFi positioning step.
+- `wifi_localization_eval.csv`: leave-one-out fingerprint localization evaluation.
+- `wifi_signal_grid.csv`: interpolated RSSI field over the sampled area.
+- `wifi_signal_boundary.csv`: boundary points with RSSI coverage metrics.
 - `export_summary.json`: counts and quality checks for this export.
 
 ## Suggested Use
@@ -203,6 +207,8 @@ Use `images/` or `colmap_image_list.txt` as the photo input for COLMAP/COMPLab.
 Use `camera_pose_seed.csv` as metadata for alignment and debugging. It is not a
 calibrated camera model. Use `wifi_fingerprint_library.csv` for later indoor
 localization, and use `wifi_boundary_seed.csv` as a soft spatial constraint.
+The WiFi positioning step turns this fingerprint library into a KNN localization
+model and an RSSI boundary/grid model.
 """
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")

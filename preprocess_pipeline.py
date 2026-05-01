@@ -18,6 +18,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from colmap_bridge import prepare_colmap_workspace
 from image_mapping import build_image_wifi_tables
 from reconstruction_export import export_reconstruction_dataset
+from wifi_positioning import run_wifi_positioning_pipeline
 
 
 FILL_RSSI = -110
@@ -1000,14 +1001,20 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--camera-height-m", type=float, default=1.50)
     parser.add_argument("--slot-yaw-start-deg", type=float, default=0.0)
     parser.add_argument("--slot-yaw-step-deg", type=float, default=45.0)
+    parser.add_argument("--skip-wifi-positioning", action="store_true")
+    parser.add_argument("--wifi-grid-cell-size-m", type=float, default=1.0)
+    parser.add_argument("--wifi-localization-k", type=int, default=3)
     parser.add_argument("--colmap-workspace", type=Path, default=Path("colmap_workspace"))
     parser.add_argument("--colmap-dir", type=Path, default=Path("colmap-x64-windows-cuda"))
     parser.add_argument("--colmap-exe", type=Path)
     parser.add_argument("--skip-colmap-prepare", action="store_true")
     parser.add_argument("--colmap-camera-model", default="SIMPLE_RADIAL")
-    parser.add_argument("--colmap-matcher", choices=["exhaustive", "sequential"], default="exhaustive")
+    parser.add_argument("--colmap-matcher", choices=["constrained", "exhaustive", "sequential"], default="constrained")
     parser.add_argument("--colmap-quality", choices=["low", "medium", "high", "extreme"], default="high")
     parser.add_argument("--colmap-dense-max-image-size", type=int, default=2000)
+    parser.add_argument("--constrained-point-window", type=int, default=1)
+    parser.add_argument("--constrained-slot-window", type=int, default=2)
+    parser.add_argument("--constrained-max-pdr-distance-m", type=float, default=8.0)
     return parser.parse_args(argv)
 
 
@@ -1068,6 +1075,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             copy_images=True,
         )
     )
+    wifi_positioning_summary = (
+        {"status": "skipped"}
+        if args.skip_wifi_positioning or reconstruction_summary.get("status") == "skipped"
+        else run_wifi_positioning_pipeline(
+            fingerprint_path=reconstruction_output_dir / "wifi_fingerprint_library.csv",
+            output_dir=reconstruction_output_dir,
+            grid_cell_size_m=args.wifi_grid_cell_size_m,
+            localization_k=args.wifi_localization_k,
+        )
+    )
     colmap_workspace_dir = (
         (root / args.colmap_workspace).resolve()
         if not args.colmap_workspace.is_absolute()
@@ -1088,6 +1105,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             matcher=args.colmap_matcher,
             quality=args.colmap_quality,
             dense_max_image_size=args.colmap_dense_max_image_size,
+            constrained_point_window=args.constrained_point_window,
+            constrained_slot_window=args.constrained_slot_window,
+            constrained_max_pdr_distance_m=args.constrained_max_pdr_distance_m,
         )
     )
     write_readme(output_dir)
@@ -1104,6 +1124,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "wifi_pdr_features": fused_summary,
             "image_wifi": image_summary,
             "reconstruction_export": reconstruction_summary,
+            "wifi_positioning": wifi_positioning_summary,
             "colmap_workspace": colmap_summary,
         },
     )
@@ -1118,6 +1139,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print("[info] wifi_pdr_features:", fused_summary)
     print("[info] image_wifi:", image_summary)
     print("[info] reconstruction_export:", reconstruction_summary)
+    print("[info] wifi_positioning:", wifi_positioning_summary)
     print("[info] colmap_workspace:", colmap_summary)
     print("[done] preprocessing complete")
     return 0

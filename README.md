@@ -1,10 +1,19 @@
-# FYP 3D WiFi/IMU/Photo Reconstruction Pipeline
+# 3D Reconstruction Signal Vision Pipeline
 
-这个项目用于把手机采集的 `.sess` 数据、WiFi/IMU 信息和现场照片整理成可接入 COLMAP 的 3D 重建工作流。
+本项目把手机采集的 WiFi、IMU、照片数据整理成一条完整流水线，用于：
 
-## 目录要求
+- 生成 COLMAP 点云输入
+- 构建 WiFi 指纹库
+- 用 WiFi/PDR 生成空间边界
+- 用 IMU/PDR 约束照片位置
+- 用受限匹配减少室内 COLMAP 乱匹配
+- 后续支持新 WiFi scan 定位
 
-项目根目录应类似这样：
+COLMAP 本身只使用图像重建点云；本项目在 COLMAP 前后把 WiFi/IMU 变成可用的空间约束和定位模型。
+
+## 1. 项目目录
+
+项目根目录示例：
 
 ```text
 FYP_3d/
@@ -13,27 +22,37 @@ FYP_3d/
   preprocess_pipeline.py
   image_mapping.py
   reconstruction_export.py
+  wifi_positioning.py
   colmap_bridge.py
+  localize_wifi.py
+  run_colmap.py
   run_colmap_sparse.bat
   run_colmap_dense.bat
   run_colmap_full.bat
-  run_colmap.py
+  open_colmap_gui.bat
+  DATA_COLLECTION_GUIDE.md
   pic/
   2026-05-01-10-19-15-725.sess/
   colmap-x64-windows-cuda/
 ```
 
-其中：
+输入数据：
 
-- `pic/` 存放采集照片。
-- `.sess/` 文件夹存放手机采集的 WiFi、IMU、movement 数据。
-- `colmap-x64-windows-cuda/` 是 COLMAP 程序目录，里面应有 `bin/colmap.exe`。
+- `pic/`：照片目录
+- `*.sess/`：手机采集的 WiFi、IMU、movement 数据
+- `colmap-x64-windows-cuda/`：COLMAP 程序目录，内部需要有 `bin/colmap.exe`
 
-当前默认规则是：**一个 WiFi 点位对应 8 张照片**，照片按文件名数字顺序分组。
+默认采集规则：
 
-## 第一步：预处理数据
+```text
+1 个 WiFi 点位 = 8 张照片
+```
 
-在 PowerShell 或 VS Code Terminal 中进入项目根目录：
+照片会按文件名数字顺序分组。
+
+## 2. 一键生成预处理结果
+
+在 PowerShell 或 VS Code Terminal 中进入项目目录：
 
 ```powershell
 cd C:\Users\ASUS\Desktop\FYP_3d
@@ -45,177 +64,398 @@ cd C:\Users\ASUS\Desktop\FYP_3d
 python main.py
 ```
 
-这一步会自动生成：
+这一步会自动完成：
 
 ```text
-processed/
-reconstruction_dataset/
-colmap_workspace/
+raw .sess + pic
+  -> processed/
+  -> reconstruction_dataset/
+  -> colmap_workspace/
 ```
 
-主要结果：
-
-- `processed/image_wifi_points.csv`：一个 WiFi 点位一行，每行绑定 8 张图片。
-- `processed/image_wifi_long.csv`：一张图片一行，带 WiFi/PDR 信息。
-- `processed/wifi_pdr_features.csv`：WiFi 指纹和 PDR 轨迹融合结果。
-- `reconstruction_dataset/wifi_fingerprint_library.csv`：WiFi 指纹库。
-- `reconstruction_dataset/wifi_boundary_seed.csv`：WiFi/PDR 粗边界。
-- `colmap_workspace/images/`：给 COLMAP 使用的图片。
-- `colmap_workspace/metadata/`：WiFi、IMU、pose seed 等元数据。
-
-如果运行成功，终端中应看到：
+如果看到：
 
 ```text
 [done] preprocessing complete
 ```
 
-## 第二步：运行 COLMAP
+说明预处理流水线完成。
 
-第一次建议先跑稀疏重建：
+## 3. 流水线逻辑
 
-```powershell
-.\run_colmap_sparse.bat
-```
+### Step 1: 解析 WiFi 原始数据
 
-如果稀疏重建成功，再跑 dense 点云：
-
-```powershell
-.\run_colmap_dense.bat
-```
-
-也可以直接完整运行：
-
-```powershell
-.\run_colmap_full.bat
-```
-
-注意：在 PowerShell 中运行 `.bat` 文件时要加 `.\`。
-
-## 输出点云位置
-
-COLMAP dense 点云输出在：
+输入：
 
 ```text
-colmap_workspace\dense\fused.ply
+*.sess/wifiScanner.dat
 ```
 
-这个 `fused.ply` 可以用 MeshLab、CloudCompare 等工具打开、缩放、清理和进一步建 mesh。
-
-稀疏模型输出在：
+输出：
 
 ```text
-colmap_workspace\sparse\
+processed/wifi_long.csv
+processed/ap_stats.csv
+processed/selected_aps.json
+processed/wifi_wide_selected.csv
 ```
 
-## WiFi 数据是否参与了流程
+作用：
 
-COLMAP 本身只使用图片生成点云，不会直接读取 WiFi/IMU。
+- 展开每一次 WiFi scan
+- 筛选稳定 AP
+- 生成 selected AP RSSI 特征表
 
-本项目已经把 WiFi/IMU 用作空间元数据：
+### Step 2: 解析 IMU 并生成 PDR 轨迹
 
-- 用 WiFi scan 生成指纹库。
-- 用 WiFi 点位绑定照片。
-- 用 PDR 给图片和 WiFi 点位提供空间坐标。
-- 用 WiFi/PDR 点位生成粗边界。
-- 将这些数据复制到 `colmap_workspace/metadata/`，用于后续点云对齐、定位、裁剪和边界约束。
+输入：
 
-## 常用命令
+```text
+*.sess/7.dat
+*.sess/8.dat
+*.sess/11.dat
+*.sess/movements.dat
+```
 
-重新生成所有预处理和 COLMAP workspace：
+输出：
+
+```text
+processed/pdr_steps.csv
+processed/pdr_path.csv
+processed/movement_events.csv
+processed/movement_segments.csv
+```
+
+作用：
+
+- 用线性加速度检测步伐
+- 用旋转向量估计 heading
+- 生成相对 PDR 坐标 `pdr_x`, `pdr_y`
+
+### Step 3: 融合 WiFi 和 PDR
+
+输出：
+
+```text
+processed/wifi_pdr_features.csv
+```
+
+作用：
+
+- 每条 WiFi scan 绑定一个 PDR 空间位置
+- 后续 WiFi 指纹库和边界都基于这个坐标
+
+### Step 4: 绑定照片和 WiFi 点位
+
+输入：
+
+```text
+pic/
+processed/wifi_pdr_features.csv
+```
+
+输出：
+
+```text
+processed/image_wifi_points.csv
+processed/image_wifi_long.csv
+processed/image_wifi_summary.json
+```
+
+作用：
+
+- 按照片编号顺序分组
+- 每 8 张照片绑定到一个 `CHECKPOINT_PAUSE` WiFi 点位
+- 每张照片携带 WiFi/PDR 信息
+
+### Step 5: 导出 3D 重建数据集
+
+输出：
+
+```text
+reconstruction_dataset/images/
+reconstruction_dataset/images_manifest.csv
+reconstruction_dataset/camera_pose_seed.csv
+reconstruction_dataset/wifi_fingerprint_library.csv
+reconstruction_dataset/wifi_boundary_seed.csv
+```
+
+作用：
+
+- 把照片复制并重命名成 COLMAP 友好的格式
+- 给每张照片生成 PDR 初始位置和 8 方向 yaw seed
+- 生成 WiFi 指纹库
+- 生成 WiFi/PDR 粗边界
+
+### Step 6: 生成 WiFi 定位模型和信号边界
+
+输出：
+
+```text
+reconstruction_dataset/wifi_localization_model.json
+reconstruction_dataset/wifi_localization_eval.csv
+reconstruction_dataset/wifi_positioning_summary.json
+reconstruction_dataset/wifi_signal_grid.csv
+reconstruction_dataset/wifi_signal_boundary.csv
+```
+
+作用：
+
+- `wifi_localization_model.json`：加权 KNN WiFi 指纹定位模型
+- `wifi_localization_eval.csv`：留一法定位误差评估
+- `wifi_signal_grid.csv`：室内区域 RSSI 插值网格
+- `wifi_signal_boundary.csv`：带信号强度指标的 WiFi/PDR 边界
+
+当前模型是离线指纹定位：
+
+```text
+新 WiFi scan -> AP RSSI 向量 -> 匹配指纹库 -> 输出估计 pdr_x, pdr_y
+```
+
+### Step 7: 准备 COLMAP workspace
+
+输出：
+
+```text
+colmap_workspace/images/
+colmap_workspace/image_list.txt
+colmap_workspace/match_pairs.txt
+colmap_workspace/pdr_alignment_refs.txt
+colmap_workspace/metadata/
+```
+
+作用：
+
+- `images/`：COLMAP 输入照片
+- `match_pairs.txt`：用 WiFi 点位顺序、拍摄方向、PDR 距离生成的受限匹配对
+- `pdr_alignment_refs.txt`：用 PDR 坐标作为 sparse 模型对齐参考
+- `metadata/`：复制 WiFi 指纹、信号边界、定位模型、PDR seed 等文件
+
+默认 COLMAP 不再全量乱匹配，而是使用 constrained matching。
+
+## 4. 运行 COLMAP
+
+如果之前已经跑过 COLMAP，先清理旧数据库和旧模型：
 
 ```powershell
-python main.py
+python run_colmap.py reset
 ```
 
-只跑 COLMAP 稀疏模型：
+它会要求输入：
 
-```powershell
-.\run_colmap_sparse.bat
+```text
+YES
 ```
 
-只跑 COLMAP dense 点云：
-
-```powershell
-.\run_colmap_dense.bat
-```
-
-完整跑 COLMAP：
-
-```powershell
-.\run_colmap_full.bat
-```
-
-用 Python 启动 COLMAP 脚本：
+然后运行 sparse：
 
 ```powershell
 python run_colmap.py sparse
-python run_colmap.py dense
-python run_colmap.py full
 ```
 
-打开 COLMAP GUI：
-
-```powershell
-.\open_colmap_gui.bat
-```
-
-## 常见问题
-
-### PowerShell 提示找不到 bat
-
-如果输入：
-
-```powershell
-run_colmap_full.bat
-```
-
-PowerShell 可能提示找不到命令。请改成：
-
-```powershell
-.\run_colmap_full.bat
-```
-
-### 出现 `Clamping features`
-
-类似：
-
-```text
-Clamping features from 38157 to 32768
-```
-
-这是 COLMAP 的 warning，不是致命错误。它表示匹配点较多，COLMAP 按默认上限裁剪了一部分。一般可以先继续跑。
-
-### dense 阶段提示找不到 sparse/0
-
-说明稀疏重建还没成功，或者 COLMAP 生成的稀疏模型目录不是 `sparse/0`。
-
-先运行：
+或者：
 
 ```powershell
 .\run_colmap_sparse.bat
 ```
 
-确认 `colmap_workspace\sparse\0` 是否存在，再运行 dense。
+成功后运行 dense：
 
-### 修改照片数量或每点图片数
+```powershell
+python run_colmap.py dense
+```
 
-默认每个 WiFi 点位 8 张图。如果采集规则变了，可以运行：
+或者：
+
+```powershell
+.\run_colmap_dense.bat
+```
+
+也可以完整运行：
+
+```powershell
+python run_colmap.py full
+```
+
+或：
+
+```powershell
+.\run_colmap_full.bat
+```
+
+## 5. 点云输出
+
+最终 dense 点云：
+
+```text
+colmap_workspace/dense/fused.ply
+```
+
+可以用 MeshLab 或 CloudCompare 打开。
+
+稀疏模型：
+
+```text
+colmap_workspace/sparse/
+```
+
+如果 PDR 对齐成功，还会有：
+
+```text
+colmap_workspace/sparse_pdr_aligned/
+```
+
+dense 阶段会优先使用 `sparse_pdr_aligned/0`。
+
+## 6. WiFi 边界如何使用
+
+边界相关文件：
+
+```text
+reconstruction_dataset/wifi_boundary_seed.csv
+reconstruction_dataset/wifi_signal_boundary.csv
+reconstruction_dataset/wifi_signal_grid.csv
+colmap_workspace/metadata/wifi_signal_boundary.csv
+colmap_workspace/metadata/wifi_signal_grid.csv
+```
+
+含义：
+
+- `wifi_boundary_seed.csv`：WiFi/PDR 点位凸包，表示采样空间粗边界
+- `wifi_signal_boundary.csv`：边界点附带 RSSI 统计，例如强 AP 数量、最强 AP、top3 平均 RSSI
+- `wifi_signal_grid.csv`：边界内部 1 米网格的 RSSI 插值和 inside confidence
+
+这些文件用于后续：
+
+- 点云裁剪
+- 室内区域约束
+- WiFi 覆盖区域可视化
+- 定位结果合法性检查
+
+## 7. WiFi 指纹定位如何使用
+
+指纹库：
+
+```text
+reconstruction_dataset/wifi_fingerprint_library.csv
+```
+
+定位模型：
+
+```text
+reconstruction_dataset/wifi_localization_model.json
+```
+
+如果你有一条新的 WiFi scan，格式是 JSON 数组，例如：
+
+```json
+[
+  {"mac": "1C946885EEB1", "dbm": -50},
+  {"mac": "1C946885EEB3", "dbm": -53}
+]
+```
+
+保存为：
+
+```text
+new_scan.json
+```
+
+运行：
+
+```powershell
+python localize_wifi.py --scan-json new_scan.json
+```
+
+如果是 CSV，列名包含 `mac,dbm` 或 `mac,rssi`：
+
+```powershell
+python localize_wifi.py --scan-csv new_scan.csv
+```
+
+输出会包含：
+
+```text
+estimated_x
+estimated_y
+confidence
+neighbors
+```
+
+也可以保存 JSON：
+
+```powershell
+python localize_wifi.py --scan-json new_scan.json --output-json location_result.json
+```
+
+## 8. 常用参数
+
+每个 WiFi 点位不是 8 张图时：
 
 ```powershell
 python main.py --images-per-wifi-point 6
 ```
 
-## 推荐启动顺序
+调整 WiFi 定位 KNN 的 K：
+
+```powershell
+python main.py --wifi-localization-k 5
+```
+
+调整 RSSI 信号网格大小：
+
+```powershell
+python main.py --wifi-grid-cell-size-m 0.5
+```
+
+收紧 COLMAP 匹配约束：
+
+```powershell
+python main.py --constrained-slot-window 1
+```
+
+放宽相邻点位约束：
+
+```powershell
+python main.py --constrained-point-window 2
+```
+
+降低 dense 计算量：
+
+```powershell
+python main.py --colmap-dense-max-image-size 1600
+```
+
+## 9. 推荐完整运行顺序
 
 ```powershell
 cd C:\Users\ASUS\Desktop\FYP_3d
 python main.py
-.\run_colmap_sparse.bat
-.\run_colmap_dense.bat
+python run_colmap.py reset
+python run_colmap.py sparse
+python run_colmap.py dense
 ```
 
 最终查看：
 
 ```text
-colmap_workspace\dense\fused.ply
+colmap_workspace/dense/fused.ply
 ```
+
+## 10. 采集指南
+
+下一轮采集请看：
+
+```text
+DATA_COLLECTION_GUIDE.md
+```
+
+核心建议：
+
+- 不要只在点位原地转圈
+- 点位之间也要拍照或录视频
+- 相邻照片保持 60% 到 80% 重叠
+- 每 1 到 3 米设置一个 WiFi 点位
+- 每个 WiFi 点位停留 3 到 5 秒
+- 每个点位拍 8 个方向
+- 尽量形成闭环
