@@ -3,6 +3,13 @@
 *.dat
 *.dat.tmpdownload
 pic/
+video/
+*.mp4
+*.mov
+*.m4v
+*.avi
+*.mkv
+*.webm
 
 # Generated outputs
 processed/

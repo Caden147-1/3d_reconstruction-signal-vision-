@@ -18,6 +18,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from colmap_bridge import prepare_colmap_workspace
 from image_mapping import build_image_wifi_tables
 from reconstruction_export import export_reconstruction_dataset
+from video_frames import run_video_frame_pipeline
 from wifi_positioning import run_wifi_positioning_pipeline
 
 
@@ -993,14 +994,23 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--base-step-m", type=float, default=DEFAULT_BASE_STEP_M)
     parser.add_argument("--heading-offset-deg", type=float, default=0.0)
     parser.add_argument("--pic-dir", type=Path, default=Path("pic"), help="Folder containing ordered photos.")
-    parser.add_argument("--images-per-wifi-point", type=int, default=8)
+    parser.add_argument("--images-per-wifi-point", type=int, default=20)
     parser.add_argument("--point-event", default="CHECKPOINT_PAUSE")
     parser.add_argument("--skip-image-wifi", action="store_true", help="Do not build image/WiFi mapping outputs.")
+    parser.add_argument("--video-dir", type=Path, default=Path("video"), help="Folder containing route/base videos.")
+    parser.add_argument("--skip-video-frames", action="store_true", help="Do not extract video frames for COLMAP.")
+    parser.add_argument("--video-frame-interval-s", type=float, default=1.0)
+    parser.add_argument("--video-max-frames", type=int, default=240, help="Max frames to extract per video; use 0 for no cap.")
+    parser.add_argument("--ffmpeg-exe", type=Path, help="Optional path to ffmpeg.exe.")
     parser.add_argument("--reconstruction-output", type=Path, default=Path("reconstruction_dataset"))
     parser.add_argument("--skip-reconstruction-export", action="store_true")
     parser.add_argument("--camera-height-m", type=float, default=1.50)
     parser.add_argument("--slot-yaw-start-deg", type=float, default=0.0)
-    parser.add_argument("--slot-yaw-step-deg", type=float, default=45.0)
+    parser.add_argument(
+        "--slot-yaw-step-deg",
+        type=float,
+        help="Yaw step between ordered point photos. Defaults to 360 / images-per-wifi-point.",
+    )
     parser.add_argument("--skip-wifi-positioning", action="store_true")
     parser.add_argument("--wifi-grid-cell-size-m", type=float, default=1.0)
     parser.add_argument("--wifi-localization-k", type=int, default=3)
@@ -1015,6 +1025,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--constrained-point-window", type=int, default=1)
     parser.add_argument("--constrained-slot-window", type=int, default=2)
     parser.add_argument("--constrained-max-pdr-distance-m", type=float, default=8.0)
+    parser.add_argument("--constrained-video-frame-window", type=int, default=3)
+    parser.add_argument("--constrained-video-anchor-point-window", type=int, default=1)
+    parser.add_argument("--constrained-video-anchor-limit", type=int, default=12)
     return parser.parse_args(argv)
 
 
@@ -1057,10 +1070,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             point_event=args.point_event,
         )
     )
+    video_frames_summary = (
+        {"status": "skipped"}
+        if args.skip_video_frames or args.skip_image_wifi
+        else run_video_frame_pipeline(
+            root=root,
+            processed_dir=output_dir,
+            video_dir=args.video_dir,
+            frame_interval_s=args.video_frame_interval_s,
+            max_frames=args.video_max_frames,
+            ffmpeg_exe=args.ffmpeg_exe,
+        )
+    )
     reconstruction_output_dir = (
         (root / args.reconstruction_output).resolve()
         if not args.reconstruction_output.is_absolute()
         else args.reconstruction_output
+    )
+    slot_yaw_step_deg = (
+        args.slot_yaw_step_deg
+        if args.slot_yaw_step_deg is not None
+        else 360.0 / max(1, args.images_per_wifi_point)
     )
     reconstruction_summary = (
         {"status": "skipped"}
@@ -1071,7 +1101,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             output_dir=reconstruction_output_dir,
             camera_height_m=args.camera_height_m,
             slot_yaw_start_deg=args.slot_yaw_start_deg,
-            slot_yaw_step_deg=args.slot_yaw_step_deg,
+            slot_yaw_step_deg=slot_yaw_step_deg,
             copy_images=True,
         )
     )
@@ -1108,6 +1138,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             constrained_point_window=args.constrained_point_window,
             constrained_slot_window=args.constrained_slot_window,
             constrained_max_pdr_distance_m=args.constrained_max_pdr_distance_m,
+            constrained_video_frame_window=args.constrained_video_frame_window,
+            constrained_video_anchor_point_window=args.constrained_video_anchor_point_window,
+            constrained_video_anchor_limit=args.constrained_video_anchor_limit,
         )
     )
     write_readme(output_dir)
@@ -1123,6 +1156,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "pdr": pdr_summary,
             "wifi_pdr_features": fused_summary,
             "image_wifi": image_summary,
+            "video_frames": video_frames_summary,
             "reconstruction_export": reconstruction_summary,
             "wifi_positioning": wifi_positioning_summary,
             "colmap_workspace": colmap_summary,
@@ -1138,6 +1172,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
     print("[info] wifi_pdr_features:", fused_summary)
     print("[info] image_wifi:", image_summary)
+    print("[info] video_frames:", video_frames_summary)
     print("[info] reconstruction_export:", reconstruction_summary)
     print("[info] wifi_positioning:", wifi_positioning_summary)
     print("[info] colmap_workspace:", colmap_summary)

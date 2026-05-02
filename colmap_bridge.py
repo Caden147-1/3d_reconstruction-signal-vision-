@@ -20,6 +20,8 @@ METADATA_FILES = [
     "wifi_positioning_summary.json",
     "wifi_signal_boundary.csv",
     "wifi_signal_grid.csv",
+    "video_frames_manifest.csv",
+    "video_frames_summary.json",
     "export_summary.json",
 ]
 
@@ -144,16 +146,42 @@ def point_distance(row_a: Dict[str, str], row_b: Dict[str, str]) -> float:
     return math.hypot(ax - bx, ay - by)
 
 
+def is_video_frame_row(row: Dict[str, str]) -> bool:
+    return row.get("source_type") == "video_base_frame" or bool(row.get("video_sequence_index"))
+
+
+def select_evenly_spaced(rows: Sequence[Dict[str, str]], limit: int) -> List[Dict[str, str]]:
+    if limit <= 0 or len(rows) <= limit:
+        return list(rows)
+    selected: List[Dict[str, str]] = []
+    used: set[int] = set()
+    for idx in range(limit):
+        pos = round(idx * (len(rows) - 1) / max(1, limit - 1))
+        if pos not in used:
+            selected.append(rows[pos])
+            used.add(pos)
+    return selected
+
+
 def build_constrained_match_pairs(
     manifest_rows: Sequence[Dict[str, str]],
     point_window: int,
     slot_window: int,
     max_pdr_distance_m: float,
+    video_frame_window: int,
+    video_anchor_point_window: int,
+    video_anchor_limit: int,
 ) -> Tuple[List[Tuple[str, str]], Dict[str, Any]]:
+    video_frame_window = max(1, video_frame_window)
+    video_anchor_point_window = max(0, video_anchor_point_window)
+    video_anchor_limit = max(0, video_anchor_limit)
     rows = [
         row
         for row in manifest_rows
-        if row.get("image_file") and row.get("global_point_index") and row.get("image_slot")
+        if row.get("image_file")
+        and row.get("global_point_index")
+        and row.get("image_slot")
+        and not is_video_frame_row(row)
     ]
     rows.sort(key=lambda row: (safe_int(row.get("global_point_index")), safe_int(row.get("image_slot"))))
 
@@ -209,14 +237,63 @@ def build_constrained_match_pairs(
                         reason = "nearby_wifi_points" if point_gap <= point_window else "nearby_pdr_points"
                         add_pair(row_a, row_b, reason)
 
+    video_rows = [row for row in manifest_rows if row.get("image_file") and is_video_frame_row(row)]
+    by_video: Dict[str, List[Dict[str, str]]] = {}
+    for row in video_rows:
+        by_video.setdefault(row.get("video_name", "video"), []).append(row)
+    for video_name, sequence_rows in by_video.items():
+        sequence_rows.sort(
+            key=lambda row: (
+                safe_int(row.get("video_sequence_index")),
+                safe_int(row.get("video_frame_index")),
+                row.get("image_file", ""),
+            )
+        )
+        for idx, row_a in enumerate(sequence_rows):
+            upper = min(len(sequence_rows), idx + max(1, video_frame_window) + 1)
+            for row_b in sequence_rows[idx + 1 : upper]:
+                add_pair(row_a, row_b, "video_sequence")
+
+    for video_row in video_rows:
+        candidate_points: set[int] = set()
+        for field in ("nearest_global_point_index", "left_global_point_index", "right_global_point_index"):
+            point = safe_int(video_row.get(field), -1)
+            if point < 0:
+                continue
+            for neighbor in range(point - video_anchor_point_window, point + video_anchor_point_window + 1):
+                if neighbor in by_point:
+                    candidate_points.add(neighbor)
+
+        if not candidate_points:
+            for point, point_row in point_row_by_id.items():
+                if point_distance(video_row, point_row) <= max_pdr_distance_m:
+                    candidate_points.add(point)
+
+        candidate_anchor_rows: List[Dict[str, str]] = []
+        for point in sorted(candidate_points):
+            candidate_anchor_rows.extend(by_point.get(point, []))
+        candidate_anchor_rows.sort(
+            key=lambda row: (
+                point_distance(video_row, row),
+                safe_int(row.get("global_point_index")),
+                safe_int(row.get("image_slot")),
+            )
+        )
+        for anchor_row in select_evenly_spaced(candidate_anchor_rows, video_anchor_limit):
+            add_pair(video_row, anchor_row, "video_to_wifi_anchor")
+
     sorted_pairs = sorted(pairs)
     summary = {
         "point_count": len(by_point),
         "image_count": len(rows),
+        "video_frame_count": len(video_rows),
         "pair_count": len(sorted_pairs),
         "point_window": point_window,
         "slot_window": slot_window,
         "max_pdr_distance_m": max_pdr_distance_m,
+        "video_frame_window": video_frame_window,
+        "video_anchor_point_window": video_anchor_point_window,
+        "video_anchor_limit": video_anchor_limit,
         "reason_counts": {},
     }
     for reason in pairs.values():
@@ -239,6 +316,8 @@ def write_pdr_alignment_refs(workspace_dir: Path, manifest_rows: Sequence[Dict[s
             key=lambda item: (safe_int(item.get("global_point_index")), safe_int(item.get("image_slot"))),
         ):
             image_file = row.get("image_file", "")
+            if row.get("source_type") == "video_base_frame":
+                continue
             if not image_file or image_file in seen:
                 continue
             x = safe_float(row.get("pdr_x"))
@@ -484,16 +563,17 @@ pipeline. The manual sparse/dense scripts are easier to debug.
 
 ## Inputs
 
-- `images/`: 112 renamed photos, grouped by WiFi point and slot.
+- `images/`: renamed WiFi-point photos plus optional video base frames.
 - `image_list.txt`: exact image list passed to COLMAP.
-- `metadata/camera_pose_seed.csv`: PDR XY plus 8-view yaw seed.
+- `metadata/camera_pose_seed.csv`: PDR XY plus ordered point-photo yaw seed.
 - `metadata/wifi_fingerprint_library.csv`: WiFi fingerprint table.
 - `metadata/wifi_boundary_seed.csv`: rough boundary from WiFi/PDR point hull.
 - `metadata/wifi_localization_model.json`: KNN WiFi fingerprint localizer.
 - `metadata/wifi_signal_grid.csv`: interpolated RSSI field inside the sampled area.
 - `metadata/wifi_signal_boundary.csv`: RSSI metrics on the WiFi/PDR boundary.
+- `metadata/video_frames_manifest.csv`: optional video frames used as a weak visual base.
 - `match_pairs.txt`: constrained COLMAP image pairs from WiFi point order,
-  neighboring view slots, and PDR distance.
+  neighboring view slots, PDR distance, and video-frame sequence order.
 - `pdr_alignment_refs.txt`: image position seeds used to align sparse output.
 
 The default sparse script now uses `matches_importer` with `match_pairs.txt` to
@@ -518,6 +598,9 @@ def prepare_colmap_workspace(
     constrained_point_window: int = 1,
     constrained_slot_window: int = 2,
     constrained_max_pdr_distance_m: float = 8.0,
+    constrained_video_frame_window: int = 3,
+    constrained_video_anchor_point_window: int = 1,
+    constrained_video_anchor_limit: int = 12,
 ) -> Dict[str, Any]:
     _fields, manifest_rows = read_csv(reconstruction_dir / "images_manifest.csv")
     workspace_dir.mkdir(parents=True, exist_ok=True)
@@ -531,6 +614,9 @@ def prepare_colmap_workspace(
         point_window=constrained_point_window,
         slot_window=constrained_slot_window,
         max_pdr_distance_m=constrained_max_pdr_distance_m,
+        video_frame_window=constrained_video_frame_window,
+        video_anchor_point_window=constrained_video_anchor_point_window,
+        video_anchor_limit=constrained_video_anchor_limit,
     )
     write_match_pairs(workspace_dir, match_pairs)
     pdr_alignment_ref_count = write_pdr_alignment_refs(workspace_dir, manifest_rows)

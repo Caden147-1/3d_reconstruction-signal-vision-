@@ -1,0 +1,405 @@
+"""Extract route video frames and bind them as weak visual base images."""
+
+from __future__ import annotations
+
+import csv
+import json
+import math
+import re
+import shutil
+import subprocess
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+
+VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
+
+
+def write_csv(path: Path, fieldnames: Sequence[str], rows: Iterable[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def write_json(path: Path, obj: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(obj, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+
+
+def read_csv(path: Path) -> Tuple[List[str], List[Dict[str, str]]]:
+    if not path.exists():
+        return [], []
+    with path.open("r", newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        return reader.fieldnames or [], list(reader)
+
+
+def safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_float(value: Any, default: float = math.nan) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def natural_sort_key(path: Path) -> List[Tuple[int, Any]]:
+    parts = re.split(r"(\d+)", path.name.lower())
+    key: List[Tuple[int, Any]] = []
+    for part in parts:
+        key.append((0, int(part)) if part.isdigit() else (1, part))
+    return key
+
+
+def safe_stem(name: str) -> str:
+    stem = Path(name).stem
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._-")
+    return cleaned or "video"
+
+
+def relative_path(path: Path, root: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(root.resolve()))
+    except ValueError:
+        return str(path)
+
+
+def find_video_files(video_dir: Path) -> List[Path]:
+    if not video_dir.exists() or not video_dir.is_dir():
+        return []
+    return sorted(
+        (path for path in video_dir.iterdir() if path.is_file() and path.suffix.lower() in VIDEO_SUFFIXES),
+        key=natural_sort_key,
+    )
+
+
+def resolve_ffmpeg(root: Path, ffmpeg_exe: Optional[Path]) -> Optional[Path]:
+    candidates: List[Path] = []
+    if ffmpeg_exe is not None:
+        candidates.append(ffmpeg_exe if ffmpeg_exe.is_absolute() else root / ffmpeg_exe)
+
+    found = shutil.which("ffmpeg")
+    if found:
+        candidates.append(Path(found))
+
+    candidates.extend(
+        [
+            root / "ffmpeg.exe",
+            root / "ffmpeg" / "bin" / "ffmpeg.exe",
+            root / "colmap-x64-windows-cuda" / "bin" / "ffmpeg.exe",
+        ]
+    )
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    return None
+
+
+def extract_with_ffmpeg(
+    ffmpeg_exe: Path,
+    video_path: Path,
+    output_dir: Path,
+    frame_interval_s: float,
+    max_frames: int,
+) -> Tuple[str, str]:
+    fps = 1.0 / frame_interval_s
+    command = [
+        str(ffmpeg_exe),
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(video_path),
+        "-vf",
+        f"fps={fps:.6f}",
+        "-q:v",
+        "2",
+    ]
+    if max_frames > 0:
+        command.extend(["-frames:v", str(max_frames)])
+    command.append(str(output_dir / "frame_%06d.jpg"))
+
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0:
+        message = (result.stderr or result.stdout or "").strip()
+        return "failed", message[:1000]
+    return "ok", ""
+
+
+def extract_with_opencv(
+    video_path: Path,
+    output_dir: Path,
+    frame_interval_s: float,
+    max_frames: int,
+) -> Tuple[str, str]:
+    try:
+        import cv2  # type: ignore[import-not-found]
+    except ImportError:
+        return "missing_opencv", "OpenCV is not installed."
+
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        return "failed", "OpenCV could not open the video."
+
+    fps = capture.get(cv2.CAP_PROP_FPS) or 30.0
+    frame_step = max(1, int(round(fps * frame_interval_s)))
+    written = 0
+    frame_index = 0
+    while True:
+        ok, frame = capture.read()
+        if not ok:
+            break
+        if frame_index % frame_step == 0:
+            written += 1
+            output_path = output_dir / f"frame_{written:06d}.jpg"
+            cv2.imwrite(str(output_path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+            if max_frames > 0 and written >= max_frames:
+                break
+        frame_index += 1
+    capture.release()
+    return ("ok", "") if written else ("failed", "No frames were written.")
+
+
+def clean_output_dir(path: Path) -> None:
+    if path.exists():
+        shutil.rmtree(path)
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def point_sort_key(row: Dict[str, str]) -> Tuple[int, int]:
+    return safe_int(row.get("global_point_index")), safe_int(row.get("point_index"))
+
+
+def load_anchor_points(processed_dir: Path) -> List[Dict[str, str]]:
+    _fields, rows = read_csv(processed_dir / "image_wifi_points.csv")
+    points = [row for row in rows if row.get("global_point_index")]
+    points.sort(key=point_sort_key)
+    return points
+
+
+def interpolate_value(left: Dict[str, str], right: Dict[str, str], field: str, ratio: float) -> str:
+    left_value = safe_float(left.get(field))
+    right_value = safe_float(right.get(field))
+    if math.isnan(left_value) or math.isnan(right_value):
+        return ""
+    return f"{left_value + ratio * (right_value - left_value):.6f}"
+
+
+def bind_frame_to_route(
+    points: Sequence[Dict[str, str]],
+    frame_index_zero_based: int,
+    frame_count: int,
+) -> Dict[str, Any]:
+    if not points:
+        return {
+            "bind_type": "visual_only",
+            "wifi_label_weight": 0.0,
+            "nearest_global_point_index": "",
+            "left_global_point_index": "",
+            "right_global_point_index": "",
+            "route_ratio": "",
+            "pdr_x": "",
+            "pdr_y": "",
+            "pdr_bind_source": "no_anchor_points",
+        }
+
+    if len(points) == 1 or frame_count <= 1:
+        point = points[0]
+        return {
+            "bind_type": "single_anchor_interpolated",
+            "wifi_label_weight": 0.15,
+            "nearest_global_point_index": point.get("global_point_index", ""),
+            "left_global_point_index": point.get("global_point_index", ""),
+            "right_global_point_index": point.get("global_point_index", ""),
+            "route_ratio": "0.000000",
+            "pdr_x": point.get("pdr_x", ""),
+            "pdr_y": point.get("pdr_y", ""),
+            "pdr_bind_source": "single_anchor_point",
+        }
+
+    progress = frame_index_zero_based / max(1, frame_count - 1)
+    route_position = progress * (len(points) - 1)
+    left_index = int(math.floor(route_position))
+    right_index = min(len(points) - 1, int(math.ceil(route_position)))
+    ratio = route_position - left_index
+    left = points[left_index]
+    right = points[right_index]
+    nearest = left if ratio <= 0.5 else right
+
+    return {
+        "bind_type": "order_interpolated_video_base",
+        "wifi_label_weight": 0.15,
+        "nearest_global_point_index": nearest.get("global_point_index", ""),
+        "left_global_point_index": left.get("global_point_index", ""),
+        "right_global_point_index": right.get("global_point_index", ""),
+        "route_ratio": f"{progress:.6f}",
+        "pdr_x": interpolate_value(left, right, "pdr_x", ratio),
+        "pdr_y": interpolate_value(left, right, "pdr_y", ratio),
+        "pdr_bind_source": "route_order_interpolation",
+    }
+
+
+def build_frame_rows(
+    root: Path,
+    video_path: Path,
+    frames: Sequence[Path],
+    points: Sequence[Dict[str, str]],
+    frame_interval_s: float,
+    start_sequence_index: int,
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    frame_count = len(frames)
+    for idx, frame_path in enumerate(frames):
+        binding = bind_frame_to_route(points, idx, frame_count)
+        rows.append(
+            {
+                "source_type": "video_base_frame",
+                "video_name": video_path.name,
+                "video_path": relative_path(video_path, root),
+                "frame_name": frame_path.name,
+                "frame_path": relative_path(frame_path, root),
+                "video_frame_index": idx + 1,
+                "video_sequence_index": start_sequence_index + idx,
+                "video_time_s": f"{idx * frame_interval_s:.3f}",
+                **binding,
+            }
+        )
+    return rows
+
+
+def run_video_frame_pipeline(
+    root: Path,
+    processed_dir: Path,
+    video_dir: Path,
+    frame_interval_s: float = 1.0,
+    max_frames: int = 240,
+    ffmpeg_exe: Optional[Path] = None,
+) -> Dict[str, Any]:
+    if frame_interval_s <= 0:
+        raise ValueError("--video-frame-interval-s must be greater than zero")
+
+    resolved_video_dir = video_dir if video_dir.is_absolute() else root / video_dir
+    frames_root = processed_dir / "video_frames"
+    manifest_path = processed_dir / "video_frames_manifest.csv"
+    summary_path = processed_dir / "video_frames_summary.json"
+
+    if not resolved_video_dir.exists():
+        summary = {
+            "status": "skipped",
+            "reason": "missing_video_dir",
+            "video_dir": str(resolved_video_dir),
+            "frame_manifest": str(manifest_path),
+        }
+        write_csv(manifest_path, VIDEO_FRAME_FIELDS, [])
+        write_json(summary_path, summary)
+        return summary
+
+    videos = find_video_files(resolved_video_dir)
+    if not videos:
+        summary = {
+            "status": "skipped",
+            "reason": "no_video_files",
+            "video_dir": str(resolved_video_dir),
+            "frame_manifest": str(manifest_path),
+        }
+        write_csv(manifest_path, VIDEO_FRAME_FIELDS, [])
+        write_json(summary_path, summary)
+        return summary
+
+    ffmpeg = resolve_ffmpeg(root, ffmpeg_exe)
+    points = load_anchor_points(processed_dir)
+    rows: List[Dict[str, Any]] = []
+    video_summaries: List[Dict[str, Any]] = []
+
+    for video_path in videos:
+        output_dir = frames_root / safe_stem(video_path.name)
+        clean_output_dir(output_dir)
+        if ffmpeg is not None:
+            extract_status, message = extract_with_ffmpeg(
+                ffmpeg_exe=ffmpeg,
+                video_path=video_path,
+                output_dir=output_dir,
+                frame_interval_s=frame_interval_s,
+                max_frames=max_frames,
+            )
+            extractor = "ffmpeg"
+        else:
+            extract_status, message = extract_with_opencv(
+                video_path=video_path,
+                output_dir=output_dir,
+                frame_interval_s=frame_interval_s,
+                max_frames=max_frames,
+            )
+            extractor = "opencv"
+
+        frames = sorted(output_dir.glob("*.jpg"), key=natural_sort_key)
+        video_rows = build_frame_rows(
+            root=root,
+            video_path=video_path,
+            frames=frames,
+            points=points,
+            frame_interval_s=frame_interval_s,
+            start_sequence_index=len(rows) + 1,
+        )
+        rows.extend(video_rows)
+        video_summaries.append(
+            {
+                "video": relative_path(video_path, root),
+                "extractor": extractor,
+                "status": extract_status,
+                "message": message,
+                "frame_count": len(frames),
+                "output_dir": str(output_dir),
+            }
+        )
+
+    write_csv(manifest_path, VIDEO_FRAME_FIELDS, rows)
+    status = "ok" if rows else "no_frames"
+    if all(item["status"] != "ok" for item in video_summaries):
+        status = "extract_failed"
+    summary = {
+        "status": status,
+        "video_dir": str(resolved_video_dir),
+        "video_count": len(videos),
+        "frame_count": len(rows),
+        "anchor_point_count": len(points),
+        "frame_interval_s": frame_interval_s,
+        "max_frames_per_video": max_frames,
+        "ffmpeg_exe": "" if ffmpeg is None else str(ffmpeg),
+        "frame_manifest": str(manifest_path),
+        "videos": video_summaries,
+    }
+    write_json(summary_path, summary)
+    return summary
+
+
+VIDEO_FRAME_FIELDS = [
+    "source_type",
+    "video_name",
+    "video_path",
+    "frame_name",
+    "frame_path",
+    "video_frame_index",
+    "video_sequence_index",
+    "video_time_s",
+    "bind_type",
+    "wifi_label_weight",
+    "nearest_global_point_index",
+    "left_global_point_index",
+    "right_global_point_index",
+    "route_ratio",
+    "pdr_x",
+    "pdr_y",
+    "pdr_bind_source",
+]

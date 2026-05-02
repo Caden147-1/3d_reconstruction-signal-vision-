@@ -18,7 +18,9 @@ DEFAULT_ARGS = [
     "--pic-dir",
     "pic",
     "--images-per-wifi-point",
-    "8",
+    "20",
+    "--video-dir",
+    "video",
     "--point-event",
     "CHECKPOINT_PAUSE",
 ]
