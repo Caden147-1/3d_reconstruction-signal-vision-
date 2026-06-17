@@ -46,6 +46,15 @@ def write_text(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
+def write_csv_rows(path: Path, fieldnames: Sequence[str], rows: Iterable[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
 def windows_path(path: Path) -> str:
     return str(path.resolve())
 
@@ -136,6 +145,13 @@ def circular_slot_distance(slot_a: int, slot_b: int, slot_count: int) -> int:
     return min(diff, max(0, slot_count - diff))
 
 
+def anchor_slot_count(rows: Sequence[Dict[str, str]]) -> int:
+    counts = [safe_int(row.get("anchor_slot_count")) for row in rows if safe_int(row.get("anchor_slot_count")) > 0]
+    if counts:
+        return max(counts)
+    return max((safe_int(row.get("image_slot")) for row in rows), default=len(rows))
+
+
 def point_distance(row_a: Dict[str, str], row_b: Dict[str, str]) -> float:
     ax = safe_float(row_a.get("pdr_x"))
     ay = safe_float(row_a.get("pdr_y"))
@@ -171,7 +187,8 @@ def build_constrained_match_pairs(
     video_frame_window: int,
     video_anchor_point_window: int,
     video_anchor_limit: int,
-) -> Tuple[List[Tuple[str, str]], Dict[str, Any]]:
+    visual_only: bool = False,
+) -> Tuple[List[Tuple[str, str]], List[Dict[str, Any]], Dict[str, Any]]:
     video_frame_window = max(1, video_frame_window)
     video_anchor_point_window = max(0, video_anchor_point_window)
     video_anchor_limit = max(0, video_anchor_limit)
@@ -202,7 +219,7 @@ def build_constrained_match_pairs(
         pairs.setdefault(key, reason)
 
     for point, point_rows in by_point.items():
-        slot_count = max((safe_int(row.get("image_slot")) for row in point_rows), default=len(point_rows))
+        slot_count = anchor_slot_count(point_rows)
         for idx, row_a in enumerate(point_rows):
             for row_b in point_rows[idx + 1 :]:
                 distance = circular_slot_distance(
@@ -218,14 +235,12 @@ def build_constrained_match_pairs(
     for left_index, point_a in enumerate(points):
         for point_b in points[left_index + 1 :]:
             point_gap = point_b - point_a
-            pdr_gap = point_distance(point_row_by_id[point_a], point_row_by_id[point_b])
-            if point_gap > point_window and pdr_gap > max_pdr_distance_m:
+            pdr_gap = math.inf if visual_only else point_distance(point_row_by_id[point_a], point_row_by_id[point_b])
+            if point_gap > point_window and (visual_only or pdr_gap > max_pdr_distance_m):
                 continue
             rows_a = by_point[point_a]
             rows_b = by_point[point_b]
-            slot_count = max(
-                [safe_int(row.get("image_slot")) for row in rows_a + rows_b] or [len(rows_a), len(rows_b)]
-            )
+            slot_count = anchor_slot_count(rows_a + rows_b)
             for row_a in rows_a:
                 for row_b in rows_b:
                     slot_gap = circular_slot_distance(
@@ -264,7 +279,7 @@ def build_constrained_match_pairs(
                 if neighbor in by_point:
                     candidate_points.add(neighbor)
 
-        if not candidate_points:
+        if not candidate_points and not visual_only:
             for point, point_row in point_row_by_id.items():
                 if point_distance(video_row, point_row) <= max_pdr_distance_m:
                     candidate_points.add(point)
@@ -283,14 +298,43 @@ def build_constrained_match_pairs(
             add_pair(video_row, anchor_row, "video_to_wifi_anchor")
 
     sorted_pairs = sorted(pairs)
+    row_by_image = {
+        row.get("image_file", ""): row
+        for row in manifest_rows
+        if row.get("image_file")
+    }
+    edge_rows: List[Dict[str, Any]] = []
+    for image_a, image_b in sorted_pairs:
+        row_a = row_by_image.get(image_a, {})
+        row_b = row_by_image.get(image_b, {})
+        pdr_distance = point_distance(row_a, row_b)
+        edge_rows.append(
+            {
+                "image_a": image_a,
+                "image_b": image_b,
+                "reason": pairs[(image_a, image_b)],
+                "source_type_a": row_a.get("source_type", ""),
+                "source_type_b": row_b.get("source_type", ""),
+                "global_point_index_a": row_a.get("global_point_index") or row_a.get("nearest_global_point_index", ""),
+                "global_point_index_b": row_b.get("global_point_index") or row_b.get("nearest_global_point_index", ""),
+                "image_slot_a": row_a.get("image_slot", ""),
+                "image_slot_b": row_b.get("image_slot", ""),
+                "anchor_slot_count_a": row_a.get("anchor_slot_count", ""),
+                "anchor_slot_count_b": row_b.get("anchor_slot_count", ""),
+                "video_sequence_index_a": row_a.get("video_sequence_index", ""),
+                "video_sequence_index_b": row_b.get("video_sequence_index", ""),
+                "pdr_distance_m": "" if visual_only or math.isinf(pdr_distance) else round(pdr_distance, 6),
+            }
+        )
     summary = {
         "point_count": len(by_point),
         "image_count": len(rows),
         "video_frame_count": len(video_rows),
         "pair_count": len(sorted_pairs),
+        "visual_only": visual_only,
         "point_window": point_window,
         "slot_window": slot_window,
-        "max_pdr_distance_m": max_pdr_distance_m,
+        "max_pdr_distance_m": None if visual_only else max_pdr_distance_m,
         "video_frame_window": video_frame_window,
         "video_anchor_point_window": video_anchor_point_window,
         "video_anchor_limit": video_anchor_limit,
@@ -298,13 +342,36 @@ def build_constrained_match_pairs(
     }
     for reason in pairs.values():
         summary["reason_counts"][reason] = summary["reason_counts"].get(reason, 0) + 1
-    return sorted_pairs, summary
+    return sorted_pairs, edge_rows, summary
 
 
 def write_match_pairs(workspace_dir: Path, pairs: Sequence[Tuple[str, str]]) -> None:
     with (workspace_dir / "match_pairs.txt").open("w", encoding="utf-8") as handle:
         for image_a, image_b in pairs:
             handle.write(f"{image_a} {image_b}\n")
+
+
+def write_match_graph_edges(workspace_dir: Path, edge_rows: Sequence[Dict[str, Any]]) -> None:
+    write_csv_rows(
+        workspace_dir / "match_graph_edges.csv",
+        [
+            "image_a",
+            "image_b",
+            "reason",
+            "source_type_a",
+            "source_type_b",
+            "global_point_index_a",
+            "global_point_index_b",
+            "image_slot_a",
+            "image_slot_b",
+            "anchor_slot_count_a",
+            "anchor_slot_count_b",
+            "video_sequence_index_a",
+            "video_sequence_index_b",
+            "pdr_distance_m",
+        ],
+        edge_rows,
+    )
 
 
 def write_pdr_alignment_refs(workspace_dir: Path, manifest_rows: Sequence[Dict[str, str]]) -> int:
@@ -329,6 +396,12 @@ def write_pdr_alignment_refs(workspace_dir: Path, manifest_rows: Sequence[Dict[s
             seen.add(image_file)
             written += 1
     return written
+
+
+def remove_pdr_alignment_refs(workspace_dir: Path) -> None:
+    refs_path = workspace_dir / "pdr_alignment_refs.txt"
+    if refs_path.exists():
+        refs_path.unlink()
 
 
 def batch_header(root: Path, workspace_dir: Path, colmap_exe: Path) -> str:
@@ -356,12 +429,16 @@ def write_sparse_batch(
     single_camera: bool,
     use_gpu: bool,
     matcher: str,
+    align_to_pdr: bool,
+    feature_max_image_size: int,
+    max_num_features: int,
+    max_num_matches: int,
 ) -> None:
     matcher_command = "sequential_matcher" if matcher == "sequential" else "exhaustive_matcher"
     single_camera_flag = "1" if single_camera else "0"
     gpu_flag = "1" if use_gpu else "0"
     if matcher == "constrained":
-        matching_block = f"""echo [2/4] Matching constrained image pairs from WiFi/PDR/order priors...
+        matching_block = f"""echo [2/4] Matching constrained image pairs from visual/order priors...
 if not exist "%WORKSPACE%\\match_pairs.txt" (
   echo [error] Missing constrained pair list: %WORKSPACE%\\match_pairs.txt
   exit /b 1
@@ -372,7 +449,7 @@ if not exist "%WORKSPACE%\\match_pairs.txt" (
   --match_type pairs ^
   --FeatureMatching.use_gpu {gpu_flag} ^
   --FeatureMatching.guided_matching 1 ^
-  --FeatureMatching.max_num_matches 65536
+  --FeatureMatching.max_num_matches {max_num_matches}
 if errorlevel 1 exit /b %errorlevel%
 """
     else:
@@ -381,36 +458,17 @@ if errorlevel 1 exit /b %errorlevel%
   --database_path "%DATABASE%" ^
   --FeatureMatching.use_gpu {gpu_flag} ^
   --FeatureMatching.guided_matching 1 ^
-  --FeatureMatching.max_num_matches 65536
+  --FeatureMatching.max_num_matches {max_num_matches}
 if errorlevel 1 exit /b %errorlevel%
 """
-    content = batch_header(root, workspace_dir, colmap_exe) + f"""
-if exist "%DATABASE%" (
-  echo [warn] Existing database found: %DATABASE%
-  echo [warn] If you changed matching constraints, run reset_colmap_outputs.bat first.
-)
-if not exist "%WORKSPACE%\\sparse" mkdir "%WORKSPACE%\\sparse"
-
-echo [1/4] Extracting features...
-"%COLMAP_EXE%" feature_extractor ^
-  --database_path "%DATABASE%" ^
-  --image_path "%IMAGE_PATH%" ^
-  --image_list_path "%IMAGE_LIST%" ^
-  --ImageReader.camera_model {camera_model} ^
-  --ImageReader.single_camera {single_camera_flag} ^
-  --FeatureExtraction.use_gpu {gpu_flag}
-if errorlevel 1 exit /b %errorlevel%
-
-{matching_block}
-
-echo [3/4] Building sparse model...
-"%COLMAP_EXE%" mapper ^
-  --database_path "%DATABASE%" ^
-  --image_path "%IMAGE_PATH%" ^
-  --output_path "%WORKSPACE%\\sparse" ^
-  --Mapper.multiple_models 0
-if errorlevel 1 exit /b %errorlevel%
-
+    feature_limits = ""
+    if feature_max_image_size > 0:
+        feature_limits += f" ^\n  --SiftExtraction.max_image_size {feature_max_image_size}"
+    if max_num_features > 0:
+        feature_limits += f" ^\n  --SiftExtraction.max_num_features {max_num_features}"
+    alignment_block = ""
+    if align_to_pdr:
+        alignment_block = """
 echo [4/4] Aligning sparse model to PDR coordinate seeds...
 if exist "%WORKSPACE%\\pdr_alignment_refs.txt" (
   if exist "%WORKSPACE%\\sparse\\0" (
@@ -430,17 +488,61 @@ if exist "%WORKSPACE%\\pdr_alignment_refs.txt" (
     )
   )
 )
+"""
+    else:
+        alignment_block = """
+echo [4/4] Skipping PDR alignment for visual-only reconstruction.
+"""
+    content = batch_header(root, workspace_dir, colmap_exe) + f"""
+if exist "%DATABASE%" (
+  echo [warn] Existing database found: %DATABASE%
+  echo [warn] If you changed matching constraints, run reset_colmap_outputs.bat first.
+)
+if not exist "%WORKSPACE%\\sparse" mkdir "%WORKSPACE%\\sparse"
 
+echo [1/4] Extracting features...
+"%COLMAP_EXE%" feature_extractor ^
+  --database_path "%DATABASE%" ^
+  --image_path "%IMAGE_PATH%" ^
+  --image_list_path "%IMAGE_LIST%" ^
+  --ImageReader.camera_model {camera_model} ^
+  --ImageReader.single_camera {single_camera_flag} ^
+  --FeatureExtraction.use_gpu {gpu_flag}{feature_limits}
+if errorlevel 1 exit /b %errorlevel%
+
+{matching_block}
+
+echo [3/4] Building sparse model...
+"%COLMAP_EXE%" mapper ^
+  --database_path "%DATABASE%" ^
+  --image_path "%IMAGE_PATH%" ^
+  --output_path "%WORKSPACE%\\sparse" ^
+  --Mapper.multiple_models 0
+if errorlevel 1 exit /b %errorlevel%
+
+{alignment_block}
 echo [done] Sparse model written under %WORKSPACE%\\sparse
 """
     write_text(workspace_dir / "run_colmap_sparse.bat", content)
 
 
-def write_dense_batch(root: Path, workspace_dir: Path, colmap_exe: Path, dense_max_image_size: int) -> None:
-    content = batch_header(root, workspace_dir, colmap_exe) + f"""
-set "SPARSE_MODEL=%WORKSPACE%\\sparse_pdr_aligned\\0"
+def write_dense_batch(
+    root: Path,
+    workspace_dir: Path,
+    colmap_exe: Path,
+    dense_max_image_size: int,
+    align_to_pdr: bool,
+) -> None:
+    sparse_selector = (
+        """set "SPARSE_MODEL=%WORKSPACE%\\sparse_pdr_aligned\\0"
 if not exist "%SPARSE_MODEL%" set "SPARSE_MODEL=%WORKSPACE%\\sparse\\0"
-if not exist "%SPARSE_MODEL%" (
+"""
+        if align_to_pdr
+        else """set "SPARSE_MODEL=%WORKSPACE%\\sparse\\0"
+"""
+    )
+    content = batch_header(root, workspace_dir, colmap_exe) + f"""
+{sparse_selector}if not exist "%SPARSE_MODEL%" (
   echo [error] Sparse model not found: %SPARSE_MODEL%
   echo Run run_colmap_sparse.bat first, or check which sparse model folder COLMAP created.
   exit /b 1
@@ -547,8 +649,18 @@ echo [done] COLMAP outputs reset.
     write_text(workspace_dir / "reset_colmap_outputs.bat", content)
 
 
-def write_readme(workspace_dir: Path) -> None:
-    content = """# COLMAP Workspace
+def write_readme(workspace_dir: Path, visual_only: bool) -> None:
+    alignment_note = (
+        "This workspace is visual-only: no `pdr_alignment_refs.txt` is generated, and sparse models are not aligned to PDR.\n"
+        if visual_only
+        else "After sparse mapping, the script tries to align the model to PDR coordinates and dense reconstruction prefers that aligned model.\n"
+    )
+    pdr_ref_line = (
+        "- `pdr_alignment_refs.txt`: disabled in visual-only mode.\n"
+        if visual_only
+        else "- `pdr_alignment_refs.txt`: image position seeds used to align sparse output.\n"
+    )
+    content = f"""# COLMAP Workspace
 
 This folder is prepared from the current WiFi/IMU/photo capture.
 
@@ -556,7 +668,7 @@ This folder is prepared from the current WiFi/IMU/photo capture.
 
 1. Run `run_colmap_sparse.bat` to build the sparse SfM model.
 2. If `sparse/0` is created, run `run_colmap_dense.bat` to generate `dense/fused.ply`.
-3. Or run `run_colmap_full.bat` to do both steps.
+3. For final spatial measurement, prepare the workspace with `python main.py --reconstruction-profile final` before running dense.
 
 `run_colmap_automatic.bat` is also provided if you prefer COLMAP's automatic
 pipeline. The manual sparse/dense scripts are easier to debug.
@@ -573,12 +685,12 @@ pipeline. The manual sparse/dense scripts are easier to debug.
 - `metadata/wifi_signal_boundary.csv`: RSSI metrics on the WiFi/PDR boundary.
 - `metadata/video_frames_manifest.csv`: optional video frames used as a weak visual base.
 - `match_pairs.txt`: constrained COLMAP image pairs from WiFi point order,
-  neighboring view slots, PDR distance, and video-frame sequence order.
-- `pdr_alignment_refs.txt`: image position seeds used to align sparse output.
+  neighboring angular slots, and video-frame sequence order.
+- `match_graph_edges.csv`: diagnostic edge list with pair reasons and original slot counts.
+{pdr_ref_line}
 
 The default sparse script now uses `matches_importer` with `match_pairs.txt` to
-avoid matching unrelated indoor images. After sparse mapping, it tries to align
-the model to PDR coordinates and dense reconstruction prefers that aligned model.
+avoid matching unrelated indoor images. {alignment_note}
 """
     write_text(workspace_dir / "README.md", content)
 
@@ -594,7 +706,11 @@ def prepare_colmap_workspace(
     use_gpu: bool = True,
     matcher: str = "constrained",
     quality: str = "high",
-    dense_max_image_size: int = 2000,
+    dense_max_image_size: int = 1200,
+    visual_only: bool = False,
+    feature_max_image_size: int = 1600,
+    max_num_features: int = 6000,
+    max_num_matches: int = 32768,
     constrained_point_window: int = 1,
     constrained_slot_window: int = 2,
     constrained_max_pdr_distance_m: float = 8.0,
@@ -609,7 +725,7 @@ def prepare_colmap_workspace(
     copied_images, image_names, missing_images = copy_images(reconstruction_dir, workspace_dir, manifest_rows)
     copied_metadata = copy_metadata(reconstruction_dir, workspace_dir)
     write_image_list(workspace_dir, image_names)
-    match_pairs, match_pair_summary = build_constrained_match_pairs(
+    match_pairs, match_edge_rows, match_pair_summary = build_constrained_match_pairs(
         manifest_rows=manifest_rows,
         point_window=constrained_point_window,
         slot_window=constrained_slot_window,
@@ -617,9 +733,16 @@ def prepare_colmap_workspace(
         video_frame_window=constrained_video_frame_window,
         video_anchor_point_window=constrained_video_anchor_point_window,
         video_anchor_limit=constrained_video_anchor_limit,
+        visual_only=visual_only,
     )
     write_match_pairs(workspace_dir, match_pairs)
-    pdr_alignment_ref_count = write_pdr_alignment_refs(workspace_dir, manifest_rows)
+    write_match_graph_edges(workspace_dir, match_edge_rows)
+    align_to_pdr = not visual_only
+    if align_to_pdr:
+        pdr_alignment_ref_count = write_pdr_alignment_refs(workspace_dir, manifest_rows)
+    else:
+        remove_pdr_alignment_refs(workspace_dir)
+        pdr_alignment_ref_count = 0
 
     matcher = matcher if matcher in {"constrained", "exhaustive", "sequential"} else "constrained"
     write_sparse_batch(
@@ -630,12 +753,17 @@ def prepare_colmap_workspace(
         single_camera=single_camera,
         use_gpu=use_gpu,
         matcher=matcher,
+        align_to_pdr=align_to_pdr,
+        feature_max_image_size=feature_max_image_size,
+        max_num_features=max_num_features,
+        max_num_matches=max_num_matches,
     )
     write_dense_batch(
         root=root,
         workspace_dir=workspace_dir,
         colmap_exe=resolved_colmap_exe,
         dense_max_image_size=dense_max_image_size,
+        align_to_pdr=align_to_pdr,
     )
     write_full_batch(workspace_dir)
     write_automatic_batch(
@@ -649,7 +777,7 @@ def prepare_colmap_workspace(
     )
     write_gui_batch(root=root, workspace_dir=workspace_dir, colmap_exe=resolved_colmap_exe)
     write_reset_batch(workspace_dir)
-    write_readme(workspace_dir)
+    write_readme(workspace_dir, visual_only=visual_only)
 
     summary = {
         "status": "ok" if not missing_images and resolved_colmap_exe.exists() else "needs_attention",
@@ -666,7 +794,13 @@ def prepare_colmap_workspace(
         "single_camera": single_camera,
         "use_gpu": use_gpu,
         "matcher": matcher,
+        "visual_only": visual_only,
+        "pdr_alignment_enabled": align_to_pdr,
+        "feature_max_image_size": feature_max_image_size,
+        "max_num_features": max_num_features,
+        "max_num_matches": max_num_matches,
         "constrained_match_pairs": match_pair_summary,
+        "match_graph_edges": "match_graph_edges.csv",
         "pdr_alignment_ref_count": pdr_alignment_ref_count,
         "quality": quality,
         "dense_max_image_size": dense_max_image_size,

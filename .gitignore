@@ -16,6 +16,12 @@ processed/
 reconstruction_dataset/
 colmap_workspace/
 
+# Research papers and extracted notes
+Papers/
+paper_texts/
+*paper*.md
+*Paper*.md
+
 # Local COLMAP binary/package
 colmap-x64-windows-cuda/
 colmap/

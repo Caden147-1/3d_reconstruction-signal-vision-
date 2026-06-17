@@ -171,6 +171,131 @@ def extract_with_opencv(
     return ("ok", "") if written else ("failed", "No frames were written.")
 
 
+def frame_original_index(frame_path: Path, fallback: int) -> int:
+    matches = re.findall(r"\d+", frame_path.stem)
+    if not matches:
+        return fallback
+    return safe_int(matches[-1], fallback)
+
+
+def filter_keyframes(
+    frames: Sequence[Path],
+    blur_threshold: float,
+    min_visual_change: float,
+    min_gap: int,
+) -> Tuple[List[Path], Dict[str, Dict[str, Any]], Dict[str, Any]]:
+    if not frames:
+        return [], {}, {
+            "status": "no_frames",
+            "input_frame_count": 0,
+            "kept_frame_count": 0,
+            "rejected_blurry_count": 0,
+            "rejected_low_change_count": 0,
+            "rejected_too_close_count": 0,
+            "rejected_unreadable_count": 0,
+        }
+
+    needs_cv = blur_threshold > 0 or min_visual_change > 0
+    if not needs_cv and min_gap <= 1:
+        return list(frames), {}, {
+            "status": "disabled",
+            "input_frame_count": len(frames),
+            "kept_frame_count": len(frames),
+            "rejected_blurry_count": 0,
+            "rejected_low_change_count": 0,
+            "rejected_too_close_count": 0,
+            "rejected_unreadable_count": 0,
+        }
+
+    try:
+        import cv2  # type: ignore[import-not-found]
+    except ImportError:
+        return list(frames), {}, {
+            "status": "missing_opencv",
+            "input_frame_count": len(frames),
+            "kept_frame_count": len(frames),
+            "rejected_blurry_count": 0,
+            "rejected_low_change_count": 0,
+            "rejected_too_close_count": 0,
+            "rejected_unreadable_count": 0,
+        }
+
+    kept: List[Path] = []
+    metrics: Dict[str, Dict[str, Any]] = {}
+    best_frame: Optional[Path] = None
+    best_blur = -1.0
+    last_kept_gray = None
+    last_kept_frame_pos = -10**9
+    rejected_blurry = 0
+    rejected_low_change = 0
+    rejected_too_close = 0
+    rejected_unreadable = 0
+    min_gap = max(1, min_gap)
+
+    for frame_pos, frame_path in enumerate(frames):
+        gray = cv2.imread(str(frame_path), cv2.IMREAD_GRAYSCALE)
+        if gray is None:
+            rejected_unreadable += 1
+            continue
+
+        blur_score = float(cv2.Laplacian(gray, cv2.CV_64F).var()) if blur_threshold > 0 else 0.0
+        if blur_score > best_blur:
+            best_blur = blur_score
+            best_frame = frame_path
+
+        if blur_threshold > 0 and blur_score < blur_threshold:
+            rejected_blurry += 1
+            continue
+
+        if kept and frame_pos - last_kept_frame_pos < min_gap:
+            rejected_too_close += 1
+            continue
+
+        visual_change = ""
+        if last_kept_gray is not None and min_visual_change > 0:
+            compare_gray = gray
+            if gray.shape != last_kept_gray.shape:
+                compare_gray = cv2.resize(gray, (last_kept_gray.shape[1], last_kept_gray.shape[0]))
+            visual_change_value = float(cv2.mean(cv2.absdiff(compare_gray, last_kept_gray))[0])
+            visual_change = round(visual_change_value, 6)
+            if visual_change_value < min_visual_change:
+                rejected_low_change += 1
+                continue
+
+        kept.append(frame_path)
+        metrics[frame_path.name] = {
+            "blur_score": round(blur_score, 6) if blur_threshold > 0 else "",
+            "visual_change": visual_change,
+            "keyframe_filter_status": "kept",
+        }
+        last_kept_gray = gray
+        last_kept_frame_pos = frame_pos
+
+    fallback_used = False
+    if not kept and best_frame is not None:
+        kept.append(best_frame)
+        metrics[best_frame.name] = {
+            "blur_score": round(best_blur, 6) if blur_threshold > 0 else "",
+            "visual_change": "",
+            "keyframe_filter_status": "fallback_best_blur",
+        }
+        fallback_used = True
+
+    return kept, metrics, {
+        "status": "ok",
+        "input_frame_count": len(frames),
+        "kept_frame_count": len(kept),
+        "rejected_blurry_count": rejected_blurry,
+        "rejected_low_change_count": rejected_low_change,
+        "rejected_too_close_count": rejected_too_close,
+        "rejected_unreadable_count": rejected_unreadable,
+        "fallback_used": fallback_used,
+        "blur_threshold": blur_threshold,
+        "min_visual_change": min_visual_change,
+        "min_gap": min_gap,
+    }
+
+
 def clean_output_dir(path: Path) -> None:
     if path.exists():
         shutil.rmtree(path)
@@ -257,11 +382,16 @@ def build_frame_rows(
     points: Sequence[Dict[str, str]],
     frame_interval_s: float,
     start_sequence_index: int,
+    source_frame_count: Optional[int] = None,
+    frame_metrics: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
-    frame_count = len(frames)
+    frame_count = source_frame_count or len(frames)
+    frame_metrics = frame_metrics or {}
     for idx, frame_path in enumerate(frames):
-        binding = bind_frame_to_route(points, idx, frame_count)
+        original_index = frame_original_index(frame_path, idx + 1)
+        binding = bind_frame_to_route(points, max(0, original_index - 1), frame_count)
+        metrics = frame_metrics.get(frame_path.name, {})
         rows.append(
             {
                 "source_type": "video_base_frame",
@@ -269,9 +399,12 @@ def build_frame_rows(
                 "video_path": relative_path(video_path, root),
                 "frame_name": frame_path.name,
                 "frame_path": relative_path(frame_path, root),
-                "video_frame_index": idx + 1,
+                "video_frame_index": original_index,
                 "video_sequence_index": start_sequence_index + idx,
-                "video_time_s": f"{idx * frame_interval_s:.3f}",
+                "video_time_s": f"{(original_index - 1) * frame_interval_s:.3f}",
+                "blur_score": metrics.get("blur_score", ""),
+                "visual_change": metrics.get("visual_change", ""),
+                "keyframe_filter_status": metrics.get("keyframe_filter_status", "kept"),
                 **binding,
             }
         )
@@ -282,9 +415,12 @@ def run_video_frame_pipeline(
     root: Path,
     processed_dir: Path,
     video_dir: Path,
-    frame_interval_s: float = 1.0,
-    max_frames: int = 240,
+    frame_interval_s: float = 1.5,
+    max_frames: int = 120,
     ffmpeg_exe: Optional[Path] = None,
+    blur_threshold: float = 80.0,
+    keyframe_min_change: float = 6.0,
+    keyframe_min_gap: int = 2,
 ) -> Dict[str, Any]:
     if frame_interval_s <= 0:
         raise ValueError("--video-frame-interval-s must be greater than zero")
@@ -344,13 +480,21 @@ def run_video_frame_pipeline(
             extractor = "opencv"
 
         frames = sorted(output_dir.glob("*.jpg"), key=natural_sort_key)
+        selected_frames, frame_metrics, keyframe_summary = filter_keyframes(
+            frames=frames,
+            blur_threshold=blur_threshold,
+            min_visual_change=keyframe_min_change,
+            min_gap=keyframe_min_gap,
+        )
         video_rows = build_frame_rows(
             root=root,
             video_path=video_path,
-            frames=frames,
+            frames=selected_frames,
             points=points,
             frame_interval_s=frame_interval_s,
             start_sequence_index=len(rows) + 1,
+            source_frame_count=len(frames),
+            frame_metrics=frame_metrics,
         )
         rows.extend(video_rows)
         video_summaries.append(
@@ -359,7 +503,9 @@ def run_video_frame_pipeline(
                 "extractor": extractor,
                 "status": extract_status,
                 "message": message,
-                "frame_count": len(frames),
+                "extracted_frame_count": len(frames),
+                "frame_count": len(selected_frames),
+                "keyframe_filter": keyframe_summary,
                 "output_dir": str(output_dir),
             }
         )
@@ -376,6 +522,9 @@ def run_video_frame_pipeline(
         "anchor_point_count": len(points),
         "frame_interval_s": frame_interval_s,
         "max_frames_per_video": max_frames,
+        "blur_threshold": blur_threshold,
+        "keyframe_min_change": keyframe_min_change,
+        "keyframe_min_gap": keyframe_min_gap,
         "ffmpeg_exe": "" if ffmpeg is None else str(ffmpeg),
         "frame_manifest": str(manifest_path),
         "videos": video_summaries,
@@ -393,6 +542,9 @@ VIDEO_FRAME_FIELDS = [
     "video_frame_index",
     "video_sequence_index",
     "video_time_s",
+    "blur_score",
+    "visual_change",
+    "keyframe_filter_status",
     "bind_type",
     "wifi_label_weight",
     "nearest_global_point_index",

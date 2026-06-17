@@ -23,6 +23,7 @@ DEFAULT_ARGS = [
     "video",
     "--point-event",
     "CHECKPOINT_PAUSE",
+    "--visual-only",
 ]
 
 

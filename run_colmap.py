@@ -20,7 +20,7 @@ SCRIPT_BY_MODE = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=SCRIPT_BY_MODE, nargs="?", default="full")
+    parser.add_argument("mode", choices=SCRIPT_BY_MODE, nargs="?", default="sparse")
     parser.add_argument("--workspace", type=Path, default=Path("colmap_workspace"))
     return parser.parse_args()
 

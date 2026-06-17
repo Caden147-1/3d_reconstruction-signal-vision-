@@ -154,6 +154,77 @@ def point_key(row: Dict[str, str]) -> str:
     return f"{row.get('session', '')}|{row.get('global_point_index', '')}"
 
 
+def select_evenly_spaced_rows(rows: Sequence[Dict[str, str]], limit: int) -> List[Dict[str, str]]:
+    if limit <= 0 or len(rows) <= limit:
+        return list(rows)
+    selected: List[Dict[str, str]] = []
+    used: set[int] = set()
+    for idx in range(limit):
+        pos = int(math.floor(idx * len(rows) / limit))
+        while pos in used and len(used) < len(rows):
+            pos = (pos + 1) % len(rows)
+        if pos in used:
+            continue
+        selected.append(rows[pos])
+        used.add(pos)
+    return selected
+
+
+def select_anchor_image_rows(
+    image_rows: Sequence[Dict[str, str]],
+    max_images_per_point: int,
+) -> Tuple[List[Dict[str, str]], Dict[str, Any]]:
+    if max_images_per_point <= 0:
+        selected_slots_by_point: Dict[str, List[int]] = {}
+        for row in image_rows:
+            selected_slots_by_point.setdefault(point_key(row), []).append(safe_int(row.get("image_slot")))
+        for slots in selected_slots_by_point.values():
+            slots.sort()
+        return list(image_rows), {
+            "enabled": False,
+            "max_images_per_point": 0,
+            "input_rows": len(image_rows),
+            "selected_rows": len(image_rows),
+            "dropped_rows": 0,
+            "capped_point_count": 0,
+            "selection_strategy": "all_anchor_images",
+            "selected_slots_by_point": selected_slots_by_point,
+        }
+
+    grouped: Dict[str, List[Dict[str, str]]] = {}
+    for row in image_rows:
+        grouped.setdefault(point_key(row), []).append(row)
+
+    selected: List[Dict[str, str]] = []
+    capped_point_count = 0
+    selected_slots_by_point: Dict[str, List[int]] = {}
+    for key in sorted(
+        grouped,
+        key=lambda item: (
+            grouped[item][0].get("session", ""),
+            safe_int(grouped[item][0].get("global_point_index")),
+        ),
+    ):
+        point_rows = sorted(grouped[key], key=lambda row: safe_int(row.get("image_slot")))
+        kept_rows = select_evenly_spaced_rows(point_rows, max_images_per_point)
+        if len(kept_rows) < len(point_rows):
+            capped_point_count += 1
+        selected.extend(kept_rows)
+        selected_slots_by_point[key] = [safe_int(row.get("image_slot")) for row in kept_rows]
+
+    return selected, {
+        "enabled": True,
+        "max_images_per_point": max_images_per_point,
+        "input_rows": len(image_rows),
+        "selected_rows": len(selected),
+        "dropped_rows": len(image_rows) - len(selected),
+        "point_count": len(grouped),
+        "capped_point_count": capped_point_count,
+        "selection_strategy": "circular_even_slots",
+        "selected_slots_by_point": selected_slots_by_point,
+    }
+
+
 def build_fingerprint_rows(point_rows: Sequence[Dict[str, str]], ap_fields: Sequence[str]) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for row in point_rows:
@@ -264,10 +335,16 @@ def export_reconstruction_dataset(
     slot_yaw_start_deg: float = 0.0,
     slot_yaw_step_deg: float = 18.0,
     copy_images: bool = True,
+    max_anchor_images_per_point: int = 0,
+    include_video_frames: bool = True,
 ) -> Dict[str, Any]:
     long_fields, image_rows = read_csv(processed_dir / "image_wifi_long.csv")
     point_fields, point_rows = read_csv(processed_dir / "image_wifi_points.csv")
-    _video_fields, video_rows = read_csv(processed_dir / "video_frames_manifest.csv")
+    _video_fields, video_rows = (
+        read_csv(processed_dir / "video_frames_manifest.csv")
+        if include_video_frames
+        else ([], [])
+    )
     expected_images_per_point = read_expected_images_per_point(processed_dir)
     if not image_rows or not point_rows:
         summary = {
@@ -279,6 +356,8 @@ def export_reconstruction_dataset(
         }
         write_json(output_dir / "export_summary.json", summary)
         return summary
+    original_image_row_count = len(image_rows)
+    image_rows, anchor_selection_summary = select_anchor_image_rows(image_rows, max_anchor_images_per_point)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     images_dir = output_dir / "images"
@@ -323,6 +402,7 @@ def export_reconstruction_dataset(
             "point_index": row.get("point_index", ""),
             "global_point_index": row.get("global_point_index", ""),
             "image_slot": row.get("image_slot", ""),
+            "anchor_slot_count": expected_images_per_point or "",
             "image_number": row.get("image_number", ""),
             "point_elapsed_ts": row.get("point_elapsed_ts", ""),
             "wifi_scan_index": row.get("wifi_scan_index", ""),
@@ -348,6 +428,7 @@ def export_reconstruction_dataset(
                 "session": row.get("session", ""),
                 "global_point_index": row.get("global_point_index", ""),
                 "image_slot": row.get("image_slot", ""),
+                "anchor_slot_count": expected_images_per_point or "",
                 "video_name": "",
                 "video_frame_index": "",
                 "video_sequence_index": "",
@@ -381,6 +462,7 @@ def export_reconstruction_dataset(
             "point_index": "",
             "global_point_index": "",
             "image_slot": "",
+            "anchor_slot_count": "",
             "image_number": "",
             "point_elapsed_ts": "",
             "wifi_scan_index": "",
@@ -406,6 +488,7 @@ def export_reconstruction_dataset(
                 "session": "",
                 "global_point_index": "",
                 "image_slot": "",
+                "anchor_slot_count": "",
                 "video_name": row.get("video_name", ""),
                 "video_frame_index": row.get("video_frame_index", ""),
                 "video_sequence_index": row.get("video_sequence_index", ""),
@@ -427,6 +510,7 @@ def export_reconstruction_dataset(
         "point_index",
         "global_point_index",
         "image_slot",
+        "anchor_slot_count",
         "image_number",
         "point_elapsed_ts",
         "wifi_scan_index",
@@ -457,6 +541,7 @@ def export_reconstruction_dataset(
         "session",
         "global_point_index",
         "image_slot",
+        "anchor_slot_count",
         "video_name",
         "video_frame_index",
         "video_sequence_index",
@@ -497,11 +582,17 @@ def export_reconstruction_dataset(
     write_colmap_image_list(output_dir / "colmap_image_list.txt", colmap_image_paths)
     write_readme(output_dir / "README.md")
     copied_optional_metadata: List[str] = []
-    for optional_name in ("video_frames_manifest.csv", "video_frames_summary.json"):
-        source = processed_dir / optional_name
-        if source.exists():
-            shutil.copy2(source, output_dir / optional_name)
-            copied_optional_metadata.append(optional_name)
+    if include_video_frames:
+        for optional_name in ("video_frames_manifest.csv", "video_frames_summary.json"):
+            source = processed_dir / optional_name
+            if source.exists():
+                shutil.copy2(source, output_dir / optional_name)
+                copied_optional_metadata.append(optional_name)
+    else:
+        for optional_name in ("video_frames_manifest.csv", "video_frames_summary.json"):
+            stale_path = output_dir / optional_name
+            if stale_path.exists():
+                stale_path.unlink()
 
     point_image_counts: Dict[str, int] = {point_key(row): 0 for row in point_rows}
     for row in manifest_rows:
@@ -510,7 +601,12 @@ def export_reconstruction_dataset(
         key = point_key(row)
         point_image_counts[key] = point_image_counts.get(key, 0) + 1
     expected_count = expected_images_per_point or max(point_image_counts.values() or [0])
-    incomplete_points = [key for key, count in point_image_counts.items() if count != expected_count]
+    exported_expected_count = (
+        min(expected_count, max_anchor_images_per_point)
+        if max_anchor_images_per_point > 0
+        else expected_count
+    )
+    incomplete_points = [key for key, count in point_image_counts.items() if count != exported_expected_count]
 
     copied_count = len(list(images_dir.iterdir())) if images_dir.exists() else 0
     status = "ok"
@@ -528,11 +624,15 @@ def export_reconstruction_dataset(
         "camera_height_m": camera_height_m,
         "slot_yaw_start_deg": slot_yaw_start_deg,
         "slot_yaw_step_deg": slot_yaw_step_deg,
-        "image_rows": len(image_rows),
+        "include_video_frames": include_video_frames,
+        "image_rows": original_image_row_count,
+        "selected_image_rows": len(image_rows),
+        "anchor_image_selection": anchor_selection_summary,
         "anchor_image_rows": sum(1 for row in manifest_rows if row.get("source_type") == "wifi_anchor_photo"),
         "video_frame_rows": sum(1 for row in manifest_rows if row.get("source_type") == "video_base_frame"),
         "point_rows": len(point_rows),
         "expected_images_per_wifi_point": expected_count,
+        "expected_exported_images_per_wifi_point": exported_expected_count,
         "exported_image_rows": len(manifest_rows),
         "copied_image_file_count": copied_count,
         "colmap_image_count": len(colmap_image_paths),
