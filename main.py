@@ -15,6 +15,8 @@ DEFAULT_ARGS = [
     str(PROJECT_ROOT),
     "--output",
     "processed",
+    "--reconstruction-profile",
+    "final",
     "--pic-dir",
     "pic",
     "--images-per-wifi-point",
@@ -23,7 +25,6 @@ DEFAULT_ARGS = [
     "video",
     "--point-event",
     "CHECKPOINT_PAUSE",
-    "--visual-only",
 ]
 
 

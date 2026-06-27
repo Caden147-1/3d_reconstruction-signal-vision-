@@ -13,13 +13,13 @@ Date: May 2026
 
 This Final Year Project develops a practical pipeline for building an indoor virtual campus tour from smartphone-collected visual, wireless, and inertial data. The system combines route videos, checkpoint photographs, WiFi scans, and IMU measurements to support indoor 3D reconstruction and signal-based localization. Instead of treating 3D reconstruction as a purely visual task, the project uses WiFi and pedestrian dead reckoning (PDR) derived from IMU data as supporting spatial constraints. These constraints help organize image data, generate localization metadata, reduce incorrect visual matching in repetitive indoor environments, and provide a reusable WiFi fingerprint library for later positioning.
 
-The final system is designed around an end-to-end workflow. A user collects data with a phone by walking through the indoor environment, recording WiFi/IMU data, taking checkpoint photos, and filming a continuous route video. The project scripts then parse the raw session files, estimate a relative walking trajectory from IMU acceleration and heading readings, bind checkpoint images to WiFi/PDR points, extract video frames, export a reconstruction dataset, prepare a COLMAP workspace, and generate sparse and dense 3D reconstruction outputs. The main dense point cloud can be opened in tools such as MeshLab or CloudCompare, while the generated WiFi localization model can estimate positions from new WiFi scans.
+The final system is designed around an end-to-end workflow. A user collects data with a phone by walking through the indoor environment, recording WiFi/IMU data, taking checkpoint photos, and filming a continuous route video. The project scripts then parse the raw session files, estimate a relative walking trajectory from IMU acceleration and heading readings, bind checkpoint images to WiFi/PDR points, extract video frames, export a reconstruction dataset, prepare a COLMAP workspace, and generate scripts for sparse and dense 3D reconstruction. When COLMAP dense reconstruction is run successfully, the dense point cloud can be opened in tools such as MeshLab or CloudCompare, while the generated WiFi localization model can estimate positions from new WiFi scans.
 
-Under the assumed final state, the project has been updated according to the data collection and pipeline guidelines: each WiFi checkpoint is linked with a fixed group of photos, route video frames are used as visual transition frames, IMU-derived PDR provides rough route geometry, COLMAP matching is constrained using route order and PDR distance, and WiFi/PDR metadata is exported alongside the visual reconstruction dataset. The result is a reproducible software pipeline that connects indoor mapping, inertial tracking, visual reconstruction, and lightweight signal-based localization.
+The current P0-quality preprocessing run uses the final reconstruction profile, enables PDR-assisted matching and PDR alignment references, includes route-video bridge frames, and records data-quality caveats explicitly. The generated workspace contains 277 COLMAP input images, 2,469 constrained match pairs, and 260 PDR alignment reference images. Existing COLMAP database and sparse outputs from an older run are detected and marked for reset before the next sparse/dense reconstruction run.
 
 ## Abstract
 
-Indoor virtual tour systems require reliable spatial reconstruction, but indoor environments often create challenges for image-based reconstruction due to repeated textures, weak visual features, reflective surfaces, and limited GPS availability. This project proposes a multimodal pipeline for constructing an indoor virtual campus tour using smartphone videos, checkpoint photographs, WiFi scans, and IMU data. The system processes WiFi scans to generate fingerprint features and uses IMU linear acceleration, rotation vectors, and movement events to estimate a relative PDR trajectory. Checkpoint photographs are strongly associated with WiFi/PDR points, while route video frames are extracted as weakly constrained visual bridge frames for COLMAP reconstruction. The pipeline exports image manifests, camera pose seeds, WiFi fingerprint libraries, signal boundaries, constrained COLMAP matching pairs, and PDR alignment references. A KNN-based WiFi localization model is also produced for estimating positions from new WiFi scans. By combining visual reconstruction with wireless signal features and inertial motion metadata, the project improves the organization of indoor image data and reduces the risk of incorrect matching in repetitive spaces. The final system provides a reproducible workflow from raw mobile data collection to dense point cloud generation and indoor localization support, forming a technical foundation for a virtual campus tour application.
+Indoor virtual tour systems require reliable spatial reconstruction, but indoor environments often create challenges for image-based reconstruction due to repeated textures, weak visual features, reflective surfaces, and limited GPS availability. This project proposes a multimodal pipeline for constructing an indoor virtual campus tour using smartphone videos, checkpoint photographs, WiFi scans, and IMU data. The system processes WiFi scans to generate fingerprint features and uses IMU linear acceleration, rotation vectors, and movement events to estimate a relative PDR trajectory. Checkpoint photographs are strongly associated with WiFi/PDR points, while route video frames are extracted as weakly constrained visual bridge frames for COLMAP reconstruction. The pipeline exports image manifests, camera pose seeds, WiFi fingerprint libraries, signal boundaries, constrained COLMAP matching pairs, and PDR alignment references. A KNN-based WiFi localization model is also produced for estimating positions from new WiFi scans. By combining visual reconstruction with wireless signal features and inertial motion metadata, the project improves the organization of indoor image data and reduces the risk of incorrect matching in repetitive spaces. The final system provides a reproducible workflow from raw mobile data collection to a PDR-enabled COLMAP workspace, dense reconstruction support, and indoor localization assets, forming a technical foundation for a virtual campus tour application.
 
 ## Problem Statement
 
@@ -73,7 +73,7 @@ The system treats the collected data as two complementary streams:
 
 ## Data Collection Design
 
-The assumed final data collection follows the updated project guideline:
+The implemented data collection and preprocessing protocol follows the updated project guideline:
 
 - Each WiFi checkpoint contains a short stop of around 3 to 5 seconds.
 - Each checkpoint is marked using `CHECKPOINT_PAUSE`.
@@ -297,41 +297,137 @@ python run_colmap.py dense
 8. **Reproducible project structure**  
    The pipeline produces standardized folders such as `processed/`, `reconstruction_dataset/`, and `colmap_workspace/`, making experiments easier to repeat and debug.
 
-## Assumed Final Results
+## Current Run Results
 
-Assuming the project has been completed according to the latest Markdown guidance, the expected final deliverables are:
+The current P0 run was regenerated with `python main.py` after changing the default launcher to use the `final` reconstruction profile and PDR-enabled COLMAP preparation. It should be treated as the current preprocessing/export result, not as a completed dense reconstruction result.
+
+Current deliverables:
 
 - A working preprocessing pipeline from raw phone session data to COLMAP-ready images and metadata.
-- A processed IMU/PDR dataset containing movement segments, detected steps, heading estimates, and relative path coordinates.
-- A processed WiFi/PDR dataset with selected AP features and relative walking trajectory.
-- A checkpoint image mapping table linking photos to WiFi fingerprint points.
-- Extracted route video frames used as visual transition frames.
-- A reconstruction dataset containing images, manifests, pose seeds, WiFi fingerprints, and boundary metadata.
-- A prepared COLMAP workspace with constrained matching pairs.
-- A generated sparse reconstruction model.
-- A generated dense point cloud file at `colmap_workspace/dense/fused.ply`.
-- A WiFi localization model and evaluation output.
-- Documentation for repeatable data collection and execution.
+- Processed IMU/PDR tables with movement events, detected steps, heading estimates, and relative path coordinates.
+- Processed WiFi/PDR features with selected AP RSSI features and relative PDR coordinates.
+- Checkpoint image mapping tables for 13 WiFi checkpoints, using 20 anchor photos per checkpoint.
+- An explicit unassigned image list at `processed/unassigned_images.csv` for the 190 raw photos outside the checkpoint grouping protocol.
+- Route video frame extraction with 17 retained video bridge frames from `video/IMG_1735.MOV`.
+- A reconstruction dataset containing 277 exported images, pose seeds, WiFi fingerprints, signal boundaries, and video metadata.
+- A PDR-enabled COLMAP workspace with constrained matching pairs and PDR alignment references.
+- A WiFi localization model, leave-one-out evaluation, signal grid, and signal boundary outputs.
+- COLMAP sparse/dense scripts ready to run after resetting older COLMAP outputs in the workspace.
 
-Suggested result table for the final report:
+Current result table:
 
-| Metric | Value |
+| Metric | Current value |
 | --- | --- |
-| Number of WiFi checkpoints | To be filled |
-| Photos per checkpoint | 20 by default |
-| Total checkpoint photos | To be filled |
-| Number of route videos | To be filled |
-| Extracted video frames | To be filled |
-| Detected PDR steps | To be filled |
-| Estimated PDR walking distance | To be filled |
-| Movement segments | To be filled |
-| Selected WiFi APs | To be filled |
-| Sparse reconstruction registered images | To be filled |
-| Sparse 3D points | To be filled |
-| Dense point cloud file | `colmap_workspace/dense/fused.ply` |
-| WiFi localization mean error | To be filled |
-| WiFi localization median error | To be filled |
+| Collection sessions | 1 |
+| Number of WiFi checkpoints | 13 |
+| Photos per checkpoint | 20 |
+| Raw photos in `pic/` | 450 |
+| Mapped checkpoint photos | 260 |
+| Extra unassigned photos | 190, listed in `processed/unassigned_images.csv` |
+| Number of route videos | 1 |
+| Video frames extracted | 240 |
+| Video frames retained/exported | 17 |
+| Detected PDR steps | 695 |
+| Estimated PDR walking distance | 504.59 m |
+| Movement events | 28 |
+| Movement segments | 14 |
+| WiFi/PDR feature rows | 1,652 |
+| Selected WiFi APs | 15 |
+| Reconstruction dataset images | 277 |
+| Constrained COLMAP match pairs | 2,469 |
+| PDR alignment reference images | 260 |
+| COLMAP workspace status | `ready_needs_colmap_reset` |
+| Sparse reconstruction registered images | Pending rerun after COLMAP reset |
+| Sparse 3D points | Pending rerun after COLMAP reset |
+| Dense point cloud file | Pending; expected path `colmap_workspace/dense/fused.ply` |
+| WiFi localization mean error | 12.38 m |
+| WiFi localization median error | 9.00 m |
+| WiFi localization max error | 28.36 m |
 
+P0 quality notes:
+
+- The current launcher no longer defaults to visual-only mode. PDR-assisted distance matching and PDR alignment references are enabled by default.
+- The 190 extra photos are not silently used as WiFi-labeled checkpoint anchors because they do not fit the fixed 20 photos/checkpoint protocol for the 13 detected checkpoints.
+- The route video contributed bridge frames, but 223 of 240 extracted frames were rejected by the blur threshold. This is useful evidence for the report and a strong reason to recapture or tune video-frame filtering for a better visual reconstruction.
+- Existing `database.db` and `sparse/` outputs are from an older COLMAP run. Before reporting sparse/dense metrics for this PDR-enabled workspace, run `python run_colmap.py reset`, then `python run_colmap.py sparse`, then `python run_colmap.py dense`.
+
+## P1 Quality Addendum
+
+After the P0 cleanup, the next quality layer is to make the project measurable and defensible rather than only runnable. P1 focuses on output freshness, localization interpretation, reconstruction diagnostics, ablation experiments, and reference-to-claim alignment.
+
+### Output Freshness and Run Integrity
+
+The preprocessing and export outputs are now regenerated from the current default command, while older COLMAP outputs are explicitly detected. This prevents the report from mixing a new `match_pairs.txt` or `pdr_alignment_refs.txt` with an old `database.db` or sparse model.
+
+| Output group | Current status | Report treatment |
+| --- | --- | --- |
+| `processed/` | Regenerated with final profile and PDR-enabled defaults | Use as current preprocessing result |
+| `processed/unassigned_images.csv` | Present, 190 extra raw photos listed | Explain as excluded from the fixed checkpoint-photo protocol |
+| `processed/video_frames_manifest.csv` | Present, 17 retained bridge frames | Use as current video contribution, with blur rejection caveat |
+| `reconstruction_dataset/` | Regenerated with 277 images | Use as current COLMAP input dataset |
+| `wifi_localization_model.json` and evaluation files | Regenerated and copied to metadata | Use as lightweight WiFi baseline, not navigation-grade accuracy |
+| `colmap_workspace/database.db` and `sparse/` | Existing older outputs detected | Do not report as final PDR-enabled reconstruction until reset and rerun |
+| `colmap_workspace/dense/fused.ply` | Pending | Report as expected output path only |
+
+### WiFi Localization Interpretation
+
+The current WiFi positioning result uses 13 fingerprint points and 15 selected AP features. Leave-one-out evaluation gives a mean error of 12.38 m, median error of 9.00 m, and maximum error of 28.36 m. This should be presented as a baseline demonstrating that the pipeline can generate reusable WiFi localization assets, not as a finished high-accuracy indoor navigation system.
+
+For a stronger P1 result, the report should explicitly state the causes and improvements:
+
+- The fingerprint count is small for a long indoor route, so KNN has limited spatial resolution.
+- Single-checkpoint fingerprints are vulnerable to RSSI noise, body occlusion, and device orientation.
+- More repeated scans per checkpoint, denser checkpoints, AP stability filtering, and a graph-based model such as IndoorGNN are natural next steps.
+- WiFi results should be evaluated separately from 3D reconstruction quality because RSSI localization and visual geometry fail for different reasons.
+
+### Reconstruction Quality Report
+
+The next COLMAP run should produce a compact quality report before claiming final sparse or dense reconstruction. The report should include the following metrics.
+
+| Metric | Source | Current status |
+| --- | --- | --- |
+| Registered image count | COLMAP sparse model | Pending rerun after reset |
+| Registered image ratio | Registered images / 277 input images | Pending rerun after reset |
+| Sparse 3D point count | COLMAP `points3D` output | Pending rerun after reset |
+| Sparse component count | `colmap_workspace/sparse/` model folders | Pending rerun after reset |
+| Largest component size | COLMAP model analysis | Pending rerun after reset |
+| PDR alignment reference count | `pdr_alignment_refs.txt` | 260 images available |
+| PDR alignment residual | COLMAP `model_aligner` output/log | Pending rerun after reset |
+| Dense point cloud exists | `colmap_workspace/dense/fused.ply` | Pending |
+| Dense point count | PLY header or point-cloud tool | Pending |
+| Match-pair count | `match_pairs.txt` / summary | 2,469 pairs available |
+| Match-pair reason distribution | `match_graph_edges.csv` | Available for analysis |
+| Video bridge coverage | `video_frames_manifest.csv` | 17 retained bridge frames |
+
+### Ablation Experiments
+
+P1 should include at least a small ablation table. The aim is not to exhaustively benchmark every setting, but to show that the design choices are testable.
+
+| Experiment | Command/config idea | Purpose | Status |
+| --- | --- | --- | --- |
+| Visual-only baseline | `python main.py --visual-only` | Compare against PDR-enabled matching and alignment refs | Planned |
+| PDR-enabled current run | `python main.py` | Main pipeline after P0 cleanup | Prepared |
+| Without video bridge frames | `python main.py --skip-video-frames` | Measure whether route frames improve connectivity | Planned |
+| Video blur threshold sweep | `--video-blur-threshold 0/40/60` | Check whether current filtering is too strict | Planned |
+| Constrained vs exhaustive/sequential matching | `--colmap-matcher constrained/exhaustive/sequential` | Evaluate robustness vs compute cost | Planned |
+| PDR distance window sweep | `--constrained-max-pdr-distance-m 4/8/12` | Check sensitivity to PDR drift and over-restriction | Planned |
+| WiFi K sweep | `--wifi-localization-k 1/3/5` | Determine whether KNN weighting is stable | Planned |
+
+The thesis can report these as a compact comparison table with columns for registered images, sparse points, dense file status, visual continuity, runtime, and WiFi localization error where applicable.
+
+### Reference-to-Claim Alignment
+
+The reference list should be used to support specific claims rather than appear as a generic bibliography.
+
+| Project claim | Supporting references |
+| --- | --- |
+| COLMAP/SfM is the visual reconstruction backbone | [1], [2] |
+| IMU/PDR is a weak spatial prior rather than a direct point-cloud generator | [3], [4], [5], [6] |
+| WiFi RSSI fingerprinting is useful but noisy and data-dependent | [7], [8], [9] |
+| Indoor reconstruction needs careful evaluation against indoor-scene benchmarks | [10] |
+| Dense/surface reconstruction can later be improved with 3DGS or depth-prior methods | [11], [12], [13], [14], [15] |
+
+This P1 framing keeps the final report honest: the current contribution is a reproducible multimodal pipeline and diagnostic COLMAP workspace, while the remaining quality gap is expressed through concrete metrics and experiments.
 ## Evaluation Plan
 
 The project can be evaluated from four perspectives:
@@ -387,6 +483,37 @@ Future improvements may include:
 - Supporting multi-floor mapping and floor-level WiFi classification.
 - Automating quality reports after each reconstruction run.
 
+## References
+
+[1] J. L. Schonberger and J.-M. Frahm, "Structure-from-Motion Revisited," IEEE Conference on Computer Vision and Pattern Recognition (CVPR), 2016.
+
+[2] J. L. Schonberger, E. Zheng, M. Pollefeys, and J.-M. Frahm, "Pixelwise View Selection for Unstructured Multi-View Stereo," European Conference on Computer Vision (ECCV), 2016.
+
+[3] S. Leutenegger, S. Lynen, M. Bosse, R. Siegwart, and P. Furgale, "Keyframe-Based Visual-Inertial Odometry using Nonlinear Optimization," International Journal of Robotics Research, 2015.
+
+[4] T. Qin, P. Li, and S. Shen, "VINS-Mono: A Robust and Versatile Monocular Visual-Inertial State Estimator," IEEE Transactions on Robotics, 2018.
+
+[5] C. Campos, R. Elvira, J. J. Gomez Rodriguez, J. M. M. Montiel, and J. D. Tardos, "ORB-SLAM3: An Accurate Open-Source Library for Visual, Visual-Inertial, and Multi-Map SLAM," IEEE Transactions on Robotics, 2021.
+
+[6] C. Forster, L. Carlone, F. Dellaert, and D. Scaramuzza, "IMU Preintegration on Manifold for Efficient Visual-Inertial Maximum-a-Posteriori Estimation," Robotics: Science and Systems, 2015.
+
+[7] M. Youssef and A. Agrawala, "The Horus WLAN Location Determination System," ACM MobiSys, 2005.
+
+[8] A. Haeberlen, E. Flannery, A. M. Ladd, A. Rudys, D. S. Wallach, and L. E. Kavraki, "Practical Robust Localization over Large-Scale 802.11 Wireless Networks," ACM MobiCom, 2004.
+
+[9] "IndoorGNN: A Graph Neural Network based approach for Indoor Localization using WiFi RSSI," 2023.
+
+[10] Y. Lyu et al., "ScanNet++: A High-Fidelity Dataset of 3D Indoor Scenes," 2023.
+
+[11] B. Kerbl, G. Kopanas, T. Leimkuhler, and G. Drettakis, "3D Gaussian Splatting for Real-Time Radiance Field Rendering," ACM Transactions on Graphics, 2023.
+
+[12] M. Sayed, J. Gibson, J. Watson, V. Prisacariu, M. Firman, and C. Godard, "SimpleRecon: 3D Reconstruction Without 3D Convolutions," European Conference on Computer Vision (ECCV), 2022.
+
+[13] "LFM-3D: Learnable Feature Matching Across Wide Baselines Using 3D Signals," 2024.
+
+[14] "MP-SfM: Monocular Surface Priors for Robust Structure-from-Motion," 2025.
+
+[15] "A Review on 3D Gaussian Splatting for Sparse View Reconstruction," 2025.
 ## Thesis Chapter Mapping
 
 This summary can be expanded into the following FYP thesis structure:
@@ -414,4 +541,4 @@ This summary can be expanded into the following FYP thesis structure:
 
 ## Final Conclusion
 
-This FYP demonstrates a practical approach to indoor virtual campus tour construction by combining visual reconstruction with WiFi and IMU-based spatial metadata. The project does not attempt to replace COLMAP with signal or inertial data; instead, it uses WiFi and IMU-derived PDR to organize images, constrain matching, generate rough spatial references, and support indoor localization. The final pipeline provides a complete route from smartphone data collection to dense point cloud generation and WiFi positioning assets. With further development into an interactive viewer, the system can become a usable foundation for virtual campus navigation, indoor mapping, and location-aware campus services.
+This FYP demonstrates a practical approach to indoor virtual campus tour construction by combining visual reconstruction with WiFi and IMU-based spatial metadata. The project does not attempt to replace COLMAP with signal or inertial data; instead, it uses WiFi and IMU-derived PDR to organize images, constrain matching, generate rough spatial references, and support indoor localization. The final pipeline provides a complete route from smartphone data collection to a PDR-enabled COLMAP reconstruction workspace, dense point cloud generation scripts, and WiFi positioning assets. With further development into an interactive viewer, the system can become a usable foundation for virtual campus navigation, indoor mapping, and location-aware campus services.

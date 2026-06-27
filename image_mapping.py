@@ -283,8 +283,18 @@ def build_image_wifi_tables(
         point_rows.append(point_row)
 
     expected_image_count = len(points) * images_per_point
-    unassigned_image_count = max(0, len(images) - expected_image_count)
+    unassigned_images = images[expected_image_count:]
+    unassigned_image_count = len(unassigned_images)
     missing_image_count = max(0, expected_image_count - len(images))
+    unassigned_rows = [
+        {
+            "image_name": image.name,
+            "image_path": relative_path(image, root),
+            "image_number": image_number(image),
+            "reason": "outside_checkpoint_grouping_protocol",
+        }
+        for image in unassigned_images
+    ]
 
     write_csv(
         output_dir / "image_wifi_long.csv",
@@ -296,14 +306,21 @@ def build_image_wifi_tables(
         point_base_fields + image_fields + copied_feature_fields,
         point_rows,
     )
+    write_csv(
+        output_dir / "unassigned_images.csv",
+        ["image_name", "image_path", "image_number", "reason"],
+        unassigned_rows,
+    )
 
     status = "ok"
     if not resolved_pic_dir.exists():
         status = "missing_pic_dir"
     elif not points:
         status = "no_wifi_points"
-    elif missing_image_count or unassigned_image_count:
+    elif missing_image_count:
         status = "count_mismatch"
+    elif unassigned_image_count:
+        status = "extra_images_ignored"
     elif any(row["mapping_status"] != "ok" for row in point_rows):
         status = "partial"
 
@@ -323,6 +340,7 @@ def build_image_wifi_tables(
         "outputs": {
             "long": "image_wifi_long.csv",
             "points": "image_wifi_points.csv",
+            "unassigned_images": "unassigned_images.csv",
         },
     }
     write_json(output_dir / "image_wifi_summary.json", summary)

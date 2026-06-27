@@ -26,6 +26,22 @@ METADATA_FILES = [
 ]
 
 
+REASON_BASE_WEIGHTS = {
+    "same_wifi_point_nearby_slots": 1.00,
+    "nearby_wifi_points": 0.88,
+    "video_sequence": 0.82,
+    "nearby_pdr_points": 0.74,
+    "video_to_wifi_anchor": 0.70,
+}
+
+SOURCE_PAIR_WEIGHTS = {
+    ("wifi_anchor_photo", "wifi_anchor_photo"): 1.00,
+    ("video_base_frame", "video_base_frame"): 0.86,
+    ("video_base_frame", "wifi_anchor_photo"): 0.78,
+    ("wifi_anchor_photo", "video_base_frame"): 0.78,
+}
+
+
 def read_csv(path: Path) -> Tuple[List[str], List[Dict[str, str]]]:
     if not path.exists():
         return [], []
@@ -162,6 +178,108 @@ def point_distance(row_a: Dict[str, str], row_b: Dict[str, str]) -> float:
     return math.hypot(ax - bx, ay - by)
 
 
+def bounded_score(value: Optional[float], scale: float) -> float:
+    if value is None or scale <= 0 or math.isnan(value) or math.isinf(value):
+        return 1.0
+    return 1.0 / (1.0 + max(0.0, value) / scale)
+
+
+def row_point_index(row: Dict[str, str]) -> int:
+    return safe_int(row.get("global_point_index") or row.get("nearest_global_point_index"), -1)
+
+
+def row_slot(row: Dict[str, str]) -> int:
+    return safe_int(row.get("image_slot"), -1)
+
+
+def row_video_sequence(row: Dict[str, str]) -> int:
+    return safe_int(row.get("video_sequence_index"), -1)
+
+
+def pair_point_gap(row_a: Dict[str, str], row_b: Dict[str, str]) -> Optional[int]:
+    point_a = row_point_index(row_a)
+    point_b = row_point_index(row_b)
+    if point_a < 0 or point_b < 0:
+        return None
+    return abs(point_a - point_b)
+
+
+def pair_slot_gap(row_a: Dict[str, str], row_b: Dict[str, str]) -> Optional[int]:
+    slot_a = row_slot(row_a)
+    slot_b = row_slot(row_b)
+    if slot_a < 0 or slot_b < 0:
+        return None
+    slot_count = max(
+        safe_int(row_a.get("anchor_slot_count")),
+        safe_int(row_b.get("anchor_slot_count")),
+        slot_a,
+        slot_b,
+    )
+    if slot_count <= 0:
+        return abs(slot_a - slot_b)
+    return circular_slot_distance(slot_a, slot_b, slot_count)
+
+
+def pair_video_sequence_gap(row_a: Dict[str, str], row_b: Dict[str, str]) -> Optional[int]:
+    sequence_a = row_video_sequence(row_a)
+    sequence_b = row_video_sequence(row_b)
+    if sequence_a < 0 or sequence_b < 0:
+        return None
+    return abs(sequence_a - sequence_b)
+
+
+def source_pair_weight(row_a: Dict[str, str], row_b: Dict[str, str]) -> float:
+    source_a = row_a.get("source_type", "")
+    source_b = row_b.get("source_type", "")
+    return SOURCE_PAIR_WEIGHTS.get((source_a, source_b), SOURCE_PAIR_WEIGHTS.get((source_b, source_a), 0.75))
+
+
+def score_match_edge(
+    row_a: Dict[str, str],
+    row_b: Dict[str, str],
+    reason: str,
+    pdr_distance: float,
+    point_window: int,
+    slot_window: int,
+    max_pdr_distance_m: float,
+    video_frame_window: int,
+    visual_only: bool,
+) -> Dict[str, Any]:
+    point_gap = pair_point_gap(row_a, row_b)
+    slot_gap = pair_slot_gap(row_a, row_b)
+    video_gap = pair_video_sequence_gap(row_a, row_b)
+    pdr_score = 1.0 if visual_only else bounded_score(pdr_distance, max_pdr_distance_m)
+    slot_score = bounded_score(float(slot_gap) if slot_gap is not None else None, max(1.0, float(slot_window)))
+    point_score = bounded_score(float(point_gap) if point_gap is not None else None, max(1.0, float(point_window + 1)))
+    video_score = bounded_score(float(video_gap) if video_gap is not None else None, max(1.0, float(video_frame_window)))
+
+    if reason == "same_wifi_point_nearby_slots":
+        combined = 0.35 * pdr_score + 0.45 * slot_score + 0.20 * point_score
+    elif reason == "video_sequence":
+        combined = 0.45 * pdr_score + 0.15 * point_score + 0.40 * video_score
+    elif reason == "video_to_wifi_anchor":
+        combined = 0.45 * pdr_score + 0.35 * point_score + 0.20 * video_score
+    else:
+        combined = 0.50 * pdr_score + 0.25 * slot_score + 0.25 * point_score
+
+    reason_weight = REASON_BASE_WEIGHTS.get(reason, 0.60)
+    pair_weight = source_pair_weight(row_a, row_b)
+    edge_weight = max(0.01, min(1.0, reason_weight * pair_weight * combined))
+    return {
+        "edge_weight": round(edge_weight, 6),
+        "reason_weight": round(reason_weight, 6),
+        "source_pair_weight": round(pair_weight, 6),
+        "pdr_score": round(pdr_score, 6),
+        "slot_score": round(slot_score, 6),
+        "point_score": round(point_score, 6),
+        "video_score": round(video_score, 6),
+        "point_gap": "" if point_gap is None else point_gap,
+        "slot_gap": "" if slot_gap is None else slot_gap,
+        "video_sequence_gap": "" if video_gap is None else video_gap,
+        "edge_weight_basis": "reason_source_pdr_slot_point_video",
+    }
+
+
 def is_video_frame_row(row: Dict[str, str]) -> bool:
     return row.get("source_type") == "video_base_frame" or bool(row.get("video_sequence_index"))
 
@@ -216,7 +334,9 @@ def build_constrained_match_pairs(
         if not image_a or not image_b or image_a == image_b:
             return
         key = tuple(sorted((image_a, image_b)))
-        pairs.setdefault(key, reason)
+        existing_reason = pairs.get(key)
+        if existing_reason is None or REASON_BASE_WEIGHTS.get(reason, 0.0) > REASON_BASE_WEIGHTS.get(existing_reason, 0.0):
+            pairs[key] = reason
 
     for point, point_rows in by_point.items():
         slot_count = anchor_slot_count(point_rows)
@@ -307,12 +427,24 @@ def build_constrained_match_pairs(
     for image_a, image_b in sorted_pairs:
         row_a = row_by_image.get(image_a, {})
         row_b = row_by_image.get(image_b, {})
+        reason = pairs[(image_a, image_b)]
         pdr_distance = point_distance(row_a, row_b)
+        edge_scores = score_match_edge(
+            row_a=row_a,
+            row_b=row_b,
+            reason=reason,
+            pdr_distance=pdr_distance,
+            point_window=point_window,
+            slot_window=slot_window,
+            max_pdr_distance_m=max_pdr_distance_m,
+            video_frame_window=video_frame_window,
+            visual_only=visual_only,
+        )
         edge_rows.append(
             {
                 "image_a": image_a,
                 "image_b": image_b,
-                "reason": pairs[(image_a, image_b)],
+                "reason": reason,
                 "source_type_a": row_a.get("source_type", ""),
                 "source_type_b": row_b.get("source_type", ""),
                 "global_point_index_a": row_a.get("global_point_index") or row_a.get("nearest_global_point_index", ""),
@@ -324,6 +456,7 @@ def build_constrained_match_pairs(
                 "video_sequence_index_a": row_a.get("video_sequence_index", ""),
                 "video_sequence_index_b": row_b.get("video_sequence_index", ""),
                 "pdr_distance_m": "" if visual_only or math.isinf(pdr_distance) else round(pdr_distance, 6),
+                **edge_scores,
             }
         )
     summary = {
@@ -339,9 +472,33 @@ def build_constrained_match_pairs(
         "video_anchor_point_window": video_anchor_point_window,
         "video_anchor_limit": video_anchor_limit,
         "reason_counts": {},
+        "weighted_graph": True,
+        "edge_weight": {"min": None, "mean": None, "max": None},
+        "weight_by_reason": {},
     }
-    for reason in pairs.values():
+    weights: List[float] = []
+    weights_by_reason: Dict[str, List[float]] = {}
+    for row in edge_rows:
+        reason = str(row.get("reason", "unknown"))
         summary["reason_counts"][reason] = summary["reason_counts"].get(reason, 0) + 1
+        weight = safe_float(row.get("edge_weight"), math.nan)
+        if math.isnan(weight):
+            continue
+        weights.append(weight)
+        weights_by_reason.setdefault(reason, []).append(weight)
+    if weights:
+        summary["edge_weight"] = {
+            "min": round(min(weights), 6),
+            "mean": round(sum(weights) / len(weights), 6),
+            "max": round(max(weights), 6),
+        }
+    for reason, reason_weights in sorted(weights_by_reason.items()):
+        summary["weight_by_reason"][reason] = {
+            "count": len(reason_weights),
+            "min": round(min(reason_weights), 6),
+            "mean": round(sum(reason_weights) / len(reason_weights), 6),
+            "max": round(max(reason_weights), 6),
+        }
     return sorted_pairs, edge_rows, summary
 
 
@@ -358,6 +515,17 @@ def write_match_graph_edges(workspace_dir: Path, edge_rows: Sequence[Dict[str, A
             "image_a",
             "image_b",
             "reason",
+            "edge_weight",
+            "reason_weight",
+            "source_pair_weight",
+            "pdr_score",
+            "slot_score",
+            "point_score",
+            "video_score",
+            "point_gap",
+            "slot_gap",
+            "video_sequence_gap",
+            "edge_weight_basis",
             "source_type_a",
             "source_type_b",
             "global_point_index_a",
@@ -666,9 +834,9 @@ This folder is prepared from the current WiFi/IMU/photo capture.
 
 ## Start Here
 
-1. Run `run_colmap_sparse.bat` to build the sparse SfM model.
-2. If `sparse/0` is created, run `run_colmap_dense.bat` to generate `dense/fused.ply`.
-3. For final spatial measurement, prepare the workspace with `python main.py --reconstruction-profile final` before running dense.
+1. If this workspace already has `database.db`, `sparse/`, or `dense/` from an older run, run `reset_colmap_outputs.bat` first.
+2. Run `run_colmap_sparse.bat` to build the sparse SfM model with the current image list and match pairs.
+3. If `sparse/0` is created, run `run_colmap_dense.bat` to generate `dense/fused.ply`.
 
 `run_colmap_automatic.bat` is also provided if you prefer COLMAP's automatic
 pipeline. The manual sparse/dense scripts are easier to debug.
@@ -686,7 +854,7 @@ pipeline. The manual sparse/dense scripts are easier to debug.
 - `metadata/video_frames_manifest.csv`: optional video frames used as a weak visual base.
 - `match_pairs.txt`: constrained COLMAP image pairs from WiFi point order,
   neighboring angular slots, and video-frame sequence order.
-- `match_graph_edges.csv`: diagnostic edge list with pair reasons and original slot counts.
+- `match_graph_edges.csv`: diagnostic weighted edge list with pair reasons, scores, and original slot counts.
 {pdr_ref_line}
 
 The default sparse script now uses `matches_importer` with `match_pairs.txt` to
@@ -779,8 +947,17 @@ def prepare_colmap_workspace(
     write_reset_batch(workspace_dir)
     write_readme(workspace_dir, visual_only=visual_only)
 
+    existing_colmap_outputs = [
+        name
+        for name in ("database.db", "sparse", "sparse_pdr_aligned", "dense", "stereo")
+        if (workspace_dir / name).exists()
+    ]
+    summary_status = "ok" if not missing_images and resolved_colmap_exe.exists() else "needs_attention"
+    if summary_status == "ok" and existing_colmap_outputs:
+        summary_status = "ready_needs_colmap_reset"
+
     summary = {
-        "status": "ok" if not missing_images and resolved_colmap_exe.exists() else "needs_attention",
+        "status": summary_status,
         "workspace_dir": str(workspace_dir),
         "reconstruction_dir": str(reconstruction_dir),
         "colmap_exe": str(resolved_colmap_exe),
@@ -789,6 +966,8 @@ def prepare_colmap_workspace(
         "copied_image_count": copied_images,
         "missing_image_count": len(missing_images),
         "missing_images": missing_images[:20],
+        "existing_colmap_outputs": existing_colmap_outputs,
+        "colmap_reset_recommended": bool(existing_colmap_outputs),
         "metadata_files": copied_metadata,
         "camera_model": camera_model,
         "single_camera": single_camera,

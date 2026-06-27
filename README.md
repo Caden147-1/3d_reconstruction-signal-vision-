@@ -17,7 +17,7 @@
 推荐把数据放成这样：
 
 ```text
-FYP_3d/
+3d_reconstruction-signal-vision-/
   main.py
   preprocess_pipeline.py
   image_mapping.py
@@ -53,12 +53,14 @@ FYP_3d/
 
 这 20 张照片会被强绑定到对应 WiFi 指纹点。`video/` 里的视频会被抽帧，作为弱绑定的视觉基底，帮助 COLMAP 把相邻点位连接起来。
 
+如果 `pic/` 里照片数量超过 `WiFi 点位数 * images-per-wifi-point`，多出的照片不会被悄悄当成 WiFi 锚点使用；流水线会写入 `processed/unassigned_images.csv`，方便在报告里说明或回头重新分组。
+
 ## 2. 一键预处理
 
 在 PowerShell 或 VS Code Terminal 里进入项目目录：
 
 ```powershell
-cd C:\Users\ASUS\Desktop\FYP_3d
+cd C:\Users\ASUS\Desktop\3d_reconstruction-signal-vision-
 ```
 
 运行：
@@ -66,6 +68,8 @@ cd C:\Users\ASUS\Desktop\FYP_3d
 ```powershell
 python main.py
 ```
+
+`main.py` 默认使用 final reconstruction profile，并启用 PDR-assisted matching / PDR alignment refs。若只想跑视觉顺序约束，可以额外传入 `--visual-only`。
 
 这一步会生成：
 
@@ -294,6 +298,8 @@ python run_colmap.py full
 
 ## 5. 最终点云
 
+如果 `colmap_workspace/colmap_workspace_summary.json` 里显示 `ready_needs_colmap_reset`，说明 workspace 已按当前数据重新准备好，但旧的 `database.db` 或 `sparse/` 仍在。先运行 `python run_colmap.py reset`，再重新跑 sparse/dense，避免旧重建结果和新匹配约束混用。
+
 最终 dense 点云：
 
 ```text
@@ -357,7 +363,7 @@ python main.py --colmap-dense-max-image-size 1600
 ## 7. 推荐完整运行顺序
 
 ```powershell
-cd C:\Users\ASUS\Desktop\FYP_3d
+cd C:\Users\ASUS\Desktop\3d_reconstruction-signal-vision-
 python main.py
 python run_colmap.py reset
 python run_colmap.py sparse
