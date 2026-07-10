@@ -111,10 +111,12 @@ python run_colmap.py full --yes
 *.sess/wifiScanner.dat
 ```
 
-During `full` and `dense` runs, the live estimator also watches the first completed PatchMatch views and refines the rough estimate. The default sample size is 2 views:
+During `full` and `dense` runs, the live estimator prints an immediate model preview as soon as COLMAP reports the dense view count. It then prints the first target-precision estimate as soon as the sample and model agree within the default 30-minute error target, or after 60 seconds at the latest:
 
 ```powershell
 python run_colmap.py full --runtime-estimate-sample-views 3
+python run_colmap.py full --runtime-estimate-first-update-seconds 60
+python run_colmap.py full --runtime-estimate-target-error-minutes 30
 python run_colmap.py full --no-runtime-estimate
 python run_colmap.py full --no-upfront-estimate
 ```
@@ -207,7 +209,7 @@ Reset COLMAP outputs without rebuilding:
 python run_colmap.py reset
 ```
 
-This removes old COLMAP outputs immediately and does not ask for confirmation.
+This asks you to type `YES` before deleting old COLMAP outputs.
 
 Localize a new WiFi scan from JSON:
 
@@ -499,7 +501,7 @@ Use the Python launcher for normal rebuilds:
 python run_colmap.py full
 ```
 
-It automatically removes stale `database.db`, sparse, dense, mesh, and report outputs before rebuilding. If you run the generated `.bat` scripts directly and they report existing outputs, run `colmap_workspace\reset_colmap_outputs.bat` first; it deletes the old outputs without asking for confirmation.
+It automatically removes stale `database.db`, sparse, dense, mesh, and report outputs before rebuilding. If you run the generated `.bat` scripts directly and they report existing outputs, run `colmap_workspace\reset_colmap_outputs.bat` first; it asks you to type `YES` before deleting old outputs.
 
 ### Dense reconstruction says sparse model is missing
 

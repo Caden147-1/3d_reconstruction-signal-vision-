@@ -1079,6 +1079,10 @@ def profile_value(args: argparse.Namespace, name: str) -> Any:
     return PROFILE_DEFAULTS[args.reconstruction_profile][name]
 
 
+def log_stage(message: str) -> None:
+    print(f"[stage] {message}", flush=True)
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path.cwd(), help="Folder containing .sess directories.")
@@ -1130,8 +1134,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--skip-colmap-prepare", action="store_true")
     parser.add_argument("--visual-only", action="store_true", help="Prepare COLMAP without PDR distance fallback or PDR model alignment.")
     parser.add_argument("--colmap-camera-model", default="SIMPLE_RADIAL")
-    parser.add_argument("--colmap-matcher", choices=["constrained", "exhaustive", "sequential"], default="constrained")
-    parser.add_argument("--colmap-quality", choices=["low", "medium", "high", "extreme"], default="high")
+    parser.add_argument("--colmap-matcher", choices=["constrained", "hybrid", "exhaustive", "sequential"])
+    parser.add_argument("--colmap-quality", choices=["low", "medium", "high", "extreme"])
     parser.add_argument("--colmap-dense-max-image-size", type=int)
     parser.add_argument("--colmap-dense-profile", choices=["balanced", "rtx4080", "complete"], help="Dense/MVS parameter profile written into run_colmap_dense.bat.")
     parser.add_argument("--skip-colmap-meshing", action="store_true", help="Skip Delaunay/Poisson mesh commands in the generated dense script.")
@@ -1141,12 +1145,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--colmap-feature-max-image-size", type=int)
     parser.add_argument("--colmap-max-num-features", type=int)
     parser.add_argument("--colmap-max-num-matches", type=int)
-    parser.add_argument("--constrained-point-window", type=int, default=1)
-    parser.add_argument("--constrained-slot-window", type=int, default=2)
-    parser.add_argument("--constrained-max-pdr-distance-m", type=float, default=8.0)
-    parser.add_argument("--constrained-video-frame-window", type=int, default=3)
-    parser.add_argument("--constrained-video-anchor-point-window", type=int, default=1)
-    parser.add_argument("--constrained-video-anchor-limit", type=int, default=12)
+    parser.add_argument("--constrained-point-window", type=int)
+    parser.add_argument("--constrained-slot-window", type=int)
+    parser.add_argument("--constrained-max-pdr-distance-m", type=float)
+    parser.add_argument("--constrained-video-frame-window", type=int)
+    parser.add_argument("--constrained-video-anchor-point-window", type=int)
+    parser.add_argument("--constrained-video-anchor-limit", type=int)
     return parser.parse_args(argv)
 
 
@@ -1158,10 +1162,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not session_dirs:
         raise SystemExit(f"No .sess directories found under {root}")
 
-    print(f"[info] root: {root}")
-    print(f"[info] output: {output_dir}")
-    print(f"[info] sessions: {', '.join(path.name for path in session_dirs)}")
-    print(f"[info] reconstruction profile: {args.reconstruction_profile}")
+    print(f"[info] root: {root}", flush=True)
+    print(f"[info] output: {output_dir}", flush=True)
+    print(f"[info] sessions: {', '.join(path.name for path in session_dirs)}", flush=True)
+    print(f"[info] reconstruction profile: {args.reconstruction_profile}", flush=True)
 
     video_frame_interval_s = profile_value(args, "video_frame_interval_s")
     video_max_frames = profile_value(args, "video_max_frames")
@@ -1170,10 +1174,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     video_keyframe_min_gap = profile_value(args, "video_keyframe_min_gap")
     max_colmap_anchor_images_per_point = profile_value(args, "max_colmap_anchor_images_per_point")
     colmap_dense_max_image_size = profile_value(args, "colmap_dense_max_image_size")
+    colmap_dense_profile = profile_value(args, "colmap_dense_profile")
+    colmap_matcher = profile_value(args, "colmap_matcher")
+    colmap_quality = profile_value(args, "colmap_quality")
     colmap_feature_max_image_size = profile_value(args, "colmap_feature_max_image_size")
     colmap_max_num_features = profile_value(args, "colmap_max_num_features")
     colmap_max_num_matches = profile_value(args, "colmap_max_num_matches")
+    constrained_point_window = profile_value(args, "constrained_point_window")
+    constrained_slot_window = profile_value(args, "constrained_slot_window")
+    constrained_max_pdr_distance_m = profile_value(args, "constrained_max_pdr_distance_m")
+    constrained_video_frame_window = profile_value(args, "constrained_video_frame_window")
+    constrained_video_anchor_point_window = profile_value(args, "constrained_video_anchor_point_window")
+    constrained_video_anchor_limit = profile_value(args, "constrained_video_anchor_limit")
 
+    log_stage("1/8 parsing WiFi scans and selecting stable APs")
     selection = build_wifi_tables(
         session_dirs=session_dirs,
         output_dir=output_dir,
@@ -1182,13 +1196,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         max_rssi_std=args.max_rssi_std,
         min_scan_count=args.min_scan_count,
     )
+    log_stage("2/8 computing IMU/PDR movement tables")
     pdr_summary = build_pdr_tables(
         session_dirs=session_dirs,
         output_dir=output_dir,
         base_step_m=args.base_step_m,
         heading_offset_deg=args.heading_offset_deg,
     )
+    log_stage("3/8 fusing WiFi fingerprints with PDR positions")
     fused_summary = build_wifi_pdr_feature_table(output_dir)
+    log_stage("4/8 mapping checkpoint photos to WiFi/PDR points")
     image_summary = (
         {"status": "skipped"}
         if args.skip_image_wifi
@@ -1201,6 +1218,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             point_event=args.point_event,
         )
     )
+    log_stage("5/8 extracting route video bridge frames")
     video_frames_summary = (
         {"status": "skipped"}
         if args.skip_video_frames or args.skip_image_wifi
@@ -1226,6 +1244,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.slot_yaw_step_deg is not None
         else 360.0 / max(1, args.images_per_wifi_point)
     )
+    log_stage("6/8 exporting reconstruction image dataset")
     reconstruction_summary = (
         {"status": "skipped"}
         if args.skip_reconstruction_export or args.skip_image_wifi
@@ -1241,6 +1260,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             include_video_frames=not args.skip_video_frames,
         )
     )
+    log_stage("7/8 building WiFi positioning artifacts")
     wifi_positioning_summary = (
         {"status": "skipped"}
         if args.skip_wifi_positioning or reconstruction_summary.get("status") == "skipped"
@@ -1256,6 +1276,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if not args.colmap_workspace.is_absolute()
         else args.colmap_workspace
     )
+    log_stage("8/8 preparing COLMAP workspace and run scripts")
     colmap_summary = (
         {"status": "skipped"}
         if args.skip_colmap_prepare or reconstruction_summary.get("status") == "skipped"
@@ -1268,8 +1289,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             camera_model=args.colmap_camera_model,
             single_camera=True,
             use_gpu=True,
-            matcher=args.colmap_matcher,
-            quality=args.colmap_quality,
+            matcher=colmap_matcher,
+            quality=colmap_quality,
             dense_max_image_size=colmap_dense_max_image_size,
             visual_only=args.visual_only,
             feature_max_image_size=colmap_feature_max_image_size,

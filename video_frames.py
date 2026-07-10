@@ -353,9 +353,11 @@ def bind_frame_to_route(
             "pdr_bind_source": "single_anchor_point",
         }
 
-    progress = frame_index_zero_based / max(1, frame_count - 1)
+    max_frame_index = max(0, frame_count - 1)
+    bounded_frame_index = min(max(0, frame_index_zero_based), max_frame_index)
+    progress = bounded_frame_index / max(1, max_frame_index)
     route_position = progress * (len(points) - 1)
-    left_index = int(math.floor(route_position))
+    left_index = min(len(points) - 1, max(0, int(math.floor(route_position))))
     right_index = min(len(points) - 1, int(math.ceil(route_position)))
     ratio = route_position - left_index
     left = points[left_index]

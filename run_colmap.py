@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -28,6 +29,8 @@ SCRIPT_BY_MODE = {
 CLEAN_REBUILD_MODES = {"sparse", "full", "automatic"}
 PATCHMATCH_VIEW_RE = re.compile(r"Processing view\s+(\d+)\s*/\s*(\d+)")
 DEFAULT_RUNTIME_SAMPLE_VIEWS = 2
+DEFAULT_RUNTIME_FIRST_UPDATE_SECONDS = 60.0
+DEFAULT_RUNTIME_TARGET_ERROR_SECONDS = 30.0 * 60.0
 
 STALE_COLMAP_OUTPUTS = (
     "database.db",
@@ -67,7 +70,25 @@ def parse_args() -> argparse.Namespace:
         "--runtime-estimate-sample-views",
         type=int,
         default=DEFAULT_RUNTIME_SAMPLE_VIEWS,
-        help="Number of completed PatchMatch views to time before printing the first live estimate.",
+        help="Number of completed PatchMatch views to time before printing the first sample-refined estimate.",
+    )
+    parser.add_argument(
+        "--runtime-estimate-first-update-seconds",
+        type=float,
+        default=DEFAULT_RUNTIME_FIRST_UPDATE_SECONDS,
+        help=(
+            "Maximum seconds to wait before printing a partial-observation PatchMatch estimate. "
+            "Use 0 to disable only this timed partial update."
+        ),
+    )
+    parser.add_argument(
+        "--runtime-estimate-target-error-minutes",
+        type=float,
+        default=DEFAULT_RUNTIME_TARGET_ERROR_SECONDS / 60.0,
+        help=(
+            "Target error tolerance for early sample-refined estimates, in minutes. "
+            "Default is 30 minutes."
+        ),
     )
     return parser.parse_args()
 
@@ -322,8 +343,24 @@ def confirm_full_colmap_run(workspace: Path) -> bool:
 
 
 class PatchMatchRuntimeEstimator:
-    def __init__(self, *, sample_views: int, full_start: Optional[float], tail_factor: float) -> None:
+    def __init__(
+        self,
+        *,
+        sample_views: int,
+        first_update_seconds: float,
+        target_error_seconds: float,
+        model_avg_view_seconds: Optional[float],
+        full_start: Optional[float],
+        tail_factor: float,
+    ) -> None:
         self.sample_views = max(1, sample_views)
+        self.first_update_seconds = max(0.0, first_update_seconds)
+        self.target_error_seconds = max(0.0, target_error_seconds)
+        self.model_avg_view_seconds = (
+            max(1.0, model_avg_view_seconds)
+            if model_avg_view_seconds is not None and model_avg_view_seconds > 0
+            else None
+        )
         self.full_start = full_start
         self.tail_factor = max(0.0, tail_factor)
         self.patch_start: Optional[float] = None
@@ -331,8 +368,14 @@ class PatchMatchRuntimeEstimator:
         self.current_start: Optional[float] = None
         self.total_views: Optional[int] = None
         self.completed_durations: list[float] = []
-        self.first_report_done = False
+        self.model_report_done = False
+        self.first_target_report_done = False
+        self.first_sample_report_done = False
+        self.timebox_report_done = False
         self.next_progress_report = 10
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._timer_thread: Optional[threading.Thread] = None
 
     def observe(self, line: str) -> None:
         match = PATCHMATCH_VIEW_RE.search(line)
@@ -343,64 +386,230 @@ class PatchMatchRuntimeEstimator:
         view_index = int(match.group(1))
         total_views = int(match.group(2))
 
-        if self.patch_start is None:
-            self.patch_start = now
-            print(
-                f"[estimate] PatchMatch live estimator enabled; "
-                f"refining after {self.sample_views} completed view(s).",
-                flush=True,
-            )
+        with self._lock:
+            if self.patch_start is None:
+                self.patch_start = now
+                timebox_text = (
+                    f" or after {format_duration(self.first_update_seconds)}"
+                    if self.first_update_seconds > 0
+                    else ""
+                )
+                print(
+                    f"[estimate] PatchMatch live estimator enabled; "
+                    f"target error <= {format_duration(self.target_error_seconds)}, "
+                    f"refining after {self.sample_views} completed view(s){timebox_text}.",
+                    flush=True,
+                )
+                self.current_view = view_index
+                self.current_start = now
+                self.total_views = total_views
+                self.model_report_done = self._report_from_model(now)
+                self._start_timebox_timer()
+                return
 
-        if self.current_start is not None and self.current_view is not None:
-            duration = now - self.current_start
-            if duration > 0:
-                self.completed_durations.append(duration)
-                completed = len(self.completed_durations)
-                should_report_first = not self.first_report_done and completed >= self.sample_views
-                should_report_progress = self.first_report_done and completed >= self.next_progress_report
-                if should_report_first or should_report_progress:
-                    self._report(now)
-                    self.first_report_done = True
-                    while self.next_progress_report <= completed:
-                        self.next_progress_report += 10
+            if self.current_start is not None and self.current_view is not None:
+                duration = now - self.current_start
+                if duration > 0:
+                    self.completed_durations.append(duration)
+                    completed = len(self.completed_durations)
+                    avg_view_seconds = sum(self.completed_durations) / completed
+                    target_ready = self._sample_matches_target(avg_view_seconds)
+                    should_report_target = not self.first_target_report_done and target_ready
+                    should_report_first_sample = not self.first_sample_report_done and completed >= self.sample_views
+                    should_report_progress = self.first_sample_report_done and completed >= self.next_progress_report
+                    if should_report_target or should_report_first_sample or should_report_progress:
+                        heading = (
+                            "First target-precision runtime estimate from PatchMatch sample:"
+                            if should_report_target
+                            else "Live runtime update from real PatchMatch sample:"
+                        )
+                        if self._report_from_completed(
+                            now,
+                            heading=heading,
+                            include_current_view_elapsed=False,
+                        ):
+                            if should_report_target:
+                                self.first_target_report_done = True
+                            if should_report_target or should_report_first_sample or should_report_progress:
+                                self.first_sample_report_done = True
+                            while self.next_progress_report <= completed:
+                                self.next_progress_report += 10
 
-        self.current_view = view_index
-        self.current_start = now
-        self.total_views = total_views
+            self.current_view = view_index
+            self.current_start = now
+            self.total_views = total_views
 
-    def _report(self, now: float) -> None:
-        if not self.completed_durations or not self.total_views:
+    def close(self) -> None:
+        self._stop_event.set()
+        thread = self._timer_thread
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=0.2)
+
+    def _start_timebox_timer(self) -> None:
+        if self.first_update_seconds <= 0 or self._timer_thread is not None:
             return
+        self._timer_thread = threading.Thread(target=self._timebox_worker, daemon=True)
+        self._timer_thread.start()
 
-        completed = len(self.completed_durations)
-        avg_view_seconds = sum(self.completed_durations) / completed
-        patch_total_seconds = avg_view_seconds * self.total_views
-        patch_remaining_seconds = avg_view_seconds * max(0, self.total_views - completed)
+    def _timebox_worker(self) -> None:
+        if self._stop_event.wait(self.first_update_seconds):
+            return
+        now = time.monotonic()
+        with self._lock:
+            if self.first_target_report_done or self.timebox_report_done:
+                return
+            self.timebox_report_done = self._report_timeboxed(now)
+
+    def _target_text(self) -> str:
+        return format_duration(self.target_error_seconds)
+
+    def _patch_elapsed(self, now: float) -> float:
+        if self.patch_start is None:
+            return 0.0
+        return max(0.0, now - self.patch_start)
+
+    def _current_elapsed(self, now: float) -> float:
+        if self.current_start is None:
+            return 0.0
+        return max(0.0, now - self.current_start)
+
+    def _sample_matches_target(self, avg_view_seconds: float) -> bool:
+        if self.model_avg_view_seconds is None or not self.total_views:
+            return False
+        patch_delta_seconds = abs(avg_view_seconds - self.model_avg_view_seconds) * self.total_views
+        return patch_delta_seconds <= self.target_error_seconds
+
+    def _report_from_model(self, now: float) -> bool:
+        if self.model_avg_view_seconds is None or not self.total_views or self.current_view is None:
+            return False
+
+        avg_view_seconds = self.model_avg_view_seconds
+        current_elapsed_seconds = self._current_elapsed(now)
+        patch_elapsed_seconds = self._patch_elapsed(now)
+        current_remaining_seconds = max(0.0, avg_view_seconds - current_elapsed_seconds)
+        remaining_unstarted_views = max(0, self.total_views - self.current_view)
+        patch_remaining_seconds = current_remaining_seconds + (avg_view_seconds * remaining_unstarted_views)
+        patch_total_seconds = patch_elapsed_seconds + patch_remaining_seconds
         tail_seconds = patch_total_seconds * self.tail_factor
         rough_remaining_seconds = patch_remaining_seconds + tail_seconds
 
-        print("[estimate] Live runtime update from real PatchMatch sample:", flush=True)
+        self._print_runtime_estimate(
+            now=now,
+            heading="Immediate model preview from workspace settings:",
+            sample_line=(
+                f"model_views={self.total_views}, current_view={self.current_view}, "
+                f"sampled_views=0/{self.total_views}, target_error={self._target_text()}"
+            ),
+            avg_view_seconds=avg_view_seconds,
+            patch_total_seconds=patch_total_seconds,
+            patch_remaining_seconds=patch_remaining_seconds,
+            rough_remaining_seconds=rough_remaining_seconds,
+            lower_bound=False,
+        )
+        return True
+
+    def _report_from_completed(self, now: float, *, heading: str, include_current_view_elapsed: bool) -> bool:
+        if not self.completed_durations or not self.total_views:
+            return False
+
+        completed = len(self.completed_durations)
+        avg_view_seconds = sum(self.completed_durations) / completed
+        patch_elapsed_seconds = self._patch_elapsed(now)
+        active_view_count = 1 if include_current_view_elapsed and completed < self.total_views else 0
+        current_elapsed_seconds = self._current_elapsed(now) if active_view_count else 0.0
+        remaining_unstarted_views = max(0, self.total_views - completed - active_view_count)
+        current_remaining_seconds = max(0.0, avg_view_seconds - current_elapsed_seconds)
+        patch_remaining_seconds = current_remaining_seconds + (avg_view_seconds * remaining_unstarted_views)
+        patch_total_seconds = patch_elapsed_seconds + patch_remaining_seconds
+        tail_seconds = patch_total_seconds * self.tail_factor
+        rough_remaining_seconds = patch_remaining_seconds + tail_seconds
+
+        self._print_runtime_estimate(
+            now=now,
+            heading=heading,
+            sample_line=f"sampled_views={completed}/{self.total_views}",
+            avg_view_seconds=avg_view_seconds,
+            patch_total_seconds=patch_total_seconds,
+            patch_remaining_seconds=patch_remaining_seconds,
+            rough_remaining_seconds=rough_remaining_seconds,
+            lower_bound=False,
+        )
+        return True
+
+    def _report_timeboxed(self, now: float) -> bool:
+        if self.completed_durations:
+            return self._report_from_completed(
+                now,
+                heading=f"Max-delay fallback estimate from partial PatchMatch sample (target <= {self._target_text()} not confirmed):",
+                include_current_view_elapsed=True,
+            )
+        if not self.total_views or self.current_view is None:
+            return False
+
+        current_elapsed_seconds = self._current_elapsed(now)
+        if current_elapsed_seconds <= 0:
+            return False
+
+        avg_view_seconds = max(1.0, current_elapsed_seconds, self.model_avg_view_seconds or 0.0)
+        patch_elapsed_seconds = self._patch_elapsed(now)
+        current_remaining_seconds = max(0.0, avg_view_seconds - current_elapsed_seconds)
+        remaining_unstarted_views = max(0, self.total_views - self.current_view)
+        patch_remaining_seconds = current_remaining_seconds + (avg_view_seconds * remaining_unstarted_views)
+        patch_total_seconds = patch_elapsed_seconds + patch_remaining_seconds
+        tail_seconds = patch_total_seconds * self.tail_factor
+        rough_remaining_seconds = patch_remaining_seconds + tail_seconds
+
+        self._print_runtime_estimate(
+            now=now,
+            heading=f"Max-delay fallback coarse estimate before a PatchMatch view has completed (target <= {self._target_text()} not confirmed):",
+            sample_line=(
+                f"sampled_views=0/{self.total_views}, current_view={self.current_view}, "
+                f"current_view_elapsed={format_duration(current_elapsed_seconds)}, "
+                f"max_wait={format_duration(self.first_update_seconds)}"
+            ),
+            avg_view_seconds=avg_view_seconds,
+            patch_total_seconds=patch_total_seconds,
+            patch_remaining_seconds=patch_remaining_seconds,
+            rough_remaining_seconds=rough_remaining_seconds,
+            lower_bound=True,
+        )
+        return True
+
+    def _print_runtime_estimate(
+        self,
+        *,
+        now: float,
+        heading: str,
+        sample_line: str,
+        avg_view_seconds: float,
+        patch_total_seconds: float,
+        patch_remaining_seconds: float,
+        rough_remaining_seconds: float,
+        lower_bound: bool,
+    ) -> None:
+        symbol = ">=" if lower_bound else "~="
+
+        print(f"[estimate] {heading}", flush=True)
         print(
-            f"[estimate]   sampled_views={completed}/{self.total_views}, "
-            f"avg_per_view={format_duration(avg_view_seconds)}",
+            f"[estimate]   {sample_line}, avg_per_view{symbol}{format_duration(avg_view_seconds)}",
             flush=True,
         )
         print(
-            f"[estimate]   PatchMatch total ~= {format_duration(patch_total_seconds)}, "
-            f"remaining ~= {format_duration(patch_remaining_seconds)}",
+            f"[estimate]   PatchMatch total {symbol} {format_duration(patch_total_seconds)}, "
+            f"remaining {symbol} {format_duration(patch_remaining_seconds)}",
             flush=True,
         )
         if self.full_start is not None:
             rough_total_seconds = (now - self.full_start) + rough_remaining_seconds
             print(
-                f"[estimate]   Rough full remaining ~= {format_duration(rough_remaining_seconds)} "
+                f"[estimate]   Rough full remaining {symbol} {format_duration(rough_remaining_seconds)} "
                 f"including fusion/meshing tail",
                 flush=True,
             )
-            print(f"[estimate]   Rough full total ~= {format_duration(rough_total_seconds)}", flush=True)
+            print(f"[estimate]   Rough full total {symbol} {format_duration(rough_total_seconds)}", flush=True)
         else:
             print(
-                f"[estimate]   Rough dense remaining ~= {format_duration(rough_remaining_seconds)} "
+                f"[estimate]   Rough dense remaining {symbol} {format_duration(rough_remaining_seconds)} "
                 f"including fusion/meshing tail",
                 flush=True,
             )
@@ -445,13 +654,19 @@ def call_batch_with_runtime_estimate(
     *,
     runtime_estimate: bool,
     sample_views: int,
+    first_update_seconds: float,
+    target_error_seconds: float,
     full_start: Optional[float],
 ) -> int:
     if not runtime_estimate:
         return call_batch(script, workspace)
 
+    upfront_estimate = build_upfront_runtime_estimate(workspace)
     estimator = PatchMatchRuntimeEstimator(
         sample_views=sample_views,
+        first_update_seconds=first_update_seconds,
+        target_error_seconds=target_error_seconds,
+        model_avg_view_seconds=upfront_estimate.get("patch_per_view_seconds"),
         full_start=full_start,
         tail_factor=post_patch_tail_factor(script),
     )
@@ -465,21 +680,37 @@ def call_batch_with_runtime_estimate(
         bufsize=1,
     )
     assert process.stdout is not None
-    for line in process.stdout:
-        print(line, end="")
-        estimator.observe(line)
+    try:
+        for line in process.stdout:
+            print(line, end="")
+            estimator.observe(line)
+    finally:
+        estimator.close()
     return process.wait()
 
 
-def run_full_pipeline(workspace: Path, *, runtime_estimate: bool, sample_views: int) -> int:
+def run_full_pipeline(
+    workspace: Path,
+    *,
+    runtime_estimate: bool,
+    sample_views: int,
+    first_update_seconds: float,
+    target_error_seconds: float,
+) -> int:
     sparse_script = require_script(workspace, "sparse")
     dense_script = require_script(workspace, "dense")
     full_start = time.monotonic()
 
     if runtime_estimate:
+        timebox_text = (
+            f" or after {format_duration(first_update_seconds)}"
+            if first_update_seconds > 0
+            else ""
+        )
         print(
             f"[estimate] Live runtime estimator is on; dense PatchMatch will be refined "
-            f"after {max(1, sample_views)} completed view(s)."
+            f"after {max(1, sample_views)} completed view(s){timebox_text}; "
+            f"target error <= {format_duration(target_error_seconds)}."
         )
 
     print("[info] running COLMAP sparse step...")
@@ -494,6 +725,8 @@ def run_full_pipeline(workspace: Path, *, runtime_estimate: bool, sample_views: 
         workspace,
         runtime_estimate=runtime_estimate,
         sample_views=sample_views,
+        first_update_seconds=first_update_seconds,
+        target_error_seconds=target_error_seconds,
         full_start=full_start,
     )
     if dense_result == 0:
@@ -507,6 +740,8 @@ def run_colmap_script(
     *,
     runtime_estimate: bool = True,
     sample_views: int = DEFAULT_RUNTIME_SAMPLE_VIEWS,
+    first_update_seconds: float = DEFAULT_RUNTIME_FIRST_UPDATE_SECONDS,
+    target_error_seconds: float = DEFAULT_RUNTIME_TARGET_ERROR_SECONDS,
     report_dir: Optional[Path] = None,
 ) -> int:
     report_dir = report_dir or workspace.parent
@@ -525,7 +760,13 @@ def run_colmap_script(
             return reset_result
 
     if mode == "full":
-        return run_full_pipeline(workspace, runtime_estimate=runtime_estimate, sample_views=sample_views)
+        return run_full_pipeline(
+            workspace,
+            runtime_estimate=runtime_estimate,
+            sample_views=sample_views,
+            first_update_seconds=first_update_seconds,
+            target_error_seconds=target_error_seconds,
+        )
 
     if mode == "dense":
         return call_batch_with_runtime_estimate(
@@ -533,6 +774,8 @@ def run_colmap_script(
             workspace,
             runtime_estimate=runtime_estimate,
             sample_views=sample_views,
+            first_update_seconds=first_update_seconds,
+            target_error_seconds=target_error_seconds,
             full_start=None,
         )
     return call_batch(script, workspace)
@@ -554,6 +797,8 @@ def main() -> int:
         args.mode,
         runtime_estimate=not args.no_runtime_estimate,
         sample_views=args.runtime_estimate_sample_views,
+        first_update_seconds=args.runtime_estimate_first_update_seconds,
+        target_error_seconds=max(0.0, args.runtime_estimate_target_error_minutes) * 60.0,
         report_dir=root,
     )
 
