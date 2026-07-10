@@ -1053,8 +1053,6 @@ This folder is prepared from the current WiFi/IMU/photo capture.
 
 For normal rebuilds, prefer `python run_colmap.py full` from the project root; it clears old COLMAP outputs automatically before running sparse and dense reconstruction. If you run these generated `.bat` scripts directly and they report existing outputs, run `reset_colmap_outputs.bat` first; it asks you to type `YES` before deleting old outputs.
 
-When `python run_colmap.py full` reaches dense PatchMatch, it prints an immediate model preview once COLMAP reports the dense view count. It then prints the first target-precision estimate as soon as the sample and model agree within the default 30-minute error target, or after 60 seconds at the latest. Use `--runtime-estimate-sample-views N`, `--runtime-estimate-first-update-seconds N`, or `--runtime-estimate-target-error-minutes N` to tune this, or `--no-runtime-estimate` to disable it.
-
 The generated scripts favor reconstruction quality over speed. The sparse matcher is `{matcher}` and the dense profile is `{dense_profile}`.
 
 ## Why This Setup

@@ -11,6 +11,7 @@ import csv
 import json
 import math
 import statistics
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -1079,8 +1080,44 @@ def profile_value(args: argparse.Namespace, name: str) -> Any:
     return PROFILE_DEFAULTS[args.reconstruction_profile][name]
 
 
+def detect_nvidia_gpu() -> Dict[str, Any]:
+    """Probe the GPU for this run. No result is loaded from a previous run."""
+    command = ["nvidia-smi", "--query-gpu=name,memory.total,driver_version", "--format=csv,noheader,nounits"]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=8, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"available": False, "cuda_enabled": False, "reason": str(exc)}
+    if result.returncode != 0 or not result.stdout.strip():
+        return {"available": False, "cuda_enabled": False, "reason": result.stderr.strip() or "nvidia-smi returned no GPU"}
+    fields = [field.strip() for field in result.stdout.strip().splitlines()[0].split(",", 2)]
+    try:
+        memory_mb = int(fields[1])
+    except (IndexError, ValueError):
+        memory_mb = 0
+    return {"available": True, "cuda_enabled": True, "name": fields[0], "memory_mb": memory_mb,
+            "driver_version": fields[2] if len(fields) > 2 else "unknown", "probe": "nvidia-smi"}
+
+
+def automatic_profile(hardware: Dict[str, Any]) -> str:
+    memory_mb = int(hardware.get("memory_mb") or 0)
+    if memory_mb >= 22000:
+        return "complete"
+    if memory_mb >= 14000:
+        return "rtx4080"
+    if memory_mb >= 8000:
+        return "final"
+    return "preview"
+
+
 def log_stage(message: str) -> None:
     print(f"[stage] {message}", flush=True)
+
+
+def log_stage_done(number: int, summary: Any, skipped_reason: Optional[str] = None) -> None:
+    if isinstance(summary, dict) and summary.get("status") == "skipped":
+        print(f"[skip] {number}/8 {skipped_reason or 'disabled by command-line options'}", flush=True)
+    else:
+        print(f"[done] {number}/8 completed", flush=True)
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -1089,9 +1126,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--output", type=Path, default=Path("processed"), help="Output folder.")
     parser.add_argument(
         "--reconstruction-profile",
-        choices=["preview", "final", "rtx4080", "complete"],
-        default="rtx4080",
-        help="preview is fast, final is quality-oriented, rtx4080 balances quality/runtime on RTX 4080, complete maximizes completeness.",
+        choices=["auto", "preview", "final", "rtx4080", "complete"],
+        default="auto",
+        help="auto probes the current NVIDIA GPU and VRAM on every run; other values explicitly override profile selection.",
     )
     parser.add_argument("--min-detection-rate", type=float, default=0.20)
     parser.add_argument("--min-mean-rssi", type=float, default=-90.0)
@@ -1156,6 +1193,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
+    requested_profile = args.reconstruction_profile
+    hardware = detect_nvidia_gpu()
+    if requested_profile == "auto":
+        args.reconstruction_profile = automatic_profile(hardware)
     root = args.root.resolve()
     output_dir = (root / args.output).resolve() if not args.output.is_absolute() else args.output
     session_dirs = find_session_dirs(root)
@@ -1165,7 +1206,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(f"[info] root: {root}", flush=True)
     print(f"[info] output: {output_dir}", flush=True)
     print(f"[info] sessions: {', '.join(path.name for path in session_dirs)}", flush=True)
-    print(f"[info] reconstruction profile: {args.reconstruction_profile}", flush=True)
+    if hardware.get("available"):
+        print(f"[hardware] GPU detected now: {hardware['name']}, VRAM={hardware['memory_mb']} MiB, driver={hardware['driver_version']}", flush=True)
+    else:
+        print(f"[hardware] NVIDIA CUDA GPU not detected: {hardware.get('reason', 'unknown reason')}", flush=True)
+    selection_source = "automatic current-hardware selection" if requested_profile == "auto" else "explicit command-line override"
+    print(f"[info] reconstruction profile: {args.reconstruction_profile} ({selection_source})", flush=True)
 
     video_frame_interval_s = profile_value(args, "video_frame_interval_s")
     video_max_frames = profile_value(args, "video_max_frames")
@@ -1196,6 +1242,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         max_rssi_std=args.max_rssi_std,
         min_scan_count=args.min_scan_count,
     )
+    log_stage_done(1, selection)
     log_stage("2/8 computing IMU/PDR movement tables")
     pdr_summary = build_pdr_tables(
         session_dirs=session_dirs,
@@ -1203,8 +1250,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         base_step_m=args.base_step_m,
         heading_offset_deg=args.heading_offset_deg,
     )
+    log_stage_done(2, pdr_summary)
     log_stage("3/8 fusing WiFi fingerprints with PDR positions")
     fused_summary = build_wifi_pdr_feature_table(output_dir)
+    log_stage_done(3, fused_summary)
     log_stage("4/8 mapping checkpoint photos to WiFi/PDR points")
     image_summary = (
         {"status": "skipped"}
@@ -1218,6 +1267,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             point_event=args.point_event,
         )
     )
+    log_stage_done(4, image_summary, "checkpoint photo mapping disabled by --skip-image-wifi")
     log_stage("5/8 extracting route video bridge frames")
     video_frames_summary = (
         {"status": "skipped"}
@@ -1233,6 +1283,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             keyframe_min_change=video_keyframe_min_change,
             keyframe_min_gap=video_keyframe_min_gap,
         )
+    )
+    log_stage_done(
+        5,
+        video_frames_summary,
+        "video extraction disabled by --skip-video-frames or because image/WiFi mapping is disabled",
     )
     reconstruction_output_dir = (
         (root / args.reconstruction_output).resolve()
@@ -1260,6 +1315,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             include_video_frames=not args.skip_video_frames,
         )
     )
+    log_stage_done(
+        6,
+        reconstruction_summary,
+        "reconstruction export disabled by --skip-reconstruction-export or because image/WiFi mapping is disabled",
+    )
     log_stage("7/8 building WiFi positioning artifacts")
     wifi_positioning_summary = (
         {"status": "skipped"}
@@ -1270,6 +1330,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             grid_cell_size_m=args.wifi_grid_cell_size_m,
             localization_k=args.wifi_localization_k,
         )
+    )
+    log_stage_done(
+        7,
+        wifi_positioning_summary,
+        "WiFi positioning disabled or reconstruction export was skipped",
     )
     colmap_workspace_dir = (
         (root / args.colmap_workspace).resolve()
@@ -1288,7 +1353,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             colmap_exe=args.colmap_exe,
             camera_model=args.colmap_camera_model,
             single_camera=True,
-            use_gpu=True,
+            use_gpu=bool(hardware.get("cuda_enabled")),
             matcher=colmap_matcher,
             quality=colmap_quality,
             dense_max_image_size=colmap_dense_max_image_size,
@@ -1309,13 +1374,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             constrained_video_anchor_limit=constrained_video_anchor_limit,
         )
     )
+    log_stage_done(8, colmap_summary, "COLMAP preparation disabled or reconstruction export was skipped")
     write_readme(output_dir)
     write_json(
         output_dir / "processing_summary.json",
         {
             "root": str(root),
             "sessions": [path.name for path in session_dirs],
+            "requested_reconstruction_profile": requested_profile,
             "reconstruction_profile": args.reconstruction_profile,
+            "hardware_probe": hardware,
             "profile_defaults": PROFILE_DEFAULTS[args.reconstruction_profile],
             "wifi": {
                 "selected_ap_count_by_session": selection["selected_ap_count_by_session"],

@@ -56,40 +56,6 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run full reconstruction without the upfront confirmation prompt.",
     )
-    parser.add_argument(
-        "--no-upfront-estimate",
-        action="store_true",
-        help="Skip the upfront full-pipeline runtime estimate.",
-    )
-    parser.add_argument(
-        "--no-runtime-estimate",
-        action="store_true",
-        help="Disable live PatchMatch runtime estimation for full/dense runs.",
-    )
-    parser.add_argument(
-        "--runtime-estimate-sample-views",
-        type=int,
-        default=DEFAULT_RUNTIME_SAMPLE_VIEWS,
-        help="Number of completed PatchMatch views to time before printing the first sample-refined estimate.",
-    )
-    parser.add_argument(
-        "--runtime-estimate-first-update-seconds",
-        type=float,
-        default=DEFAULT_RUNTIME_FIRST_UPDATE_SECONDS,
-        help=(
-            "Maximum seconds to wait before printing a partial-observation PatchMatch estimate. "
-            "Use 0 to disable only this timed partial update."
-        ),
-    )
-    parser.add_argument(
-        "--runtime-estimate-target-error-minutes",
-        type=float,
-        default=DEFAULT_RUNTIME_TARGET_ERROR_SECONDS / 60.0,
-        help=(
-            "Target error tolerance for early sample-refined estimates, in minutes. "
-            "Default is 30 minutes."
-        ),
-    )
     return parser.parse_args()
 
 
@@ -332,7 +298,6 @@ def print_upfront_runtime_estimate(workspace: Path) -> None:
 
 
 def confirm_full_colmap_run(workspace: Path) -> bool:
-    print_upfront_runtime_estimate(workspace)
     if not sys.stdin.isatty():
         return False
     answer = input("Run full COLMAP now (sparse + dense)? [y/N]: ").strip().lower()
@@ -738,7 +703,7 @@ def run_colmap_script(
     workspace: Path,
     mode: str,
     *,
-    runtime_estimate: bool = True,
+    runtime_estimate: bool = False,
     sample_views: int = DEFAULT_RUNTIME_SAMPLE_VIEWS,
     first_update_seconds: float = DEFAULT_RUNTIME_FIRST_UPDATE_SECONDS,
     target_error_seconds: float = DEFAULT_RUNTIME_TARGET_ERROR_SECONDS,
@@ -785,20 +750,15 @@ def main() -> int:
     args = parse_args()
     root = Path(__file__).resolve().parent
     workspace = args.workspace if args.workspace.is_absolute() else root / args.workspace
-    if args.mode == "full" and not args.no_upfront_estimate:
+    if args.mode == "full":
         require_script(workspace, "sparse")
         require_script(workspace, "dense")
-        if args.yes or not sys.stdin.isatty():
-            print_upfront_runtime_estimate(workspace)
-        elif not confirm_full_colmap_run(workspace):
+        if not args.yes and sys.stdin.isatty() and not confirm_full_colmap_run(workspace):
             return 0
     return run_colmap_script(
         workspace,
         args.mode,
-        runtime_estimate=not args.no_runtime_estimate,
-        sample_views=args.runtime_estimate_sample_views,
-        first_update_seconds=args.runtime_estimate_first_update_seconds,
-        target_error_seconds=max(0.0, args.runtime_estimate_target_error_minutes) * 60.0,
+        runtime_estimate=False,
         report_dir=root,
     )
 
