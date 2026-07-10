@@ -26,19 +26,42 @@ METADATA_FILES = [
 ]
 
 
-REASON_BASE_WEIGHTS = {
-    "same_wifi_point_nearby_slots": 1.00,
-    "nearby_wifi_points": 0.88,
-    "video_sequence": 0.82,
-    "nearby_pdr_points": 0.74,
-    "video_to_wifi_anchor": 0.70,
-}
-
-SOURCE_PAIR_WEIGHTS = {
-    ("wifi_anchor_photo", "wifi_anchor_photo"): 1.00,
-    ("video_base_frame", "video_base_frame"): 0.86,
-    ("video_base_frame", "wifi_anchor_photo"): 0.78,
-    ("wifi_anchor_photo", "video_base_frame"): 0.78,
+DENSE_PROFILES: Dict[str, Dict[str, Any]] = {
+    "balanced": {
+        "description": "COLMAP defaults plus geometric consistency; good for quick checks.",
+        "patch_match": {
+            "geom_consistency": 1,
+        },
+        "fusion": {},
+        "run_meshing": True,
+        "run_floor_completion": True,
+    },
+    "complete": {
+        "description": (
+            "Higher-completeness indoor reconstruction. It keeps geometric "
+            "consistency, uses a larger PatchMatch support window, and relaxes "
+            "fusion filters so weak-texture floors survive instead of being "
+            "over-pruned."
+        ),
+        "patch_match": {
+            "geom_consistency": 1,
+            "window_radius": 9,
+            "window_step": 1,
+            "num_samples": 25,
+            "num_iterations": 7,
+            "filter": 1,
+            "filter_min_ncc": 0.05,
+        },
+        "fusion": {
+            "min_num_pixels": 3,
+            "max_reproj_error": 2.5,
+            "max_depth_error": 0.02,
+            "max_normal_error": 15,
+            "check_num_images": 120,
+        },
+        "run_meshing": True,
+        "run_floor_completion": True,
+    },
 }
 
 
@@ -589,6 +612,42 @@ if not exist "%COLMAP_EXE%" (
 """
 
 
+def batch_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    return str(value)
+
+
+def colmap_command(command: str, args: Sequence[str]) -> str:
+    if not args:
+        return f'"%COLMAP_EXE%" {command}'
+    return f'"%COLMAP_EXE%" {command} ^\n' + " ^\n".join(args)
+
+
+def prefixed_options(prefix: str, options: Dict[str, Any]) -> List[str]:
+    return [
+        f"  --{prefix}.{name} {batch_value(value)}"
+        for name, value in options.items()
+        if value is not None
+    ]
+
+
+def dense_profile_config(dense_profile: str) -> Dict[str, Any]:
+    if dense_profile not in DENSE_PROFILES:
+        return DENSE_PROFILES["complete"]
+    return DENSE_PROFILES[dense_profile]
+
+
+def remove_stale_quality_reports(workspace_dir: Path) -> List[str]:
+    removed: List[str] = []
+    for name in ("quality_report.json", "QUALITY_REPORT.md"):
+        path = workspace_dir / name
+        if path.exists():
+            path.unlink()
+            removed.append(name)
+    return removed
+
+
 def write_sparse_batch(
     root: Path,
     workspace_dir: Path,
@@ -689,7 +748,10 @@ echo [3/4] Building sparse model...
 if errorlevel 1 exit /b %errorlevel%
 
 {alignment_block}
-echo [done] Sparse model written under %WORKSPACE%\\sparse
+python "%ROOT%\\reconstruction_quality.py" --workspace "%WORKSPACE%" --summary "%WORKSPACE%\\quality_report.json" --markdown "%WORKSPACE%\\QUALITY_REPORT.md"
+if errorlevel 1 echo [warn] Sparse quality report failed; reconstruction outputs are still available.
+
+echo [done] Sparse model candidates written under %WORKSPACE%\\sparse
 """
     write_text(workspace_dir / "run_colmap_sparse.bat", content)
 
@@ -700,15 +762,75 @@ def write_dense_batch(
     colmap_exe: Path,
     dense_max_image_size: int,
     align_to_pdr: bool,
+    dense_profile: str,
+    run_meshing: bool,
+    run_floor_completion: bool,
 ) -> None:
-    sparse_selector = (
-        """set "SPARSE_MODEL=%WORKSPACE%\\sparse_pdr_aligned\\0"
-if not exist "%SPARSE_MODEL%" set "SPARSE_MODEL=%WORKSPACE%\\sparse\\0"
-"""
-        if align_to_pdr
-        else """set "SPARSE_MODEL=%WORKSPACE%\\sparse\\0"
-"""
+    profile = dense_profile_config(dense_profile)
+    patch_match_args = [
+        '  --workspace_path "%WORKSPACE%\\dense"',
+        "  --workspace_format COLMAP",
+        *prefixed_options("PatchMatchStereo", profile["patch_match"]),
+    ]
+    fusion_args = [
+        '  --workspace_path "%WORKSPACE%\\dense"',
+        "  --workspace_format COLMAP",
+        "  --input_type geometric",
+        *prefixed_options("StereoFusion", profile["fusion"]),
+        '  --output_path "%WORKSPACE%\\dense\\fused.ply"',
+    ]
+    undistorter_command = colmap_command(
+        "image_undistorter",
+        [
+            '  --image_path "%IMAGE_PATH%"',
+            '  --input_path "%SPARSE_MODEL%"',
+            '  --output_path "%WORKSPACE%\\dense"',
+            "  --output_type COLMAP",
+            f"  --max_image_size {dense_max_image_size}",
+        ],
     )
+    patch_match_command = colmap_command("patch_match_stereo", patch_match_args)
+    fusion_command = colmap_command("stereo_fusion", fusion_args)
+    mesh_block = ""
+    if run_meshing and profile.get("run_meshing", True):
+        delaunay_command = colmap_command(
+            "delaunay_mesher",
+            [
+                '  --input_path "%WORKSPACE%\\dense"',
+                '  --output_path "%WORKSPACE%\\dense\\meshed-delaunay.ply"',
+            ],
+        )
+        poisson_command = colmap_command(
+            "poisson_mesher",
+            [
+                '  --input_path "%WORKSPACE%\\dense\\fused.ply"',
+                '  --output_path "%WORKSPACE%\\dense\\meshed-poisson.ply"',
+            ],
+        )
+        mesh_block = f"""
+echo [4/6] Building a Delaunay mesh for robust MeshLab inspection...
+{delaunay_command}
+if errorlevel 1 echo [warn] Delaunay meshing failed; continuing with fused point cloud.
+
+echo [5/6] Building a Poisson mesh for smoother surface inspection...
+{poisson_command}
+if errorlevel 1 echo [warn] Poisson meshing failed; continuing with fused point cloud.
+"""
+    floor_block = ""
+    if run_floor_completion and profile.get("run_floor_completion", True):
+        floor_block = """
+echo [6/6] Estimating an explainable floor plane completion layer...
+python "%ROOT%\\floor_plane_completion.py" ^
+  --input "%WORKSPACE%\\dense\\fused.ply" ^
+  --output "%WORKSPACE%\\dense\\floor_completed_mesh.ply" ^
+  --summary "%WORKSPACE%\\dense\\floor_completion_summary.json"
+if errorlevel 1 echo [warn] Floor completion failed; raw COLMAP outputs are still available.
+"""
+    quality_block = """
+python "%ROOT%\\reconstruction_quality.py" --workspace "%WORKSPACE%" --summary "%WORKSPACE%\\quality_report.json" --markdown "%WORKSPACE%\\QUALITY_REPORT.md"
+if errorlevel 1 echo [warn] Final quality report failed; reconstruction outputs are still available.
+"""
+    pdr_note = "PDR-aligned sparse models are preferred when present." if align_to_pdr else "Visual sparse models are used because visual-only mode is enabled."
     content = batch_header(root, workspace_dir, colmap_exe) + f"""
 {sparse_selector}if not exist "%SPARSE_MODEL%" (
   echo [error] Sparse model not found: %SPARSE_MODEL%
@@ -716,6 +838,7 @@ if not exist "%SPARSE_MODEL%" set "SPARSE_MODEL=%WORKSPACE%\\sparse\\0"
   exit /b 1
 )
 if not exist "%WORKSPACE%\\dense" mkdir "%WORKSPACE%\\dense"
+set "DENSE_POINT_CLOUD=%WORKSPACE%\\dense\\fused.ply"
 
 echo [1/3] Undistorting images...
 "%COLMAP_EXE%" image_undistorter ^
@@ -741,7 +864,11 @@ echo [3/3] Fusing dense point cloud...
   --output_path "%WORKSPACE%\\dense\\fused.ply"
 if errorlevel 1 exit /b %errorlevel%
 
+{mesh_block}{floor_block}{quality_block}
 echo [done] Dense point cloud: %WORKSPACE%\\dense\\fused.ply
+if exist "%WORKSPACE%\\dense\\meshed-delaunay.ply" echo [done] Delaunay mesh: %WORKSPACE%\\dense\\meshed-delaunay.ply
+if exist "%WORKSPACE%\\dense\\meshed-poisson.ply" echo [done] Poisson mesh: %WORKSPACE%\\dense\\meshed-poisson.ply
+if exist "%WORKSPACE%\\dense\\floor_completed_mesh.ply" echo [done] Floor completion layer: %WORKSPACE%\\dense\\floor_completed_mesh.ply
 """
     write_text(workspace_dir / "run_colmap_dense.bat", content)
 
@@ -794,9 +921,10 @@ echo [info] Opening COLMAP GUI...
     write_text(workspace_dir / "open_colmap_gui.bat", content)
 
 
-def write_reset_batch(workspace_dir: Path) -> None:
-    content = """@echo off
+def write_reset_batch(root: Path, workspace_dir: Path) -> None:
+    content = f"""@echo off
 setlocal
+set "ROOT={windows_path(root)}"
 set "WORKSPACE=%~dp0"
 echo This will delete database.db, sparse, PDR-aligned sparse, dense, and automatic output folders under:
 echo %WORKSPACE%
@@ -812,6 +940,8 @@ if exist "%WORKSPACE%dense" rmdir /s /q "%WORKSPACE%dense"
 if exist "%WORKSPACE%stereo" rmdir /s /q "%WORKSPACE%stereo"
 if exist "%WORKSPACE%meshed-poisson.ply" del "%WORKSPACE%meshed-poisson.ply"
 if exist "%WORKSPACE%meshed-delaunay.ply" del "%WORKSPACE%meshed-delaunay.ply"
+if exist "%WORKSPACE%quality_report.json" del "%WORKSPACE%quality_report.json"
+if exist "%WORKSPACE%QUALITY_REPORT.md" del "%WORKSPACE%QUALITY_REPORT.md"
 echo [done] COLMAP outputs reset.
 """
     write_text(workspace_dir / "reset_colmap_outputs.bat", content)
@@ -834,12 +964,22 @@ This folder is prepared from the current WiFi/IMU/photo capture.
 
 ## Start Here
 
-1. If this workspace already has `database.db`, `sparse/`, or `dense/` from an older run, run `reset_colmap_outputs.bat` first.
-2. Run `run_colmap_sparse.bat` to build the sparse SfM model with the current image list and match pairs.
-3. If `sparse/0` is created, run `run_colmap_dense.bat` to generate `dense/fused.ply`.
+1. Run `run_colmap_sparse.bat` to build sparse SfM model candidates.
+2. Run `run_colmap_dense.bat` to generate dense point cloud, meshes, reports, and the floor completion layer.
+3. Open `dense/fused.ply` plus `dense/floor_completed_mesh.ply` together in MeshLab for the point-cloud-plus-floor view.
 
-`run_colmap_automatic.bat` is also provided if you prefer COLMAP's automatic
-pipeline. The manual sparse/dense scripts are easier to debug.
+For normal rebuilds, prefer `python run_colmap.py full` from the project root; it clears old COLMAP outputs automatically before running sparse and dense reconstruction. If you run these generated `.bat` scripts directly and they report existing outputs, run `reset_colmap_outputs.bat` first; it removes old outputs immediately without confirmation.
+
+When `python run_colmap.py full` reaches dense PatchMatch, it times the first few completed views and prints a rough remaining-time estimate. Use `--runtime-estimate-sample-views N` to change the sample size or `--no-runtime-estimate` to disable it.
+
+The generated scripts favor reconstruction quality over speed. The sparse matcher is `{matcher}` and the dense profile is `{dense_profile}`.
+
+## Why This Setup
+
+- Hybrid matching first uses explainable WiFi/PDR/video-order pairs, then adds COLMAP exhaustive visual bridge matches to reduce disconnected sparse components. `match_graph_edges.csv` explains the constrained pairs; exhaustive bridge matches are generated internally by COLMAP.
+- Dense fusion uses a completeness-oriented profile for indoor weak-texture floor and wall regions.
+- Mesh outputs are generated as separate inspection layers so the raw COLMAP point cloud is still preserved.
+- Floor completion is a separate inferred layer with a JSON summary; it is not mixed silently into the raw point cloud.
 
 ## Inputs
 
@@ -857,8 +997,16 @@ pipeline. The manual sparse/dense scripts are easier to debug.
 - `match_graph_edges.csv`: diagnostic weighted edge list with pair reasons, scores, and original slot counts.
 {pdr_ref_line}
 
-The default sparse script now uses `matches_importer` with `match_pairs.txt` to
-avoid matching unrelated indoor images. {alignment_note}
+## Outputs After Running COLMAP
+
+- `QUALITY_REPORT.md` / `quality_report.json`: sparse component counts, largest registered-image count, and dense/floor output availability.
+- `dense/fused.ply`: raw COLMAP dense point cloud.
+- `dense/meshed-delaunay.ply`: robust mesh for inspection when Delaunay succeeds.
+- `dense/meshed-poisson.ply`: smoother mesh for inspection when Poisson succeeds.
+- `dense/floor_completed_mesh.ply`: inferred floor plane mesh for weak-texture floor holes.
+- `dense/floor_completion_summary.json`: chosen vertical axis, plane height, support count, and hull size.
+
+{alignment_note}
 """
     write_text(workspace_dir / "README.md", content)
 
@@ -876,18 +1024,27 @@ def prepare_colmap_workspace(
     quality: str = "high",
     dense_max_image_size: int = 1200,
     visual_only: bool = False,
-    feature_max_image_size: int = 1600,
-    max_num_features: int = 6000,
-    max_num_matches: int = 32768,
-    constrained_point_window: int = 1,
-    constrained_slot_window: int = 2,
-    constrained_max_pdr_distance_m: float = 8.0,
-    constrained_video_frame_window: int = 3,
-    constrained_video_anchor_point_window: int = 1,
-    constrained_video_anchor_limit: int = 12,
+    feature_max_image_size: int = 3200,
+    max_num_features: int = 20000,
+    max_num_matches: int = 131072,
+    dense_profile: str = "complete",
+    run_meshing: bool = True,
+    run_floor_completion: bool = True,
+    constrained_point_window: int = 2,
+    constrained_slot_window: int = 3,
+    constrained_max_pdr_distance_m: float = 12.0,
+    constrained_video_frame_window: int = 6,
+    constrained_video_anchor_point_window: int = 2,
+    constrained_video_anchor_limit: int = 24,
 ) -> Dict[str, Any]:
     _fields, manifest_rows = read_csv(reconstruction_dir / "images_manifest.csv")
     workspace_dir.mkdir(parents=True, exist_ok=True)
+    existing_colmap_outputs = [
+        name
+        for name in ("database.db", "sparse", "sparse_pdr_aligned", "sparse_pose_prior", "dense")
+        if (workspace_dir / name).exists()
+    ]
+    removed_stale_reports = remove_stale_quality_reports(workspace_dir)
     resolved_colmap_exe = find_colmap_exe(root, colmap_dir=colmap_dir, colmap_exe=colmap_exe)
 
     copied_images, image_names, missing_images = copy_images(reconstruction_dir, workspace_dir, manifest_rows)
@@ -932,6 +1089,9 @@ def prepare_colmap_workspace(
         colmap_exe=resolved_colmap_exe,
         dense_max_image_size=dense_max_image_size,
         align_to_pdr=align_to_pdr,
+        dense_profile=dense_profile,
+        run_meshing=run_meshing,
+        run_floor_completion=run_floor_completion,
     )
     write_full_batch(workspace_dir)
     write_automatic_batch(
@@ -945,16 +1105,7 @@ def prepare_colmap_workspace(
     )
     write_gui_batch(root=root, workspace_dir=workspace_dir, colmap_exe=resolved_colmap_exe)
     write_reset_batch(workspace_dir)
-    write_readme(workspace_dir, visual_only=visual_only)
-
-    existing_colmap_outputs = [
-        name
-        for name in ("database.db", "sparse", "sparse_pdr_aligned", "dense", "stereo")
-        if (workspace_dir / name).exists()
-    ]
-    summary_status = "ok" if not missing_images and resolved_colmap_exe.exists() else "needs_attention"
-    if summary_status == "ok" and existing_colmap_outputs:
-        summary_status = "ready_needs_colmap_reset"
+    write_readme(workspace_dir, visual_only=visual_only, matcher=matcher, dense_profile=dense_profile)
 
     summary = {
         "status": summary_status,
@@ -983,6 +1134,14 @@ def prepare_colmap_workspace(
         "pdr_alignment_ref_count": pdr_alignment_ref_count,
         "quality": quality,
         "dense_max_image_size": dense_max_image_size,
+        "dense_profile": dense_profile,
+        "dense_profile_config": DENSE_PROFILES[dense_profile],
+        "run_meshing": run_meshing,
+        "run_floor_completion": run_floor_completion,
+        "sparse_model_selection": (
+            "run_colmap_dense.bat calls reconstruction_quality.py to choose the largest registered sparse component; "
+            "PDR-aligned models win ties over raw sparse models"
+        ),
         "scripts": [
             "run_colmap_sparse.bat",
             "run_colmap_dense.bat",

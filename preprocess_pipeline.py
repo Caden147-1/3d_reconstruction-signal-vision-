@@ -38,6 +38,15 @@ PROFILE_DEFAULTS = {
         "colmap_feature_max_image_size": 1600,
         "colmap_max_num_features": 6000,
         "colmap_max_num_matches": 32768,
+        "colmap_matcher": "constrained",
+        "colmap_quality": "high",
+        "colmap_dense_profile": "balanced",
+        "constrained_point_window": 1,
+        "constrained_slot_window": 2,
+        "constrained_max_pdr_distance_m": 8.0,
+        "constrained_video_frame_window": 3,
+        "constrained_video_anchor_point_window": 1,
+        "constrained_video_anchor_limit": 12,
     },
     "final": {
         "max_colmap_anchor_images_per_point": 0,
@@ -50,6 +59,57 @@ PROFILE_DEFAULTS = {
         "colmap_feature_max_image_size": 2400,
         "colmap_max_num_features": 12000,
         "colmap_max_num_matches": 65536,
+        "colmap_matcher": "hybrid",
+        "colmap_quality": "extreme",
+        "colmap_dense_profile": "complete",
+        "constrained_point_window": 2,
+        "constrained_slot_window": 3,
+        "constrained_max_pdr_distance_m": 12.0,
+        "constrained_video_frame_window": 6,
+        "constrained_video_anchor_point_window": 2,
+        "constrained_video_anchor_limit": 24,
+    },
+    "rtx4080": {
+        "max_colmap_anchor_images_per_point": 0,
+        "video_frame_interval_s": 0.75,
+        "video_max_frames": 360,
+        "video_blur_threshold": 50.0,
+        "video_keyframe_min_change": 3.0,
+        "video_keyframe_min_gap": 1,
+        "colmap_dense_max_image_size": 2400,
+        "colmap_feature_max_image_size": 2800,
+        "colmap_max_num_features": 16000,
+        "colmap_max_num_matches": 98304,
+        "colmap_matcher": "hybrid",
+        "colmap_quality": "extreme",
+        "colmap_dense_profile": "rtx4080",
+        "constrained_point_window": 2,
+        "constrained_slot_window": 3,
+        "constrained_max_pdr_distance_m": 14.0,
+        "constrained_video_frame_window": 7,
+        "constrained_video_anchor_point_window": 2,
+        "constrained_video_anchor_limit": 30,
+    },
+    "complete": {
+        "max_colmap_anchor_images_per_point": 0,
+        "video_frame_interval_s": 0.5,
+        "video_max_frames": 0,
+        "video_blur_threshold": 40.0,
+        "video_keyframe_min_change": 2.0,
+        "video_keyframe_min_gap": 1,
+        "colmap_dense_max_image_size": 3200,
+        "colmap_feature_max_image_size": 3200,
+        "colmap_max_num_features": 20000,
+        "colmap_max_num_matches": 131072,
+        "colmap_matcher": "hybrid",
+        "colmap_quality": "extreme",
+        "colmap_dense_profile": "complete",
+        "constrained_point_window": 3,
+        "constrained_slot_window": 4,
+        "constrained_max_pdr_distance_m": 16.0,
+        "constrained_video_frame_window": 8,
+        "constrained_video_anchor_point_window": 3,
+        "constrained_video_anchor_limit": 36,
     },
 }
 
@@ -1025,9 +1085,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--output", type=Path, default=Path("processed"), help="Output folder.")
     parser.add_argument(
         "--reconstruction-profile",
-        choices=["preview", "final"],
-        default="preview",
-        help="preview keeps circular angular samples for fast SfM; final keeps all checkpoint photos for dense/spatial work.",
+        choices=["preview", "final", "rtx4080", "complete"],
+        default="rtx4080",
+        help="preview is fast, final is quality-oriented, rtx4080 balances quality/runtime on RTX 4080, complete maximizes completeness.",
     )
     parser.add_argument("--min-detection-rate", type=float, default=0.20)
     parser.add_argument("--min-mean-rssi", type=float, default=-90.0)
@@ -1073,6 +1133,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--colmap-matcher", choices=["constrained", "exhaustive", "sequential"], default="constrained")
     parser.add_argument("--colmap-quality", choices=["low", "medium", "high", "extreme"], default="high")
     parser.add_argument("--colmap-dense-max-image-size", type=int)
+    parser.add_argument("--colmap-dense-profile", choices=["balanced", "rtx4080", "complete"], help="Dense/MVS parameter profile written into run_colmap_dense.bat.")
+    parser.add_argument("--skip-colmap-meshing", action="store_true", help="Skip Delaunay/Poisson mesh commands in the generated dense script.")
+    parser.add_argument("--skip-floor-completion", action="store_true", help="Skip the explainable floor plane completion layer.")
+    parser.add_argument("--skip-point-cloud-filter", action="store_true", help="Skip the filtered fused point cloud post-processing output.")
+    parser.add_argument("--skip-dark-surface-completion", action="store_true", help="Skip the dark low-texture surface completion layer.")
     parser.add_argument("--colmap-feature-max-image-size", type=int)
     parser.add_argument("--colmap-max-num-features", type=int)
     parser.add_argument("--colmap-max-num-matches", type=int)
@@ -1210,12 +1275,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             feature_max_image_size=colmap_feature_max_image_size,
             max_num_features=colmap_max_num_features,
             max_num_matches=colmap_max_num_matches,
-            constrained_point_window=args.constrained_point_window,
-            constrained_slot_window=args.constrained_slot_window,
-            constrained_max_pdr_distance_m=args.constrained_max_pdr_distance_m,
-            constrained_video_frame_window=args.constrained_video_frame_window,
-            constrained_video_anchor_point_window=args.constrained_video_anchor_point_window,
-            constrained_video_anchor_limit=args.constrained_video_anchor_limit,
+            dense_profile=colmap_dense_profile,
+            run_meshing=not args.skip_colmap_meshing,
+            run_floor_completion=not args.skip_floor_completion,
+            run_point_cloud_filter=not args.skip_point_cloud_filter,
+            run_dark_surface_completion=not args.skip_dark_surface_completion,
+            constrained_point_window=constrained_point_window,
+            constrained_slot_window=constrained_slot_window,
+            constrained_max_pdr_distance_m=constrained_max_pdr_distance_m,
+            constrained_video_frame_window=constrained_video_frame_window,
+            constrained_video_anchor_point_window=constrained_video_anchor_point_window,
+            constrained_video_anchor_limit=constrained_video_anchor_limit,
         )
     )
     write_readme(output_dir)

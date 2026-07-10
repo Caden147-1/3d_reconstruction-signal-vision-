@@ -15,6 +15,13 @@ video/
 processed/
 reconstruction_dataset/
 colmap_workspace/
+colmap_workspace_conservative/
+colmap_masks/
+colmap_masks_conservative/
+mask_review/
+mask_suggestions/
+QUALITY_REPORT.md
+quality_report.json
 
 # Research papers and extracted notes
 Papers/
@@ -35,6 +42,7 @@ stereo/
 *.bin
 
 # Python caches and local environment
+.serena/
 __pycache__/
 *.py[cod]
 .venv/

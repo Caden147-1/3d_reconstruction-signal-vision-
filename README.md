@@ -10,32 +10,40 @@
 - 用 WiFi/PDR 采样点生成粗边界和信号覆盖模型
 - 用 constrained matching 减少室内重复纹理导致的 COLMAP 乱匹配
 
-注意：COLMAP 本身只直接使用图像。WiFi/IMU 不会直接变成点云，而是在前后处理里变成位置种子、匹配约束、边界和定位模型。
+- Preprocess raw `.sess` WiFi/IMU logs into selected AP tables and PDR trajectories.
+- Bind ordered checkpoint photos to WiFi/PDR sampling points.
+- Extract route-video keyframes as weak visual bridge frames.
+- Export a COLMAP-friendly image dataset and metadata tables.
+- Generate constrained or hybrid COLMAP match pairs from WiFi point order, PDR distance, photo slot angle, and video order.
+- Build WiFi fingerprint localization models and signal-boundary summaries.
+- Generate sparse/dense COLMAP batch scripts, filtered dense point clouds, dense meshes, quality reports, and explicit completion inspection layers.
 
 ## 1. 目录结构
 
 推荐把数据放成这样：
 
 ```text
-3d_reconstruction-signal-vision-/
-  main.py
-  preprocess_pipeline.py
-  image_mapping.py
-  video_frames.py
-  reconstruction_export.py
-  wifi_positioning.py
-  colmap_bridge.py
-  localize_wifi.py
-  run_colmap.py
-  run_colmap_sparse.bat
-  run_colmap_dense.bat
-  run_colmap_full.bat
-  DATA_COLLECTION_GUIDE.md
-
-  pic/
-  video/
-  2026-xx-xx-xx-xx-xx-xxx.sess/
-  colmap-x64-windows-cuda/
+.
+|-- main.py                         # Main launcher for preprocessing and optional COLMAP run
+|-- preprocess_pipeline.py          # End-to-end preprocessing pipeline
+|-- image_mapping.py                # Photo-to-WiFi point mapping helpers
+|-- video_frames.py                 # Route video frame extraction and filtering
+|-- reconstruction_export.py        # COLMAP dataset export
+|-- colmap_bridge.py                # COLMAP workspace and batch-script generation
+|-- reconstruction_quality.py       # Sparse/dense quality report and model selection
+|-- floor_plane_completion.py       # Separate explainable floor mesh layer
+|-- point_cloud_filter.py           # Conservative far/isolated dense outlier filter
+|-- dark_surface_completion.py      # Separate dark low-texture surface fill layer
+|-- ply_io.py                       # Shared PLY vertex IO helpers
+|-- wifi_positioning.py             # WiFi fingerprint localization model generation
+|-- localize_wifi.py                # Localize a new WiFi scan
+|-- run_colmap.py                   # Wrapper for generated COLMAP batch scripts
+|-- pic/                            # Input checkpoint photos, ordered by filename
+|-- video/                          # Input route videos
+|-- *.sess/                         # Raw phone WiFi/IMU/movement session folders
+|-- processed/                      # Generated preprocessing outputs
+|-- reconstruction_dataset/         # Generated COLMAP-ready dataset
+|-- colmap_workspace/               # Generated COLMAP workspace and scripts
 ```
 
 输入数据：
@@ -85,7 +93,13 @@ colmap_workspace/
 [done] preprocessing complete
 ```
 
-说明预处理和 COLMAP workspace 准备完成。
+At the start of `full`, `run_colmap.py` prints a rough stage-by-stage estimate for reset, sparse reconstruction, dense PatchMatch, fusion, filtering, meshing, completion layers, and reports. It then asks whether to run the complete COLMAP pipeline. Old COLMAP outputs are still removed automatically after you confirm; cleanup itself does not ask for another prompt.
+
+To run without the upfront prompt:
+
+```powershell
+python run_colmap.py full --yes
+```
 
 ## 3. 流水线逻辑
 
@@ -97,7 +111,172 @@ colmap_workspace/
 *.sess/wifiScanner.dat
 ```
 
-输出：
+During `full` and `dense` runs, the live estimator also watches the first completed PatchMatch views and refines the rough estimate. The default sample size is 2 views:
+
+```powershell
+python run_colmap.py full --runtime-estimate-sample-views 3
+python run_colmap.py full --no-runtime-estimate
+python run_colmap.py full --no-upfront-estimate
+```
+
+## Pipeline
+
+1. WiFi parsing
+   - Reads raw WiFi scans from `.sess` data.
+   - Selects stable access points.
+   - Writes long/wide WiFi feature tables.
+
+2. IMU/PDR parsing
+   - Reads accelerometer, rotation, and movement logs.
+   - Estimates steps, heading, and relative PDR coordinates.
+   - Produces `pdr_x` / `pdr_y` trajectories.
+
+3. WiFi/PDR fusion
+   - Assigns WiFi scans to PDR positions.
+   - Creates the spatial basis for fingerprints, boundaries, and pose seeds.
+
+4. Photo mapping
+   - Groups ordered photos into checkpoint slots.
+   - Binds each checkpoint photo to a WiFi/PDR point.
+   - Writes image-to-WiFi mapping summaries.
+
+5. Video frame extraction
+   - Extracts route-video frames.
+   - Filters blurry or near-duplicate frames.
+   - Weakly assigns frames along the PDR route.
+
+6. Reconstruction dataset export
+   - Copies and renames COLMAP input images.
+   - Writes `images_manifest.csv`, `camera_pose_seed.csv`, WiFi fingerprint tables, and boundary seeds.
+
+7. WiFi positioning
+   - Builds a KNN-style WiFi fingerprint localizer.
+   - Writes localization evaluation, RSSI grid, and signal boundary summaries.
+
+8. COLMAP workspace generation
+   - Writes `image_list.txt`, `match_pairs.txt`, `match_graph_edges.csv`, and batch scripts.
+   - Generates sparse, dense, automatic, GUI, and reset scripts.
+
+## Reconstruction Profiles
+
+Use `--reconstruction-profile` to control speed/quality tradeoffs:
+
+```powershell
+python main.py --reconstruction-profile preview
+python main.py --reconstruction-profile final
+python main.py --reconstruction-profile rtx4080
+python main.py --reconstruction-profile complete
+```
+
+- `preview`: faster checks with lower image/feature limits.
+- `final`: quality-oriented settings for moderate compute.
+- `rtx4080`: recommended default for RTX 4080; balances dense resolution, feature count, and PatchMatch cost.
+- `complete`: highest-completeness profile, using more frames/features and the `complete` dense profile.
+
+The current default is `rtx4080`.
+
+## Useful Commands
+
+Regenerate preprocessing outputs:
+
+```powershell
+python main.py
+```
+
+Run only COLMAP sparse:
+
+```powershell
+python run_colmap.py sparse
+```
+
+Run only COLMAP dense:
+
+```powershell
+python run_colmap.py dense
+```
+
+Open COLMAP GUI:
+
+```powershell
+python run_colmap.py gui
+```
+
+Reset COLMAP outputs without rebuilding:
+
+```powershell
+python run_colmap.py reset
+```
+
+This removes old COLMAP outputs immediately and does not ask for confirmation.
+
+Localize a new WiFi scan from JSON:
+
+```powershell
+python localize_wifi.py --scan-json new_scan.json
+```
+
+Localize a new WiFi scan from CSV:
+
+```powershell
+python localize_wifi.py --scan-csv new_scan.csv
+```
+
+## Common Options
+
+Change photos per WiFi checkpoint:
+
+```powershell
+python main.py --images-per-wifi-point 16
+```
+
+Skip video frames:
+
+```powershell
+python main.py --skip-video-frames
+```
+
+Use visual-only COLMAP preparation without PDR-distance fallback or PDR model alignment:
+
+```powershell
+python main.py --visual-only
+```
+
+Reduce dense compute cost:
+
+```powershell
+python main.py --colmap-dense-max-image-size 1600
+```
+
+Use a different dense profile:
+
+```powershell
+python main.py --colmap-dense-profile balanced
+python main.py --colmap-dense-profile rtx4080
+python main.py --colmap-dense-profile complete
+```
+
+Skip post-processing layers if you only want raw COLMAP outputs:
+
+```powershell
+python main.py --skip-point-cloud-filter
+python main.py --skip-dark-surface-completion
+```
+
+Tighten same-point angular matching:
+
+```powershell
+python main.py --constrained-slot-window 1
+```
+
+Loosen neighboring-point matching:
+
+```powershell
+python main.py --constrained-point-window 3
+```
+
+## Key Outputs
+
+Preprocessing outputs:
 
 ```text
 processed/wifi_long.csv
@@ -248,7 +427,10 @@ colmap_workspace/images/
 colmap_workspace/image_list.txt
 colmap_workspace/match_pairs.txt
 colmap_workspace/pdr_alignment_refs.txt
-colmap_workspace/metadata/
+colmap_workspace/run_colmap_sparse.bat
+colmap_workspace/run_colmap_dense.bat
+QUALITY_REPORT.md
+quality_report.json
 ```
 
 作用：
@@ -269,10 +451,59 @@ python run_colmap.py reset
 它会要求输入：
 
 ```text
-YES
+colmap_workspace/dense/fused.ply
+colmap_workspace/dense/fused_filtered.ply
+colmap_workspace/dense/point_filter_summary.json
+colmap_workspace/dense/meshed-delaunay.ply
+colmap_workspace/dense/meshed-poisson.ply
+colmap_workspace/dense/floor_completed_mesh.ply
+colmap_workspace/dense/floor_completion_summary.json
+colmap_workspace/dense/dark_surface_completed_mesh.ply
+colmap_workspace/dense/dark_surface_completion_summary.json
 ```
 
-然后运行 sparse：
+`fused.ply` is the raw COLMAP dense point cloud. `fused_filtered.ply` is the recommended cleaned point cloud for inspection when far flying points are present. `floor_completed_mesh.ply` and `dark_surface_completed_mesh.ply` are inferred inspection layers and should be reported separately from the raw reconstruction.
+
+## Quality Reports
+
+Run:
+
+```powershell
+python reconstruction_quality.py --workspace colmap_workspace --summary quality_report.json --markdown QUALITY_REPORT.md
+```
+
+The report checks:
+
+- Input image count.
+- COLMAP database image count.
+- Sparse component count and registered-image ratio.
+- Dense point cloud and filtered point cloud availability.
+- Mesh, floor-completion, and dark-surface completion availability.
+- Match-pair reason counts.
+
+If the report says `database image count does not match image_list.txt`, rebuild with:
+
+```powershell
+python run_colmap.py full
+```
+
+The launcher clears stale COLMAP outputs before rebuilding.
+
+## Troubleshooting
+
+### Existing COLMAP outputs are detected
+
+Use the Python launcher for normal rebuilds:
+
+```powershell
+python run_colmap.py full
+```
+
+It automatically removes stale `database.db`, sparse, dense, mesh, and report outputs before rebuilding. If you run the generated `.bat` scripts directly and they report existing outputs, run `colmap_workspace\reset_colmap_outputs.bat` first; it deletes the old outputs without asking for confirmation.
+
+### Dense reconstruction says sparse model is missing
+
+Run sparse first:
 
 ```powershell
 python run_colmap.py sparse
@@ -296,53 +527,7 @@ python run_colmap.py full
 .\run_colmap_full.bat
 ```
 
-## 5. 最终点云
-
-如果 `colmap_workspace/colmap_workspace_summary.json` 里显示 `ready_needs_colmap_reset`，说明 workspace 已按当前数据重新准备好，但旧的 `database.db` 或 `sparse/` 仍在。先运行 `python run_colmap.py reset`，再重新跑 sparse/dense，避免旧重建结果和新匹配约束混用。
-
-最终 dense 点云：
-
-```text
-colmap_workspace/dense/fused.ply
-```
-
-可以用 MeshLab 或 CloudCompare 打开。
-
-如果 PDR 对齐成功，还会有：
-
-```text
-colmap_workspace/sparse_pdr_aligned/
-```
-
-dense 阶段会优先使用 `sparse_pdr_aligned/0`。
-
-## 6. 常用参数
-
-默认每个 WiFi 点位 20 张照片。如果你临时不是 20 张，可以改：
-
-```powershell
-python main.py --images-per-wifi-point 16
-```
-
-视频每 0.5 秒抽 1 帧：
-
-```powershell
-python main.py --video-frame-interval-s 0.5
-```
-
-视频不限制最大抽帧数量：
-
-```powershell
-python main.py --video-max-frames 0
-```
-
-跳过视频抽帧：
-
-```powershell
-python main.py --skip-video-frames
-```
-
-收紧 COLMAP 匹配约束：
+Open `colmap_workspace/dense/fused_filtered.ply` instead of the raw `fused.ply`, and inspect `point_filter_summary.json` for the number of removed points. If noise is still high, try tighter matching or lower dense image size:
 
 ```powershell
 python main.py --constrained-slot-window 1
@@ -362,13 +547,11 @@ python main.py --colmap-dense-max-image-size 1600
 
 ## 7. 推荐完整运行顺序
 
-```powershell
-cd C:\Users\ASUS\Desktop\3d_reconstruction-signal-vision-
-python main.py
-python run_colmap.py reset
-python run_colmap.py sparse
-python run_colmap.py dense
-```
+### Dark low-texture gaps remain
+
+Open `dense/dark_surface_completed_mesh.ply` together with `dense/fused_filtered.ply`. This is an inferred inspection layer based on surviving dark points, so it should be reported separately from the raw COLMAP output.
+
+### Video frames are missing
 
 最终查看：
 
