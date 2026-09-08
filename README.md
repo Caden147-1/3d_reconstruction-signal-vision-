@@ -18,6 +18,12 @@
 - Build WiFi fingerprint localization models and signal-boundary summaries.
 - Generate sparse/dense COLMAP batch scripts, filtered dense point clouds, dense meshes, quality reports, and explicit completion inspection layers.
 
+## Claim Boundary
+
+The main technical claim is an explainable signal-motion prior for indoor reconstruction, not signal-only 3D reconstruction. IMU/PDR supplies a relative route, heading seeds, distance constraints, and PDR alignment references. WiFi supplies checkpoint labels, fingerprint assets, and signal-boundary summaries. COLMAP remains the geometric reconstruction backbone, while `match_graph_edges.csv`, `camera_pose_seed.csv`, `pdr_alignment_refs.txt`, and the quality reports make the WiFi/IMU contribution inspectable.
+
+This README describes the reusable workflow rather than one fixed dataset result. Current-run numbers belong in `colmap_workspace/QUALITY_REPORT.md`, `colmap_workspace/quality_report.json`, and the evaluation section of the project summary. If the quality report says `needs_colmap_rerun`, use a clean sparse+dense rerun before treating reconstruction metrics as final.
+
 ## 1. 目录结构
 
 推荐把数据放成这样：
@@ -77,7 +83,7 @@ cd C:\Users\ASUS\Desktop\3d_reconstruction-signal-vision-
 python main.py
 ```
 
-`main.py` 默认使用 final reconstruction profile，并启用 PDR-assisted matching / PDR alignment refs。若只想跑视觉顺序约束，可以额外传入 `--visual-only`。
+`main.py` now defaults to the `final` reconstruction profile with `--colmap-load-profile low-peak`. This keeps the high-quality processing path enabled, but caps supported COLMAP stages to fewer threads and inserts short cooldown waits between heavy stages.
 
 这一步会生成：
 
@@ -165,17 +171,28 @@ Use `--reconstruction-profile` to control speed/quality tradeoffs:
 
 ```powershell
 python main.py --reconstruction-profile preview
+python main.py --reconstruction-profile balanced
 python main.py --reconstruction-profile final
 python main.py --reconstruction-profile rtx4080
 python main.py --reconstruction-profile complete
 ```
 
 - `preview`: faster checks with lower image/feature limits.
+- `balanced`: moderate image/feature limits with all generated inspection layers still enabled.
 - `final`: quality-oriented settings for moderate compute.
 - `rtx4080`: recommended default for RTX 4080; balances dense resolution, feature count, and PatchMatch cost.
 - `complete`: highest-completeness profile, using more frames/features and the `complete` dense profile.
 
-The current default is `rtx4080`.
+The current default is `final` plus the `low-peak` load profile.
+
+Load profiles control peak load without changing the reconstruction profile:
+
+```powershell
+python main.py --colmap-load-profile low-peak
+python main.py --colmap-load-profile standard
+python main.py --colmap-load-profile max
+python main.py --colmap-num-threads 2 --colmap-stage-cooldown-s 20
+```
 
 ## Useful Commands
 
@@ -453,18 +470,14 @@ python run_colmap.py reset
 它会要求输入：
 
 ```text
-colmap_workspace/dense/fused.ply
-colmap_workspace/dense/fused_filtered.ply
+colmap_workspace/dense/final.ply
+colmap_workspace/dense/final_output_summary.json
 colmap_workspace/dense/point_filter_summary.json
-colmap_workspace/dense/meshed-delaunay.ply
-colmap_workspace/dense/meshed-poisson.ply
-colmap_workspace/dense/floor_completed_mesh.ply
 colmap_workspace/dense/floor_completion_summary.json
-colmap_workspace/dense/dark_surface_completed_mesh.ply
 colmap_workspace/dense/dark_surface_completion_summary.json
 ```
 
-`fused.ply` is the raw COLMAP dense point cloud. `fused_filtered.ply` is the recommended cleaned point cloud for inspection when far flying points are present. `floor_completed_mesh.ply` and `dark_surface_completed_mesh.ply` are inferred inspection layers and should be reported separately from the raw reconstruction.
+`final.ply` is the only dense model you normally open. The pipeline prefers the Poisson mesh, falls back to Delaunay or the dense point cloud if needed, and records the choice in `final_output_summary.json`. Intermediate dense PLY files are removed by default after `final.ply` is selected.
 
 ## Quality Reports
 
@@ -479,17 +492,18 @@ The report checks:
 - Input image count.
 - COLMAP database image count.
 - Sparse component count and registered-image ratio.
-- Dense point cloud and filtered point cloud availability.
-- Mesh, floor-completion, and dark-surface completion availability.
+- Final dense model availability and vertex/face counts.
+- Intermediate dense point cloud, filtered point cloud, mesh, floor-completion, and dark-surface completion availability when those files are kept.
 - Match-pair reason counts.
 
 If the report says `database image count does not match image_list.txt`, rebuild with:
 
 ```powershell
-python run_colmap.py full
+python run_colmap.py sparse
+python run_colmap.py dense
 ```
 
-The launcher clears stale COLMAP outputs before rebuilding.
+The launcher clears stale COLMAP outputs before rebuilding sparse. A previous `final.ply` can still exist as diagnostic evidence, but it should not be treated as the final clean-run result while the report status is `needs_colmap_rerun`.
 
 ## Troubleshooting
 
@@ -529,7 +543,7 @@ python run_colmap.py full
 .\run_colmap_full.bat
 ```
 
-Open `colmap_workspace/dense/fused_filtered.ply` instead of the raw `fused.ply`, and inspect `point_filter_summary.json` for the number of removed points. If noise is still high, try tighter matching or lower dense image size:
+Open `colmap_workspace/dense/final.ply`, and inspect `point_filter_summary.json` plus `final_output_summary.json` if the final model still looks noisy. If noise is still high, try tighter matching or lower dense image size:
 
 ```powershell
 python main.py --constrained-slot-window 1
@@ -551,14 +565,14 @@ python main.py --colmap-dense-max-image-size 1600
 
 ### Dark low-texture gaps remain
 
-Open `dense/dark_surface_completed_mesh.ply` together with `dense/fused_filtered.ply`. This is an inferred inspection layer based on surviving dark points, so it should be reported separately from the raw COLMAP output.
+Inspect `dense/dark_surface_completion_summary.json` together with `dense/final_output_summary.json`. Dark-surface completion is a diagnostic layer before final cleanup, so report it separately from the raw COLMAP output.
 
 ### Video frames are missing
 
 最终查看：
 
 ```text
-colmap_workspace/dense/fused.ply
+colmap_workspace/dense/final.ply
 ```
 
 ## 8. WiFi 定位怎么用

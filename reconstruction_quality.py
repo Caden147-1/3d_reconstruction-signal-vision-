@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate a compact quality report for the prepared COLMAP workspace."""
+"""Generate a compact quality report for a prepared COLMAP workspace."""
 
 from __future__ import annotations
 
@@ -7,9 +7,14 @@ import argparse
 import csv
 import json
 import math
+import sqlite3
 import struct
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+
+SPARSE_ROOTS = ("sparse",)
+ALIGNED_SPARSE_ROOTS = ("sparse_pdr_aligned", "sparse_pose_prior")
 
 
 def read_json(path: Path) -> Dict[str, Any]:
@@ -49,6 +54,13 @@ def file_line_count(path: Path) -> int:
         return sum(1 for line in handle if line.strip())
 
 
+def read_image_list(path: Path) -> List[str]:
+    if not path.exists():
+        return []
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        return [line.strip() for line in handle if line.strip()]
+
+
 def read_uint64_prefix(path: Path) -> Optional[int]:
     if not path.exists() or path.stat().st_size < 8:
         return None
@@ -57,47 +69,82 @@ def read_uint64_prefix(path: Path) -> Optional[int]:
     return struct.unpack("<Q", data)[0]
 
 
-def sparse_model_stats(model_dir: Path) -> Dict[str, Any]:
+def sparse_model_has_files(model_dir: Path) -> bool:
+    binary = (model_dir / "cameras.bin").exists() and (model_dir / "images.bin").exists()
+    text = (model_dir / "cameras.txt").exists() and (model_dir / "images.txt").exists()
+    return binary or text
+
+
+def sparse_model_stats(model_dir: Path, root_name: str) -> Dict[str, Any]:
     registered_images = read_uint64_prefix(model_dir / "images.bin")
     sparse_points = read_uint64_prefix(model_dir / "points3D.bin")
+    exists = sparse_model_has_files(model_dir)
     return {
         "model": model_dir.name,
+        "root": root_name,
+        "label": f"{root_name}/{model_dir.name}",
         "path": str(model_dir),
         "registered_images": registered_images,
         "sparse_points": sparse_points,
-        "exists": (model_dir / "images.bin").exists() and (model_dir / "points3D.bin").exists(),
+        "exists": exists,
     }
 
 
-def collect_sparse_models(workspace_dir: Path, input_image_count: int) -> Dict[str, Any]:
-    sparse_dir = workspace_dir / "sparse"
-    models: List[Dict[str, Any]] = []
-    if sparse_dir.exists():
+def collect_sparse_models(
+    workspace_dir: Path,
+    input_image_count: int,
+    sparse_roots: Sequence[str] = SPARSE_ROOTS,
+    aligned_roots: Sequence[str] = ALIGNED_SPARSE_ROOTS,
+) -> Dict[str, Any]:
+    raw_models: List[Dict[str, Any]] = []
+    for root_name in sparse_roots:
+        sparse_dir = workspace_dir / root_name
+        if not sparse_dir.exists():
+            continue
         for model_dir in sorted((path for path in sparse_dir.iterdir() if path.is_dir()), key=lambda path: path.name):
-            models.append(sparse_model_stats(model_dir))
+            raw_models.append(sparse_model_stats(model_dir, root_name))
 
-    largest = max(models, key=lambda row: row.get("registered_images") or 0, default=None)
+    aligned_models: List[Dict[str, Any]] = []
+    for root_name in aligned_roots:
+        aligned_dir = workspace_dir / root_name
+        if not aligned_dir.exists():
+            continue
+        for model_dir in sorted((path for path in aligned_dir.iterdir() if path.is_dir()), key=lambda path: path.name):
+            stats = sparse_model_stats(model_dir, root_name)
+            if stats["exists"]:
+                aligned_models.append(stats)
+
+    largest = max(raw_models, key=lambda row: row.get("registered_images") or 0, default=None)
+    selected = aligned_models[0] if aligned_models else largest
     largest_registered = (largest or {}).get("registered_images") or 0
+    selected_registered = (selected or {}).get("registered_images") or 0
     return {
-        "component_count": len(models),
-        "models": models,
+        "component_count": len(raw_models),
+        "models": raw_models,
         "largest_component": largest,
         "registered_image_ratio": (
-            round(largest_registered / input_image_count, 6)
-            if input_image_count > 0 and largest_registered is not None
-            else None
+            round(largest_registered / input_image_count, 6) if input_image_count > 0 else None
+        ),
+        "aligned_models": aligned_models,
+        "pdr_aligned_exists": bool(aligned_models),
+        "selected_model": selected,
+        "selected_registered_image_ratio": (
+            round(selected_registered / input_image_count, 6) if input_image_count > 0 else None
         ),
     }
 
 
-def parse_ply_vertex_count(path: Path) -> Optional[int]:
+def count_ply_element(path: Path, element_name: str) -> Optional[int]:
     if not path.exists():
         return None
-    with path.open("rb") as handle:
-        header = handle.read(65536).decode("ascii", errors="ignore")
+    try:
+        with path.open("rb") as handle:
+            header = handle.read(65536).decode("ascii", errors="ignore")
+    except OSError:
+        return None
     for line in header.splitlines():
         parts = line.strip().split()
-        if len(parts) == 3 and parts[0] == "element" and parts[1] == "vertex":
+        if len(parts) == 3 and parts[0] == "element" and parts[1] == element_name:
             try:
                 return int(parts[2])
             except ValueError:
@@ -107,12 +154,41 @@ def parse_ply_vertex_count(path: Path) -> Optional[int]:
     return None
 
 
+def count_ply_vertices(path: Path) -> Optional[int]:
+    return count_ply_element(path, "vertex")
+
+
+def count_ply_faces(path: Path) -> Optional[int]:
+    return count_ply_element(path, "face")
+
+
 def summarize_dense(workspace_dir: Path) -> Dict[str, Any]:
-    fused_ply = workspace_dir / "dense" / "fused.ply"
+    dense_dir = workspace_dir / "dense"
+    final = dense_dir / "final.ply"
+    fused = dense_dir / "fused.ply"
+    filtered = dense_dir / "fused_filtered.ply"
+    final_summary = read_json(dense_dir / "final_output_summary.json")
     return {
-        "fused_ply": str(fused_ply),
-        "exists": fused_ply.exists(),
-        "vertex_count": parse_ply_vertex_count(fused_ply),
+        "final_ply": str(final),
+        "final_exists": final.exists(),
+        "final_vertex_count": count_ply_vertices(final),
+        "final_face_count": count_ply_faces(final),
+        "final_output_summary": final_summary,
+        "final_source_kind": final_summary.get("source_kind"),
+        "intermediate_ply_cleanup": bool(final_summary) and not bool(final_summary.get("keep_intermediate")),
+        "fused_ply": str(fused),
+        "fused_exists": fused.exists(),
+        "fused_vertex_count": count_ply_vertices(fused),
+        "filtered_ply": str(filtered),
+        "filtered_exists": filtered.exists(),
+        "filtered_vertex_count": count_ply_vertices(filtered),
+        "point_filter_summary": read_json(dense_dir / "point_filter_summary.json"),
+        "meshed_delaunay_exists": (dense_dir / "meshed-delaunay.ply").exists(),
+        "meshed_poisson_exists": (dense_dir / "meshed-poisson.ply").exists(),
+        "floor_completed_mesh_exists": (dense_dir / "floor_completed_mesh.ply").exists(),
+        "floor_completion_summary": read_json(dense_dir / "floor_completion_summary.json"),
+        "dark_surface_completed_mesh_exists": (dense_dir / "dark_surface_completed_mesh.ply").exists(),
+        "dark_surface_completion_summary": read_json(dense_dir / "dark_surface_completion_summary.json"),
     }
 
 
@@ -137,9 +213,9 @@ def summarize_match_graph(path: Path) -> Dict[str, Any]:
             if not math.isnan(weight):
                 weights.append(weight)
 
-    weight_summary = None
+    edge_weight = None
     if weights:
-        weight_summary = {
+        edge_weight = {
             "min": round(min(weights), 6),
             "mean": round(sum(weights) / len(weights), 6),
             "max": round(max(weights), 6),
@@ -151,7 +227,7 @@ def summarize_match_graph(path: Path) -> Dict[str, Any]:
         "weighted": bool(weights),
         "reason_counts": dict(sorted(reason_counts.items())),
         "source_pair_counts": dict(sorted(source_pair_counts.items())),
-        "edge_weight": weight_summary,
+        "edge_weight": edge_weight,
     }
 
 
@@ -170,28 +246,116 @@ def database_status(workspace: Path) -> Dict[str, Any]:
     return {"exists": True, "image_count": int(image_count), "error": ""}
 
 
-def dense_status(workspace: Path) -> Dict[str, Any]:
-    dense_dir = workspace / "dense"
-    fused = dense_dir / "fused.ply"
-    filtered = dense_dir / "fused_filtered.ply"
-    point_filter_summary = read_json(dense_dir / "point_filter_summary.json")
-    floor_summary = read_json(dense_dir / "floor_completion_summary.json")
-    dark_surface_summary = read_json(dense_dir / "dark_surface_completion_summary.json")
+def image_directory_status(workspace: Path, image_list: Sequence[str]) -> Dict[str, Any]:
+    image_dir = workspace / "images"
+    listed = set(image_list)
+    files: List[str] = []
+    if image_dir.exists():
+        files = [
+            str(path.relative_to(image_dir)).replace("\\", "/")
+            for path in image_dir.rglob("*")
+            if path.is_file()
+        ]
+    actual = set(files)
+    missing = sorted(listed - actual)
+    extra = sorted(actual - listed)
     return {
-        "fused_ply": str(fused.resolve()),
-        "fused_exists": fused.exists(),
-        "fused_vertex_count": count_ply_vertices(fused),
-        "filtered_ply": str(filtered.resolve()),
-        "filtered_exists": filtered.exists(),
-        "filtered_vertex_count": count_ply_vertices(filtered),
-        "point_filter_summary": point_filter_summary,
-        "meshed_delaunay_exists": (dense_dir / "meshed-delaunay.ply").exists(),
-        "meshed_poisson_exists": (dense_dir / "meshed-poisson.ply").exists(),
-        "floor_completed_mesh_exists": (dense_dir / "floor_completed_mesh.ply").exists(),
-        "floor_completion_summary": floor_summary,
-        "dark_surface_completed_mesh_exists": (dense_dir / "dark_surface_completed_mesh.ply").exists(),
-        "dark_surface_completion_summary": dark_surface_summary,
+        "exists": image_dir.exists(),
+        "file_count": len(files),
+        "listed_count": len(image_list),
+        "missing_listed_count": len(missing),
+        "missing_listed": missing[:20],
+        "extra_file_count": len(extra),
+        "extra_files": extra[:20],
     }
+
+
+def relative_status(
+    workspace_summary: Dict[str, Any],
+    database: Dict[str, Any],
+    image_directory: Dict[str, Any],
+    sparse: Dict[str, Any],
+    dense: Dict[str, Any],
+    input_image_count: int,
+) -> Tuple[str, List[str], List[str]]:
+    warnings: List[str] = []
+    notes: List[str] = []
+
+    if not image_directory["exists"]:
+        warnings.append("COLMAP images directory is missing.")
+    if image_directory["missing_listed_count"]:
+        warnings.append("Some image_list.txt entries are missing from the COLMAP images directory.")
+    if image_directory["extra_file_count"]:
+        warnings.append("COLMAP images directory contains files that are not listed in image_list.txt.")
+
+    missing_source_count = int(workspace_summary.get("missing_image_count") or 0)
+    if missing_source_count:
+        warnings.append(f"Workspace preparation could not copy {missing_source_count} source image file(s).")
+
+    if database.get("error"):
+        warnings.append(f"Could not inspect COLMAP database: {database['error']}")
+    if database["exists"] and input_image_count and database["image_count"] != input_image_count:
+        warnings.append("COLMAP database image count does not match image_list.txt; rebuild sparse from a reset workspace.")
+
+    if sparse["component_count"] == 0:
+        warnings.append("No sparse COLMAP model was found yet.")
+    elif input_image_count and (sparse["registered_image_ratio"] or 0) < 0.75:
+        warnings.append("Sparse registration ratio is below 75%; dense reconstruction will cover only the registered views.")
+
+    if sparse["component_count"] > 1:
+        warnings.append("Multiple sparse components exist; more overlap or wider hybrid matching may improve coverage.")
+
+    if workspace_summary.get("pdr_alignment_enabled") and not sparse.get("pdr_aligned_exists"):
+        warnings.append("PDR-aligned sparse model is missing; dense reconstruction will fall back to raw sparse/0.")
+
+    cleanup_intermediate_ply = bool(
+        workspace_summary.get("cleanup_intermediate_ply") or dense.get("intermediate_ply_cleanup")
+    )
+    dense_available = bool(dense["final_exists"] or dense["fused_exists"])
+    if not dense_available:
+        warnings.append("Dense final.ply does not exist yet.")
+    elif not dense["final_exists"]:
+        warnings.append("Dense output exists, but final.ply has not been selected yet.")
+    if (
+        dense["fused_exists"]
+        and workspace_summary.get("run_point_cloud_filter")
+        and not dense["filtered_exists"]
+        and not cleanup_intermediate_ply
+    ):
+        warnings.append("Filtered dense point cloud is not present yet.")
+    if (
+        dense["fused_exists"]
+        and not dense["floor_completed_mesh_exists"]
+        and not cleanup_intermediate_ply
+    ):
+        warnings.append("Floor completion layer is not present yet.")
+    if (
+        dense["fused_exists"]
+        and workspace_summary.get("run_dark_surface_completion")
+        and not dense["dark_surface_completed_mesh_exists"]
+        and not cleanup_intermediate_ply
+    ):
+        warnings.append("Dark surface completion layer is not present yet.")
+
+    if workspace_summary.get("matcher") == "hybrid":
+        notes.append("Hybrid matching uses constrained WiFi/PDR/video-order pairs plus COLMAP visual bridge matches.")
+    if workspace_summary.get("colmap_reset_recommended"):
+        notes.append("Workspace preparation previously saw old COLMAP outputs; this report uses the files present now.")
+
+    needs_rerun = (
+        bool(database.get("error"))
+        or (database["exists"] and input_image_count and database["image_count"] != input_image_count)
+        or bool(image_directory["missing_listed_count"])
+    )
+    if needs_rerun:
+        status = "needs_colmap_rerun"
+    elif sparse["component_count"] == 0:
+        status = "missing_sparse"
+    elif not dense_available:
+        status = "sparse_available_dense_missing"
+    else:
+        status = "ok"
+    return status, warnings, notes
 
 
 def build_next_actions(report: Dict[str, Any]) -> List[str]:
@@ -200,158 +364,22 @@ def build_next_actions(report: Dict[str, Any]) -> List[str]:
     images = report["image_directory"]
     sparse = report["sparse"]
     dense = report["dense"]
-    workspace_summary = report.get("workspace_summary", {})
     input_count = report["input_image_count"]
-    needs_database_reset = database["exists"] and input_count and database["image_count"] != input_count
-
-    if needs_database_reset:
-        actions.append("Run `python run_colmap.py reset` to remove the stale COLMAP database before rebuilding.")
-    if images["extra_file_count"] or images["missing_listed_count"]:
-        actions.append(
-            "Regenerate the COLMAP workspace so `images/` is copied from the current manifest and stale files are removed."
-        )
-    if sparse["component_count"] == 0:
-        if needs_database_reset:
-            actions.append("Then run `python run_colmap.py sparse` to create a sparse model.")
-        else:
-            actions.append("Run `python run_colmap.py sparse` to create a sparse model.")
-    elif sparse["registered_image_ratio"] < 0.75:
-        actions.append("Improve sparse coverage with more visual overlap or wider hybrid matching, then rerun sparse.")
-    if sparse["component_count"] > 0 and not dense["fused_exists"]:
-        actions.append("Run `python run_colmap.py dense` after sparse reconstruction succeeds.")
-    if dense["fused_exists"] and workspace_summary.get("run_point_cloud_filter") and not dense["filtered_exists"]:
-        actions.append("Rerun `python run_colmap.py dense` to create the filtered dense point cloud.")
-    if dense["fused_exists"] and not dense["floor_completed_mesh_exists"]:
-        actions.append("Rerun dense with floor completion enabled if the floor inspection layer is required.")
-    if dense["fused_exists"] and workspace_summary.get("run_dark_surface_completion") and not dense["dark_surface_completed_mesh_exists"]:
-        actions.append("Rerun dense to create the dark low-texture surface completion layer.")
-    return actions
-
-def build_report(workspace: Path, sparse_roots: Sequence[str] = SPARSE_ROOTS) -> Dict[str, Any]:
-    workspace = workspace.resolve()
-    image_list = read_image_list(workspace / "image_list.txt")
-    input_image_count = len(image_list)
-    workspace_summary = read_json(workspace / "colmap_workspace_summary.json")
-    sparse = scan_sparse_models(workspace, input_image_count, sparse_roots=sparse_roots)
-    dense = dense_status(workspace)
-    database = database_status(workspace)
-    image_directory = image_directory_status(workspace, image_list)
-    match_graph = count_match_graph(workspace / "match_graph_edges.csv")
-    current_colmap_outputs = [
-        name
-        for name in ("database.db", "sparse", "sparse_pdr_aligned", "sparse_pose_prior", "dense")
-        if (workspace / name).exists()
-    ]
-
-    warnings: List[str] = []
-    notes: List[str] = []
-    if not image_directory["exists"]:
-        warnings.append("COLMAP images directory is missing.")
-    if image_directory["missing_listed_count"]:
-        warnings.append("Some image_list.txt entries are missing from the COLMAP images directory.")
-    if image_directory["extra_file_count"]:
-        warnings.append("COLMAP images directory contains files that are not listed in image_list.txt; regenerate the workspace before rebuilding.")
-    missing_source_count = int(workspace_summary.get("missing_image_count") or 0)
-    if missing_source_count:
-        warnings.append(
-            f"Workspace preparation could not copy {missing_source_count} source image file(s); rebuild the reconstruction export before COLMAP."
-        )
-    if database["exists"] and input_image_count and database["image_count"] != input_image_count:
-        warnings.append(
-            "COLMAP database image count does not match image_list.txt; run reset_colmap_outputs.bat before rebuilding."
-        )
-    if database.get("error"):
-        warnings.append(f"Could not inspect COLMAP database: {database['error']}")
-    if sparse["component_count"] == 0:
-        warnings.append("No sparse COLMAP model was found yet.")
-    elif input_image_count and sparse["registered_image_ratio"] < 0.75:
-        warnings.append(
-            "Sparse registration ratio is below 75%; dense reconstruction will only cover the largest registered component."
-        )
-    if sparse["component_count"] > 1:
-        warnings.append(
-            "Multiple sparse components exist; hybrid/exhaustive bridge matching or more overlap may improve coverage."
-        )
-    if not dense["fused_exists"]:
-        warnings.append("Dense fused.ply does not exist yet.")
-    if dense["fused_exists"] and workspace_summary.get("run_point_cloud_filter") and not dense["filtered_exists"]:
-        warnings.append("Filtered dense point cloud is not present yet.")
-    if dense["fused_exists"] and not dense["floor_completed_mesh_exists"]:
-        warnings.append("Floor completion layer is not present yet.")
-    if dense["fused_exists"] and workspace_summary.get("run_dark_surface_completion") and not dense["dark_surface_completed_mesh_exists"]:
-        warnings.append("Dark surface completion layer is not present yet.")
-    if workspace_summary.get("matcher") == "hybrid":
-        notes.append(
-            "Hybrid mode explains constrained WiFi/PDR/video-order pairs in match_graph_edges.csv; exhaustive bridge matches are generated inside COLMAP."
-        )
-    if workspace_summary.get("colmap_reset_recommended") and current_colmap_outputs:
-        notes.append(
-            "Current COLMAP output paths still exist: "
-            + ", ".join(current_colmap_outputs)
-            + ". Run reset before rebuilding those outputs."
-        )
-    elif workspace_summary.get("colmap_reset_recommended"):
-        notes.append(
-            "Old COLMAP outputs were detected during the last workspace preparation, but no reset-blocking COLMAP output path is present now."
-        )
-
-    if workspace_summary.get("colmap_reset_recommended"):
-        return "needs_colmap_rerun", warnings
-    if sparse.get("component_count", 0) == 0:
-        return "missing_sparse", warnings
-    if not dense.get("exists"):
-        return "sparse_available_dense_missing", warnings
-    return "ok", warnings
-
-
-def markdown_table(rows: Iterable[Sequence[Any]]) -> str:
-    lines = ["| Metric | Value |", "| --- | --- |"]
-    for key, value in rows:
-        lines.append(f"| {key} | {value} |")
-    return "\n".join(lines)
-
-
-def render_markdown(report: Dict[str, Any]) -> str:
-    sparse = report["sparse"]
-    dense = report["dense"]
-    match_graph = report["match_graph"]
-    largest = sparse.get("largest_component") or {}
-    rows = [
-        ("Status", report["status"]),
-        ("Input images", report["input_image_count"]),
-        ("Image files in workspace/images", images["file_count"] if images["exists"] else "missing"),
-        ("Extra image files not in image_list.txt", images["extra_file_count"]),
-        ("Missing image_list.txt files", images["missing_listed_count"]),
-        ("Database images", report["database"]["image_count"] if report["database"]["exists"] else "missing"),
-        ("Match graph edges", report["match_graph"]["edge_count"]),
-        ("Sparse components", sparse["component_count"]),
-        ("Largest registered images", largest.get("registered_images", 0)),
-        ("Largest sparse points", largest.get("sparse_points", 0)),
-        ("Registered image ratio", sparse["registered_image_ratio"]),
-        ("Dense fused.ply exists", yes_no(dense["fused_exists"])),
-        ("Dense vertex count", dense["fused_vertex_count"]),
-        ("Filtered fused.ply exists", yes_no(dense["filtered_exists"])),
-        ("Filtered vertex count", dense["filtered_vertex_count"]),
-        ("Point filter removed vertices", dense.get("point_filter_summary", {}).get("removed_vertex_count", "-")),
-        ("Delaunay mesh exists", yes_no(dense["meshed_delaunay_exists"])),
-        ("Poisson mesh exists", yes_no(dense["meshed_poisson_exists"])),
-        ("Floor completion exists", yes_no(dense["floor_completed_mesh_exists"])),
-        ("Dark surface completion exists", yes_no(dense["dark_surface_completed_mesh_exists"])),
-    ]
-
-    reason_lines = ["| Reason | Count |", "| --- | --- |"]
-    for reason, count in match_graph.get("reason_counts", {}).items():
-        reason_lines.append(f"| {reason} | {count} |")
-
-    warning_lines = "\n".join(f"- {warning}" for warning in report.get("warnings", [])) or "- None"
-    return (
-        "# Reconstruction Quality Report\n\n"
-        f"{markdown_table(rows)}\n\n"
-        "## Match Pair Reasons\n\n"
-        f"{chr(10).join(reason_lines)}\n\n"
-        "## Warnings\n\n"
-        f"{warning_lines}\n"
+    needs_clean_sparse = (
+        (database["exists"] and input_count and database["image_count"] != input_count)
+        or bool(images["extra_file_count"])
+        or bool(images["missing_listed_count"])
     )
+
+    if needs_clean_sparse:
+        actions.append("Run `python run_colmap.py sparse`; the launcher resets stale COLMAP outputs before rebuilding.")
+    elif sparse["component_count"] == 0:
+        actions.append("Run `python run_colmap.py sparse` to create a sparse model.")
+    elif not sparse.get("pdr_aligned_exists") and report["workspace_summary"].get("pdr_alignment_enabled"):
+        actions.append("Rerun `python run_colmap.py sparse`; PDR alignment should now create sparse_pdr_aligned/0 first.")
+    if sparse["component_count"] > 0 and not dense["final_exists"]:
+        actions.append("Run `python run_colmap.py dense` to create `colmap_workspace/dense/final.ply`.")
+    return actions
 
 
 def build_report(root: Path, processed_dir: Path, reconstruction_dir: Path, workspace_dir: Path) -> Dict[str, Any]:
@@ -359,17 +387,27 @@ def build_report(root: Path, processed_dir: Path, reconstruction_dir: Path, work
     export_summary = read_json(reconstruction_dir / "export_summary.json")
     workspace_summary = read_json(workspace_dir / "colmap_workspace_summary.json")
 
+    image_list = read_image_list(workspace_dir / "image_list.txt")
     input_image_count = int(
         workspace_summary.get("image_count")
         or export_summary.get("colmap_image_count")
+        or len(image_list)
         or file_line_count(workspace_dir / "image_list.txt")
     )
     match_graph = summarize_match_graph(workspace_dir / "match_graph_edges.csv")
     sparse = collect_sparse_models(workspace_dir, input_image_count)
     dense = summarize_dense(workspace_dir)
-    status, warnings = relative_status(workspace_summary, sparse, dense)
-
-    return {
+    database = database_status(workspace_dir)
+    image_directory = image_directory_status(workspace_dir, image_list)
+    status, warnings, notes = relative_status(
+        workspace_summary=workspace_summary,
+        database=database,
+        image_directory=image_directory,
+        sparse=sparse,
+        dense=dense,
+        input_image_count=input_image_count,
+    )
+    report = {
         "status": status,
         "root": str(root),
         "processed_dir": str(processed_dir),
@@ -379,12 +417,95 @@ def build_report(root: Path, processed_dir: Path, reconstruction_dir: Path, work
         "processing_status": processing_summary.get("status", "available" if processing_summary else "missing"),
         "export_status": export_summary.get("status", "missing"),
         "workspace_status": workspace_summary.get("status", "missing"),
+        "workspace_summary": workspace_summary,
         "colmap_reset_recommended": bool(workspace_summary.get("colmap_reset_recommended")),
+        "image_directory": image_directory,
+        "database": database,
         "match_graph": match_graph,
         "sparse": sparse,
         "dense": dense,
         "warnings": warnings,
+        "notes": notes,
     }
+    report["next_actions"] = build_next_actions(report)
+    return report
+
+
+def yes_no(value: bool) -> str:
+    return "yes" if value else "no"
+
+
+def format_value(value: Any) -> str:
+    if value is None:
+        return "-"
+    if isinstance(value, bool):
+        return yes_no(value)
+    return str(value)
+
+
+def markdown_table(rows: Iterable[Sequence[Any]]) -> str:
+    lines = ["| Metric | Value |", "| --- | --- |"]
+    for key, value in rows:
+        lines.append(f"| {key} | {format_value(value)} |")
+    return "\n".join(lines)
+
+
+def render_markdown(report: Dict[str, Any]) -> str:
+    sparse = report["sparse"]
+    dense = report["dense"]
+    match_graph = report["match_graph"]
+    images = report["image_directory"]
+    largest = sparse.get("largest_component") or {}
+    selected = sparse.get("selected_model") or {}
+    rows = [
+        ("Status", report["status"]),
+        ("Input images", report["input_image_count"]),
+        ("Image files in workspace/images", images["file_count"] if images["exists"] else "missing"),
+        ("Extra image files not in image_list.txt", images["extra_file_count"]),
+        ("Missing image_list.txt files", images["missing_listed_count"]),
+        ("Database images", report["database"]["image_count"] if report["database"]["exists"] else "missing"),
+        ("Match graph edges", match_graph["edge_count"]),
+        ("Sparse components", sparse["component_count"]),
+        ("Largest sparse model", largest.get("label", "-")),
+        ("Largest registered images", largest.get("registered_images", 0)),
+        ("Largest sparse points", largest.get("sparse_points", 0)),
+        ("Registered image ratio", sparse["registered_image_ratio"]),
+        ("PDR-aligned sparse exists", sparse["pdr_aligned_exists"]),
+        ("Dense input candidate", selected.get("label", "-")),
+        ("final.ply exists", dense["final_exists"]),
+        ("Final vertex count", dense["final_vertex_count"]),
+        ("Final face count", dense["final_face_count"]),
+        ("Final source kind", dense["final_source_kind"] or "-"),
+        ("Intermediate PLY cleanup", dense["intermediate_ply_cleanup"]),
+        ("Intermediate fused.ply kept", dense["fused_exists"]),
+        ("Intermediate fused vertex count", dense["fused_vertex_count"]),
+        ("Intermediate fused_filtered.ply kept", dense["filtered_exists"]),
+        ("Intermediate filtered vertex count", dense["filtered_vertex_count"]),
+        ("Intermediate Delaunay mesh kept", dense["meshed_delaunay_exists"]),
+        ("Intermediate Poisson mesh kept", dense["meshed_poisson_exists"]),
+        ("Floor completion PLY kept", dense["floor_completed_mesh_exists"]),
+        ("Dark surface completion PLY kept", dense["dark_surface_completed_mesh_exists"]),
+    ]
+
+    reason_lines = ["| Reason | Count |", "| --- | --- |"]
+    for reason, count in match_graph.get("reason_counts", {}).items():
+        reason_lines.append(f"| {reason} | {count} |")
+
+    warning_lines = "\n".join(f"- {warning}" for warning in report.get("warnings", [])) or "- None"
+    note_lines = "\n".join(f"- {note}" for note in report.get("notes", [])) or "- None"
+    action_lines = "\n".join(f"- {action}" for action in report.get("next_actions", [])) or "- None"
+    return (
+        "# Reconstruction Quality Report\n\n"
+        f"{markdown_table(rows)}\n\n"
+        "## Match Pair Reasons\n\n"
+        f"{chr(10).join(reason_lines)}\n\n"
+        "## Warnings\n\n"
+        f"{warning_lines}\n\n"
+        "## Notes\n\n"
+        f"{note_lines}\n\n"
+        "## Next Actions\n\n"
+        f"{action_lines}\n"
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -394,8 +515,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--processed", type=Path, default=Path("processed"))
     parser.add_argument("--reconstruction", type=Path, default=Path("reconstruction_dataset"))
     parser.add_argument("--workspace", type=Path, default=Path("colmap_workspace"))
-    parser.add_argument("--json-output", type=Path, default=Path("colmap_workspace") / "quality_report.json")
-    parser.add_argument("--markdown-output", type=Path, default=Path("colmap_workspace") / "QUALITY_REPORT.md")
+    parser.add_argument(
+        "--summary",
+        "--json-output",
+        dest="summary",
+        type=Path,
+        default=Path("colmap_workspace") / "quality_report.json",
+    )
+    parser.add_argument(
+        "--markdown",
+        "--markdown-output",
+        dest="markdown",
+        type=Path,
+        default=Path("colmap_workspace") / "QUALITY_REPORT.md",
+    )
     return parser.parse_args()
 
 
@@ -411,11 +544,11 @@ def main() -> int:
     workspace_dir = resolve_path(root, args.workspace).resolve()
     report = build_report(root, processed_dir, reconstruction_dir, workspace_dir)
 
-    json_output = resolve_path(root, args.json_output)
-    markdown_output = resolve_path(root, args.markdown_output)
-    write_json(json_output, report)
+    summary_output = resolve_path(root, args.summary)
+    markdown_output = resolve_path(root, args.markdown)
+    write_json(summary_output, report)
     write_text(markdown_output, render_markdown(report))
-    print(f"[done] wrote {json_output}")
+    print(f"[done] wrote {summary_output}")
     print(f"[done] wrote {markdown_output}")
     print(f"[info] status: {report['status']}")
     return 0

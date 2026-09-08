@@ -39,8 +39,16 @@ STALE_COLMAP_OUTPUTS = (
     "sparse_pose_prior",
     "dense",
     "stereo",
+    "final.ply",
+    "final_output_summary.json",
     "meshed-poisson.ply",
     "meshed-delaunay.ply",
+    "floor_completed_mesh.ply",
+    "floor_completion_summary.json",
+    "dark_surface_completed_mesh.ply",
+    "dark_surface_completion_summary.json",
+    "fused_filtered.ply",
+    "point_filter_summary.json",
     "quality_report.json",
     "QUALITY_REPORT.md",
 )
@@ -51,10 +59,53 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=SCRIPT_BY_MODE, nargs="?", default="sparse")
     parser.add_argument("--workspace", type=Path, default=Path("colmap_workspace"))
+    parser.set_defaults(runtime_estimate=True, upfront_estimate=True)
     parser.add_argument(
         "--yes",
         action="store_true",
         help="Run full reconstruction without the upfront confirmation prompt.",
+    )
+    parser.add_argument(
+        "--runtime-estimate",
+        dest="runtime_estimate",
+        action="store_true",
+        help="Print live dense PatchMatch runtime estimates for full/dense runs.",
+    )
+    parser.add_argument(
+        "--no-runtime-estimate",
+        dest="runtime_estimate",
+        action="store_false",
+        help="Disable live dense PatchMatch runtime estimates.",
+    )
+    parser.add_argument(
+        "--runtime-estimate-sample-views",
+        type=int,
+        default=DEFAULT_RUNTIME_SAMPLE_VIEWS,
+        help="Completed PatchMatch views to sample before the first live estimate.",
+    )
+    parser.add_argument(
+        "--runtime-estimate-first-update-seconds",
+        type=float,
+        default=DEFAULT_RUNTIME_FIRST_UPDATE_SECONDS,
+        help="Maximum seconds to wait before printing a coarse live PatchMatch estimate.",
+    )
+    parser.add_argument(
+        "--runtime-estimate-target-error-minutes",
+        type=float,
+        default=DEFAULT_RUNTIME_TARGET_ERROR_SECONDS / 60.0,
+        help="Target estimate error window in minutes before the first live report.",
+    )
+    parser.add_argument(
+        "--upfront-estimate",
+        dest="upfront_estimate",
+        action="store_true",
+        help="Print a rough stage-by-stage estimate before full/dense runs.",
+    )
+    parser.add_argument(
+        "--no-upfront-estimate",
+        dest="upfront_estimate",
+        action="store_false",
+        help="Skip the rough upfront stage estimate.",
     )
     return parser.parse_args()
 
@@ -182,6 +233,7 @@ def build_upfront_runtime_estimate(workspace: Path) -> dict[str, Any]:
     dense_max_image_size = positive_number(summary.get("dense_max_image_size"), 1200.0)
     dense_profile = str(summary.get("dense_profile") or "unknown")
     dense_views = estimate_dense_view_count(summary, image_count)
+    stage_cooldown_s = positive_number(summary.get("stage_cooldown_s"), 0.0)
 
     exhaustive_pairs = image_count * max(0, image_count - 1) // 2
     if matcher == "constrained":
@@ -246,6 +298,18 @@ def build_upfront_runtime_estimate(workspace: Path) -> dict[str, Any]:
         post_dense_factor += 0.01
     post_dense_factor += 0.01
     post_dense_seconds = patchmatch_seconds * post_dense_factor
+    cooldown_count = 0
+    if stage_cooldown_s > 0:
+        cooldown_count = 6
+        if summary.get("run_point_cloud_filter"):
+            cooldown_count += 1
+        if summary.get("run_meshing"):
+            cooldown_count += 2
+        if summary.get("run_floor_completion"):
+            cooldown_count += 1
+        if summary.get("run_dark_surface_completion"):
+            cooldown_count += 1
+    cooldown_seconds = stage_cooldown_s * cooldown_count
 
     stages = [
         ("Reset old COLMAP outputs", *estimate_range(5.0 if existing_colmap_outputs(workspace) else 1.0, 0.5)),
@@ -256,6 +320,8 @@ def build_upfront_runtime_estimate(workspace: Path) -> dict[str, Any]:
         ("Dense: PatchMatch stereo", *estimate_range(patchmatch_seconds, 0.50)),
         ("Dense: fusion + filtering + meshing + completion/report", *estimate_range(post_dense_seconds, 0.60)),
     ]
+    if cooldown_seconds > 0:
+        stages.append((f"Low-peak cooldown waits ({cooldown_count}x)", cooldown_seconds, cooldown_seconds))
     low_total = sum(stage[1] for stage in stages)
     high_total = sum(stage[2] for stage in stages)
 
@@ -270,6 +336,9 @@ def build_upfront_runtime_estimate(workspace: Path) -> dict[str, Any]:
         "dense_max_image_size": int(dense_max_image_size),
         "feature_max_image_size": int(feature_max_image_size),
         "max_num_features": int(max_num_features),
+        "load_profile": summary.get("load_profile", "unknown"),
+        "colmap_num_threads": int(positive_number(summary.get("colmap_num_threads"), 0.0)),
+        "stage_cooldown_s": int(stage_cooldown_s),
         "patch_per_view_seconds": patch_per_view_seconds,
         "stages": stages,
         "total_range": (low_total, high_total),
@@ -284,7 +353,9 @@ def print_upfront_runtime_estimate(workspace: Path) -> None:
         "[estimate]   "
         f"images={estimate['image_count']}, estimated_dense_views={estimate['dense_views']}, "
         f"matcher={estimate['matcher']}, dense_profile={estimate['dense_profile']}, "
-        f"dense_max_image_size={estimate['dense_max_image_size']}"
+        f"dense_max_image_size={estimate['dense_max_image_size']}, "
+        f"load_profile={estimate['load_profile']}, colmap_threads={estimate['colmap_num_threads']}, "
+        f"cooldown_s={estimate['stage_cooldown_s']}"
     )
     print(
         "[estimate]   "
@@ -753,12 +824,20 @@ def main() -> int:
     if args.mode == "full":
         require_script(workspace, "sparse")
         require_script(workspace, "dense")
+        if args.upfront_estimate:
+            print_upfront_runtime_estimate(workspace)
         if not args.yes and sys.stdin.isatty() and not confirm_full_colmap_run(workspace):
             return 0
+    elif args.mode == "dense" and args.upfront_estimate:
+        require_script(workspace, "dense")
+        print_upfront_runtime_estimate(workspace)
     return run_colmap_script(
         workspace,
         args.mode,
-        runtime_estimate=False,
+        runtime_estimate=args.runtime_estimate,
+        sample_views=args.runtime_estimate_sample_views,
+        first_update_seconds=args.runtime_estimate_first_update_seconds,
+        target_error_seconds=max(0.0, args.runtime_estimate_target_error_minutes * 60.0),
         report_dir=root,
     )
 

@@ -15,7 +15,7 @@ This Final Year Project develops a practical pipeline for building an indoor vir
 
 The final system is designed around an end-to-end workflow. A user collects data with a phone by walking through the indoor environment, recording WiFi/IMU data, taking checkpoint photos, and filming a continuous route video. The project scripts then parse the raw session files, estimate a relative walking trajectory from IMU acceleration and heading readings, bind checkpoint images to WiFi/PDR points, extract video frames, export a reconstruction dataset, prepare a COLMAP workspace, and generate scripts for sparse and dense 3D reconstruction. When COLMAP dense reconstruction is run successfully, the dense point cloud can be opened in tools such as MeshLab or CloudCompare, while the generated WiFi localization model can estimate positions from new WiFi scans.
 
-The current P0-quality preprocessing run uses the final reconstruction profile, enables PDR-assisted matching and PDR alignment references, includes route-video bridge frames, and records data-quality caveats explicitly. The generated workspace contains 277 COLMAP input images, 2,469 constrained match pairs, and 260 PDR alignment reference images. Existing COLMAP database and sparse outputs from an older run are detected and marked for reset before the next sparse/dense reconstruction run.
+The current P0-quality preprocessing run uses the final reconstruction profile, enables PDR-assisted matching and PDR alignment references, includes route-video bridge frames, and records data-quality caveats explicitly. Dataset-specific counts are kept as a run snapshot in the evaluation section, not as part of the general method definition. A diagnostic COLMAP result is present, including a sparse component and `dense/final.ply`, but the quality report still marks the workspace as `needs_colmap_rerun` because the COLMAP database and image folder contain stale files from an older run.
 
 ## Abstract
 
@@ -31,6 +31,8 @@ A virtual campus tour needs more than static images. It requires a spatially coh
 - Mobile collection data includes useful WiFi and IMU signals, but these signals are not directly consumed by standard visual SfM tools.
 
 This project addresses the gap by using WiFi and IMU/PDR data as auxiliary spatial information around the visual reconstruction workflow. The key idea is that WiFi and IMU do not directly create a point cloud; instead, they generate position seeds, matching constraints, signal boundaries, and localization models that make the visual reconstruction pipeline more structured and reusable.
+
+For the final report and presentation, the innovation should therefore be framed as an explainable signal-motion prior around COLMAP rather than as a replacement for visual 3D reconstruction. IMU/PDR provides a relative route and distance constraints, WiFi provides checkpoint-level signal labels and fingerprint assets, and COLMAP remains the geometry engine that turns the organized image set into sparse and dense 3D structure.
 
 ## Objectives
 
@@ -238,7 +240,7 @@ After preprocessing, COLMAP can be run through the generated scripts. Sparse rec
 Expected final output:
 
 ```text
-colmap_workspace/dense/fused.ply
+colmap_workspace/dense/final.ply
 ```
 
 ## Implementation Summary
@@ -288,18 +290,23 @@ python run_colmap.py dense
 5. **PDR-assisted spatial metadata**  
    IMU-based PDR provides rough relative positions and heading seeds for image metadata and reconstruction alignment.
 
-6. **Constrained COLMAP matching**  
-   The system generates `match_pairs.txt` based on route order, checkpoint adjacency, image slot direction, PDR distance, and video frame continuity. This reduces the chance of matching visually similar but spatially unrelated indoor images.
+6. **Explainable signal-motion-to-COLMAP bridge**
+   WiFi checkpoints and IMU/PDR coordinates are not treated as black-box reconstruction inputs. They are exported as image manifests, pose seeds, PDR alignment references, and weighted match-graph reasons that explain why each image pair is allowed to match.
 
-7. **WiFi fingerprint localization support**  
+7. **Constrained COLMAP matching**
+   The system generates `match_pairs.txt` and `match_graph_edges.csv` based on route order, checkpoint adjacency, image slot direction, PDR distance, and video frame continuity. This reduces the chance of matching visually similar but spatially unrelated indoor images.
+
+8. **WiFi fingerprint localization support**
    The project exports a reusable WiFi localization model and evaluation files, allowing future localization from new WiFi scans.
 
-8. **Reproducible project structure**  
+9. **Reproducible project structure**
    The pipeline produces standardized folders such as `processed/`, `reconstruction_dataset/`, and `colmap_workspace/`, making experiments easier to repeat and debug.
 
-## Current Run Results
+## Current Run Snapshot
 
-The current P0 run was regenerated with `python main.py` after changing the default launcher to use the `final` reconstruction profile and PDR-enabled COLMAP preparation. It should be treated as the current preprocessing/export result, not as a completed dense reconstruction result.
+This section is an evidence log for the current dataset, not the definition of the reusable system. The method is intended to generalize to other indoor routes with different checkpoint counts, AP counts, image counts, and match-graph sizes. These numbers are useful for evaluation, debugging, and thesis reporting, but they should be moved to the Experiments or Appendix chapter rather than repeated as method claims.
+
+The current P0 run was regenerated with `python main.py` after changing the default launcher to use the `final` reconstruction profile and PDR-enabled COLMAP preparation. It should be treated as the current preprocessing/export result and diagnostic reconstruction evidence, not as a completed clean-run benchmark.
 
 Current deliverables:
 
@@ -314,7 +321,7 @@ Current deliverables:
 - A WiFi localization model, leave-one-out evaluation, signal grid, and signal boundary outputs.
 - COLMAP sparse/dense scripts ready to run after resetting older COLMAP outputs in the workspace.
 
-Current result table:
+Current run snapshot:
 
 | Metric | Current value |
 | --- | --- |
@@ -334,12 +341,16 @@ Current result table:
 | WiFi/PDR feature rows | 1,652 |
 | Selected WiFi APs | 15 |
 | Reconstruction dataset images | 277 |
-| Constrained COLMAP match pairs | 2,469 |
+| Weighted COLMAP match-graph edges | 6,169 |
 | PDR alignment reference images | 260 |
-| COLMAP workspace status | `ready_needs_colmap_reset` |
-| Sparse reconstruction registered images | Pending rerun after COLMAP reset |
-| Sparse 3D points | Pending rerun after COLMAP reset |
-| Dense point cloud file | Pending; expected path `colmap_workspace/dense/fused.ply` |
+| COLMAP quality-report status | `needs_colmap_rerun` |
+| Sparse reconstruction registered images | 238 / 277 in current diagnostic workspace |
+| Sparse 3D points | 135,341 in largest sparse component |
+| Sparse component count | 3 |
+| Final dense model file | `colmap_workspace/dense/final.ply` exists |
+| Final dense vertices | 2,448,105 |
+| Final dense faces | 4,801,827 |
+| Final dense source | Poisson mesh selected by final-output step |
 | WiFi localization mean error | 12.38 m |
 | WiFi localization median error | 9.00 m |
 | WiFi localization max error | 28.36 m |
@@ -349,11 +360,11 @@ P0 quality notes:
 - The current launcher no longer defaults to visual-only mode. PDR-assisted distance matching and PDR alignment references are enabled by default.
 - The 190 extra photos are not silently used as WiFi-labeled checkpoint anchors because they do not fit the fixed 20 photos/checkpoint protocol for the 13 detected checkpoints.
 - The route video contributed bridge frames, but 223 of 240 extracted frames were rejected by the blur threshold. This is useful evidence for the report and a strong reason to recapture or tune video-frame filtering for a better visual reconstruction.
-- Existing `database.db` and `sparse/` outputs are from an older COLMAP run. Before reporting sparse/dense metrics for this PDR-enabled workspace, run `python run_colmap.py reset`, then `python run_colmap.py sparse`, then `python run_colmap.py dense`.
+- The current COLMAP result is useful as diagnostic evidence, but not yet the clean final result: `workspace/images` contains extra stale files and `database.db` lists 260 images while the current input list has 277. Before reporting final sparse/dense metrics, run `python run_colmap.py sparse` so the launcher resets stale outputs, then run `python run_colmap.py dense`.
 
 ## P1 Quality Addendum
 
-After the P0 cleanup, the next quality layer is to make the project measurable and defensible rather than only runnable. P1 focuses on output freshness, localization interpretation, reconstruction diagnostics, ablation experiments, and reference-to-claim alignment.
+At P1, the quality layer is to make the project measurable and defensible rather than only runnable. P1 focuses on output freshness, localization interpretation, reconstruction diagnostics, ablation experiments, and reference-to-claim alignment.
 
 ### Output Freshness and Run Integrity
 
@@ -366,8 +377,8 @@ The preprocessing and export outputs are now regenerated from the current defaul
 | `processed/video_frames_manifest.csv` | Present, 17 retained bridge frames | Use as current video contribution, with blur rejection caveat |
 | `reconstruction_dataset/` | Regenerated with 277 images | Use as current COLMAP input dataset |
 | `wifi_localization_model.json` and evaluation files | Regenerated and copied to metadata | Use as lightweight WiFi baseline, not navigation-grade accuracy |
-| `colmap_workspace/database.db` and `sparse/` | Existing older outputs detected | Do not report as final PDR-enabled reconstruction until reset and rerun |
-| `colmap_workspace/dense/fused.ply` | Pending | Report as expected output path only |
+| `colmap_workspace/database.db` and `sparse/` | Present, but quality report says `needs_colmap_rerun` because database/image-list freshness is inconsistent | Use only as diagnostic evidence until clean rerun |
+| `colmap_workspace/dense/final.ply` | Present, 2,448,105 vertices and 4,801,827 faces from Poisson mesh | Report as current diagnostic dense output, not as final clean-run evidence |
 
 ### WiFi Localization Interpretation
 
@@ -382,20 +393,20 @@ For a stronger P1 result, the report should explicitly state the causes and impr
 
 ### Reconstruction Quality Report
 
-The next COLMAP run should produce a compact quality report before claiming final sparse or dense reconstruction. The report should include the following metrics.
+The quality report should be kept as the compact evidence table before claiming final sparse or dense reconstruction. The current report includes the following metrics, with clean-run caveats where needed.
 
 | Metric | Source | Current status |
 | --- | --- | --- |
-| Registered image count | COLMAP sparse model | Pending rerun after reset |
-| Registered image ratio | Registered images / 277 input images | Pending rerun after reset |
-| Sparse 3D point count | COLMAP `points3D` output | Pending rerun after reset |
-| Sparse component count | `colmap_workspace/sparse/` model folders | Pending rerun after reset |
-| Largest component size | COLMAP model analysis | Pending rerun after reset |
+| Registered image count | COLMAP sparse model | 238 images in current diagnostic workspace |
+| Registered image ratio | Registered images / 277 input images | 0.859206 |
+| Sparse 3D point count | COLMAP `points3D` output | 135,341 in largest component |
+| Sparse component count | `colmap_workspace/sparse/` model folders | 3 components |
+| Largest component size | COLMAP model analysis | 238 registered images |
 | PDR alignment reference count | `pdr_alignment_refs.txt` | 260 images available |
 | PDR alignment residual | COLMAP `model_aligner` output/log | Pending rerun after reset |
-| Dense point cloud exists | `colmap_workspace/dense/fused.ply` | Pending |
-| Dense point count | PLY header or point-cloud tool | Pending |
-| Match-pair count | `match_pairs.txt` / summary | 2,469 pairs available |
+| Final dense model exists | `colmap_workspace/dense/final.ply` | Yes, but still under `needs_colmap_rerun` freshness warning |
+| Dense mesh size | `final_output_summary.json` | 2,448,105 vertices and 4,801,827 faces |
+| Match-graph edge count | `match_pairs.txt` / summary | 6,169 edges available |
 | Match-pair reason distribution | `match_graph_edges.csv` | Available for analysis |
 | Video bridge coverage | `video_frames_manifest.csv` | 17 retained bridge frames |
 
@@ -427,7 +438,7 @@ The reference list should be used to support specific claims rather than appear 
 | Indoor reconstruction needs careful evaluation against indoor-scene benchmarks | [10] |
 | Dense/surface reconstruction can later be improved with 3DGS or depth-prior methods | [11], [12], [13], [14], [15] |
 
-This P1 framing keeps the final report honest: the current contribution is a reproducible multimodal pipeline and diagnostic COLMAP workspace, while the remaining quality gap is expressed through concrete metrics and experiments.
+This P1 framing keeps the final report honest: the current contribution is a reproducible multimodal pipeline, an explainable signal-motion-to-COLMAP bridge, and a diagnostic dense reconstruction output, while the remaining quality gap is expressed through clean-run integrity checks and concrete ablation experiments.
 ## Evaluation Plan
 
 The project can be evaluated from four perspectives:

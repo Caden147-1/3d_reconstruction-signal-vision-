@@ -42,10 +42,37 @@ PROFILE_DEFAULTS = {
         "colmap_matcher": "constrained",
         "colmap_quality": "high",
         "colmap_dense_profile": "balanced",
+        "colmap_load_profile": "low-peak",
+        "colmap_num_threads": 2,
+        "colmap_stage_cooldown_s": 10,
         "constrained_point_window": 1,
         "constrained_slot_window": 2,
         "constrained_max_pdr_distance_m": 8.0,
         "constrained_video_frame_window": 3,
+        "constrained_video_anchor_point_window": 1,
+        "constrained_video_anchor_limit": 12,
+    },
+    "balanced": {
+        "max_colmap_anchor_images_per_point": 12,
+        "video_frame_interval_s": 1.5,
+        "video_max_frames": 160,
+        "video_blur_threshold": 75.0,
+        "video_keyframe_min_change": 5.5,
+        "video_keyframe_min_gap": 2,
+        "colmap_dense_max_image_size": 1400,
+        "colmap_feature_max_image_size": 1800,
+        "colmap_max_num_features": 8000,
+        "colmap_max_num_matches": 32768,
+        "colmap_matcher": "constrained",
+        "colmap_quality": "high",
+        "colmap_dense_profile": "balanced",
+        "colmap_load_profile": "low-peak",
+        "colmap_num_threads": 2,
+        "colmap_stage_cooldown_s": 15,
+        "constrained_point_window": 1,
+        "constrained_slot_window": 2,
+        "constrained_max_pdr_distance_m": 8.0,
+        "constrained_video_frame_window": 4,
         "constrained_video_anchor_point_window": 1,
         "constrained_video_anchor_limit": 12,
     },
@@ -63,6 +90,9 @@ PROFILE_DEFAULTS = {
         "colmap_matcher": "hybrid",
         "colmap_quality": "extreme",
         "colmap_dense_profile": "complete",
+        "colmap_load_profile": "low-peak",
+        "colmap_num_threads": 2,
+        "colmap_stage_cooldown_s": 20,
         "constrained_point_window": 2,
         "constrained_slot_window": 3,
         "constrained_max_pdr_distance_m": 12.0,
@@ -84,6 +114,9 @@ PROFILE_DEFAULTS = {
         "colmap_matcher": "hybrid",
         "colmap_quality": "extreme",
         "colmap_dense_profile": "rtx4080",
+        "colmap_load_profile": "low-peak",
+        "colmap_num_threads": 3,
+        "colmap_stage_cooldown_s": 20,
         "constrained_point_window": 2,
         "constrained_slot_window": 3,
         "constrained_max_pdr_distance_m": 14.0,
@@ -105,6 +138,9 @@ PROFILE_DEFAULTS = {
         "colmap_matcher": "hybrid",
         "colmap_quality": "extreme",
         "colmap_dense_profile": "complete",
+        "colmap_load_profile": "low-peak",
+        "colmap_num_threads": 3,
+        "colmap_stage_cooldown_s": 30,
         "constrained_point_window": 3,
         "constrained_slot_window": 4,
         "constrained_max_pdr_distance_m": 16.0,
@@ -1101,12 +1137,132 @@ def detect_nvidia_gpu() -> Dict[str, Any]:
 def automatic_profile(hardware: Dict[str, Any]) -> str:
     memory_mb = int(hardware.get("memory_mb") or 0)
     if memory_mb >= 22000:
-        return "complete"
-    if memory_mb >= 14000:
         return "rtx4080"
-    if memory_mb >= 8000:
+    if memory_mb >= 14000:
         return "final"
+    if memory_mb >= 8000:
+        return "balanced"
     return "preview"
+
+
+def print_workload_summary(
+    profile: str,
+    load_profile: str,
+    colmap_num_threads: int,
+    stage_cooldown_s: int,
+    dense_max_image_size: int,
+    feature_max_image_size: int,
+    max_num_features: int,
+    matcher: str,
+    dense_profile: str,
+    video_max_frames: int,
+    max_anchor_images_per_point: int,
+) -> None:
+    anchor_text = "all" if max_anchor_images_per_point <= 0 else str(max_anchor_images_per_point)
+    video_text = "uncapped" if video_max_frames <= 0 else str(video_max_frames)
+    print(
+        "[load] "
+        f"profile={profile}, load_profile={load_profile}, matcher={matcher}, dense_profile={dense_profile}, "
+        f"dense_max_image_size={dense_max_image_size}, feature_max_image_size={feature_max_image_size}, "
+        f"max_features={max_num_features}, anchor_images_per_point={anchor_text}, "
+        f"video_max_frames={video_text}, colmap_threads={colmap_num_threads}, "
+        f"stage_cooldown_s={stage_cooldown_s}",
+        flush=True,
+    )
+    if profile in {"final", "rtx4080", "complete"} or matcher in {"hybrid", "exhaustive"} or dense_max_image_size >= 2000:
+        print(
+            "[warn] This is a high-quality reconstruction profile. Peak load is limited by "
+            "--colmap-load-profile/--colmap-num-threads, so it may run longer.",
+            flush=True,
+        )
+
+
+def prepare_colmap_workspace_from_args(
+    args: argparse.Namespace,
+    load_profile_override: Optional[str] = None,
+    colmap_num_threads_override: Optional[int] = None,
+    stage_cooldown_s_override: Optional[int] = None,
+) -> Dict[str, Any]:
+    effective_args = argparse.Namespace(**vars(args))
+    hardware = detect_nvidia_gpu()
+    if effective_args.reconstruction_profile == "auto":
+        effective_args.reconstruction_profile = automatic_profile(hardware)
+
+    root = effective_args.root.resolve()
+    reconstruction_output_dir = (
+        (root / effective_args.reconstruction_output).resolve()
+        if not effective_args.reconstruction_output.is_absolute()
+        else effective_args.reconstruction_output
+    )
+    colmap_workspace_dir = (
+        (root / effective_args.colmap_workspace).resolve()
+        if not effective_args.colmap_workspace.is_absolute()
+        else effective_args.colmap_workspace
+    )
+
+    colmap_dense_max_image_size = profile_value(effective_args, "colmap_dense_max_image_size")
+    colmap_dense_profile = profile_value(effective_args, "colmap_dense_profile")
+    colmap_matcher = profile_value(effective_args, "colmap_matcher")
+    colmap_quality = profile_value(effective_args, "colmap_quality")
+    colmap_feature_max_image_size = profile_value(effective_args, "colmap_feature_max_image_size")
+    colmap_max_num_features = profile_value(effective_args, "colmap_max_num_features")
+    colmap_max_num_matches = profile_value(effective_args, "colmap_max_num_matches")
+    colmap_load_profile = load_profile_override or profile_value(effective_args, "colmap_load_profile")
+    colmap_num_threads = (
+        colmap_num_threads_override
+        if colmap_num_threads_override is not None
+        else profile_value(effective_args, "colmap_num_threads")
+    )
+    colmap_stage_cooldown_s = (
+        stage_cooldown_s_override
+        if stage_cooldown_s_override is not None
+        else profile_value(effective_args, "colmap_stage_cooldown_s")
+    )
+    constrained_point_window = profile_value(effective_args, "constrained_point_window")
+    constrained_slot_window = profile_value(effective_args, "constrained_slot_window")
+    constrained_max_pdr_distance_m = profile_value(effective_args, "constrained_max_pdr_distance_m")
+    constrained_video_frame_window = profile_value(effective_args, "constrained_video_frame_window")
+    constrained_video_anchor_point_window = profile_value(effective_args, "constrained_video_anchor_point_window")
+    constrained_video_anchor_limit = profile_value(effective_args, "constrained_video_anchor_limit")
+
+    print(
+        "[info] preparing COLMAP scripts for "
+        f"load_profile={colmap_load_profile}, colmap_threads={colmap_num_threads}, "
+        f"stage_cooldown_s={colmap_stage_cooldown_s}",
+        flush=True,
+    )
+    return prepare_colmap_workspace(
+        root=root,
+        reconstruction_dir=reconstruction_output_dir,
+        workspace_dir=colmap_workspace_dir,
+        colmap_dir=effective_args.colmap_dir,
+        colmap_exe=effective_args.colmap_exe,
+        colmap_mask_dir=effective_args.colmap_mask_dir,
+        camera_model=effective_args.colmap_camera_model,
+        single_camera=True,
+        use_gpu=bool(hardware.get("cuda_enabled")),
+        matcher=colmap_matcher,
+        quality=colmap_quality,
+        dense_max_image_size=colmap_dense_max_image_size,
+        visual_only=effective_args.visual_only,
+        feature_max_image_size=colmap_feature_max_image_size,
+        max_num_features=colmap_max_num_features,
+        max_num_matches=colmap_max_num_matches,
+        load_profile=colmap_load_profile,
+        colmap_num_threads=colmap_num_threads,
+        stage_cooldown_s=colmap_stage_cooldown_s,
+        dense_profile=colmap_dense_profile,
+        run_meshing=not effective_args.skip_colmap_meshing,
+        run_floor_completion=not effective_args.skip_floor_completion,
+        run_point_cloud_filter=not effective_args.skip_point_cloud_filter,
+        run_dark_surface_completion=not effective_args.skip_dark_surface_completion,
+        constrained_point_window=constrained_point_window,
+        constrained_slot_window=constrained_slot_window,
+        constrained_max_pdr_distance_m=constrained_max_pdr_distance_m,
+        constrained_video_frame_window=constrained_video_frame_window,
+        constrained_video_anchor_point_window=constrained_video_anchor_point_window,
+        constrained_video_anchor_limit=constrained_video_anchor_limit,
+    )
 
 
 def log_stage(message: str) -> None:
@@ -1126,7 +1282,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--output", type=Path, default=Path("processed"), help="Output folder.")
     parser.add_argument(
         "--reconstruction-profile",
-        choices=["auto", "preview", "final", "rtx4080", "complete"],
+        choices=["auto", "preview", "balanced", "final", "rtx4080", "complete"],
         default="auto",
         help="auto probes the current NVIDIA GPU and VRAM on every run; other values explicitly override profile selection.",
     )
@@ -1153,7 +1309,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--max-colmap-anchor-images-per-point",
         type=int,
-        help="Limit exported point photos per WiFi/checkpoint; preview defaults to circular 10-of-20, final defaults to all.",
+        help="Limit exported point photos per WiFi/checkpoint; balanced defaults to circular 12-of-20, final defaults to all.",
     )
     parser.add_argument("--camera-height-m", type=float, default=1.50)
     parser.add_argument("--slot-yaw-start-deg", type=float, default=0.0)
@@ -1168,6 +1324,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--colmap-workspace", type=Path, default=Path("colmap_workspace"))
     parser.add_argument("--colmap-dir", type=Path, default=Path("colmap-x64-windows-cuda"))
     parser.add_argument("--colmap-exe", type=Path)
+    parser.add_argument(
+        "--colmap-mask-dir",
+        type=Path,
+        help=(
+            "Optional COLMAP mask directory for semantic clutter filtering. "
+            "Masks should follow image_list names, for example image.jpg.png or image.png."
+        ),
+    )
     parser.add_argument("--skip-colmap-prepare", action="store_true")
     parser.add_argument("--visual-only", action="store_true", help="Prepare COLMAP without PDR distance fallback or PDR model alignment.")
     parser.add_argument("--colmap-camera-model", default="SIMPLE_RADIAL")
@@ -1175,6 +1339,21 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--colmap-quality", choices=["low", "medium", "high", "extreme"])
     parser.add_argument("--colmap-dense-max-image-size", type=int)
     parser.add_argument("--colmap-dense-profile", choices=["balanced", "rtx4080", "complete"], help="Dense/MVS parameter profile written into run_colmap_dense.bat.")
+    parser.add_argument(
+        "--colmap-load-profile",
+        choices=["low-peak", "standard", "max"],
+        help="Limit per-stage peak load without changing reconstruction quality settings.",
+    )
+    parser.add_argument(
+        "--colmap-num-threads",
+        type=int,
+        help="Thread cap passed to supported COLMAP stages; use 0 for COLMAP defaults.",
+    )
+    parser.add_argument(
+        "--colmap-stage-cooldown-s",
+        type=int,
+        help="Seconds to wait between heavy COLMAP stages to lower sustained peak load.",
+    )
     parser.add_argument("--skip-colmap-meshing", action="store_true", help="Skip Delaunay/Poisson mesh commands in the generated dense script.")
     parser.add_argument("--skip-floor-completion", action="store_true", help="Skip the explainable floor plane completion layer.")
     parser.add_argument("--skip-point-cloud-filter", action="store_true", help="Skip the filtered fused point cloud post-processing output.")
@@ -1226,12 +1405,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     colmap_feature_max_image_size = profile_value(args, "colmap_feature_max_image_size")
     colmap_max_num_features = profile_value(args, "colmap_max_num_features")
     colmap_max_num_matches = profile_value(args, "colmap_max_num_matches")
+    colmap_load_profile = profile_value(args, "colmap_load_profile")
+    colmap_num_threads = profile_value(args, "colmap_num_threads")
+    colmap_stage_cooldown_s = profile_value(args, "colmap_stage_cooldown_s")
     constrained_point_window = profile_value(args, "constrained_point_window")
     constrained_slot_window = profile_value(args, "constrained_slot_window")
     constrained_max_pdr_distance_m = profile_value(args, "constrained_max_pdr_distance_m")
     constrained_video_frame_window = profile_value(args, "constrained_video_frame_window")
     constrained_video_anchor_point_window = profile_value(args, "constrained_video_anchor_point_window")
     constrained_video_anchor_limit = profile_value(args, "constrained_video_anchor_limit")
+    print_workload_summary(
+        profile=args.reconstruction_profile,
+        load_profile=colmap_load_profile,
+        colmap_num_threads=colmap_num_threads,
+        stage_cooldown_s=colmap_stage_cooldown_s,
+        dense_max_image_size=colmap_dense_max_image_size,
+        feature_max_image_size=colmap_feature_max_image_size,
+        max_num_features=colmap_max_num_features,
+        matcher=colmap_matcher,
+        dense_profile=colmap_dense_profile,
+        video_max_frames=video_max_frames,
+        max_anchor_images_per_point=max_colmap_anchor_images_per_point,
+    )
 
     log_stage("1/8 parsing WiFi scans and selecting stable APs")
     selection = build_wifi_tables(
@@ -1351,6 +1546,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             workspace_dir=colmap_workspace_dir,
             colmap_dir=args.colmap_dir,
             colmap_exe=args.colmap_exe,
+            colmap_mask_dir=args.colmap_mask_dir,
             camera_model=args.colmap_camera_model,
             single_camera=True,
             use_gpu=bool(hardware.get("cuda_enabled")),
@@ -1361,6 +1557,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             feature_max_image_size=colmap_feature_max_image_size,
             max_num_features=colmap_max_num_features,
             max_num_matches=colmap_max_num_matches,
+            load_profile=colmap_load_profile,
+            colmap_num_threads=colmap_num_threads,
+            stage_cooldown_s=colmap_stage_cooldown_s,
             dense_profile=colmap_dense_profile,
             run_meshing=not args.skip_colmap_meshing,
             run_floor_completion=not args.skip_floor_completion,

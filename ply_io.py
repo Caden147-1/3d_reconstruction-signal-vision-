@@ -11,7 +11,7 @@ from __future__ import annotations
 import math
 import struct
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
 PlyProperty = Tuple[str, str]
@@ -126,12 +126,16 @@ def _read_ascii_vertices(
     handle: Any,
     vertex_count: int,
     properties: Sequence[PlyProperty],
+    sample_stride: int = 1,
 ) -> List[PlyRow]:
     rows: List[PlyRow] = []
     kinds = [kind for _name, kind in properties]
     xyz = xyz_indices(properties)
-    for _index in range(vertex_count):
+    sample_stride = max(1, sample_stride)
+    for index in range(vertex_count):
         line = handle.readline().decode("ascii", errors="ignore")
+        if index % sample_stride != 0:
+            continue
         parts = line.split()
         if len(parts) < len(kinds):
             continue
@@ -146,40 +150,49 @@ def _read_binary_vertices(
     vertex_count: int,
     properties: Sequence[PlyProperty],
     endian: str,
+    sample_stride: int = 1,
 ) -> List[PlyRow]:
     fmt = endian + "".join(PLY_TYPES[kind][0] for _name, kind in properties)
     row_size = struct.calcsize(fmt)
     rows: List[PlyRow] = []
     xyz = xyz_indices(properties)
-    for _index in range(vertex_count):
+    sample_stride = max(1, sample_stride)
+    for index in range(vertex_count):
         raw = handle.read(row_size)
         if len(raw) != row_size:
             break
+        if index % sample_stride != 0:
+            continue
         row = tuple(struct.unpack(fmt, raw))
         if is_finite_xyz(row, xyz):
             rows.append(row)
     return rows
 
 
-def read_ply_vertices(path: Path) -> Tuple[List[PlyProperty], List[PlyRow], Dict[str, Any]]:
+def read_ply_vertices(path: Path, max_vertices: Optional[int] = None) -> Tuple[List[PlyProperty], List[PlyRow], Dict[str, Any]]:
     with path.open("rb") as handle:
         header = parse_ply_header(handle)
         properties: List[PlyProperty] = list(header["vertex_properties"])
         vertex_count = int(header["vertex_count"])
         if not properties:
             raise ValueError("PLY file has no vertex properties")
+        sample_stride = 1
+        if max_vertices is not None and max_vertices > 0:
+            sample_stride = max(1, math.ceil(vertex_count / max_vertices))
         if header["format"] == "ascii":
-            rows = _read_ascii_vertices(handle, vertex_count, properties)
+            rows = _read_ascii_vertices(handle, vertex_count, properties, sample_stride)
         elif header["format"] == "binary_little_endian":
-            rows = _read_binary_vertices(handle, vertex_count, properties, "<")
+            rows = _read_binary_vertices(handle, vertex_count, properties, "<", sample_stride)
         elif header["format"] == "binary_big_endian":
-            rows = _read_binary_vertices(handle, vertex_count, properties, ">")
+            rows = _read_binary_vertices(handle, vertex_count, properties, ">", sample_stride)
         else:
             raise ValueError(f"Unsupported PLY format: {header['format']}")
     return properties, rows, {
         "format": header["format"],
         "declared_vertex_count": vertex_count,
         "loaded_vertex_count": len(rows),
+        "sample_stride": sample_stride,
+        "sampling_requested_max_vertices": max_vertices or 0,
     }
 
 
@@ -202,17 +215,17 @@ def write_ply_vertices(
 ) -> int:
     rows = list(rows)
     path.parent.mkdir(parents=True, exist_ok=True)
-    lines = [
-        "ply",
-        "format ascii 1.0",
-        *[f"comment {comment}" for comment in comments],
-        f"element vertex {len(rows)}",
-    ]
-    for name, kind in properties:
-        lines.append(f"property {kind} {name}")
-    lines.append("end_header")
     kinds = [kind for _name, kind in properties]
-    for row in rows:
-        lines.append(" ".join(_format_value(value, kind) for value, kind in zip(row, kinds)))
-    path.write_text("\n".join(lines) + "\n", encoding="ascii")
+    with path.open("w", encoding="ascii", newline="\n") as handle:
+        handle.write("ply\n")
+        handle.write("format ascii 1.0\n")
+        for comment in comments:
+            handle.write(f"comment {comment}\n")
+        handle.write(f"element vertex {len(rows)}\n")
+        for name, kind in properties:
+            handle.write(f"property {kind} {name}\n")
+        handle.write("end_header\n")
+        for row in rows:
+            handle.write(" ".join(_format_value(value, kind) for value, kind in zip(row, kinds)))
+            handle.write("\n")
     return len(rows)

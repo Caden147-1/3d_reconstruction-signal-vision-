@@ -219,7 +219,7 @@ def complete_dark_surface(
     min_hull_area: float,
     bin_count: int,
 ) -> Dict[str, Any]:
-    properties, rows, io_summary = read_ply_vertices(input_path)
+    properties, rows, io_summary = read_ply_vertices(input_path, max_vertices=max_points)
     xyz = xyz_indices(properties)
     color = color_indices(properties)
     if color is None:
@@ -234,9 +234,9 @@ def complete_dark_surface(
     if len(dark_points) < min_support:
         raise ValueError(f"Only {len(dark_points)} dark points found; need at least {min_support}")
 
-    stride = max(1, math.ceil(len(dark_points) / max(1, max_points)))
-    sampled_dark_points = dark_points[::stride]
-    vertical_axis = choose_vertical_axis(all_points[::max(1, math.ceil(len(all_points) / max(1, max_points)))])
+    stride = int(io_summary.get("sample_stride") or 1)
+    sampled_dark_points = dark_points
+    vertical_axis = choose_vertical_axis(all_points)
     chosen = select_candidate(
         sampled_dark_points,
         vertical_axis=vertical_axis,

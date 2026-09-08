@@ -28,13 +28,26 @@ METADATA_FILES = [
 
 DENSE_PROFILES: Dict[str, Dict[str, Any]] = {
     "balanced": {
-        "description": "COLMAP defaults plus geometric consistency; good for quick checks.",
+        "description": "Balanced indoor reconstruction with bounded dense and post-processing cost.",
         "patch_match": {
             "geom_consistency": 1,
+            "window_radius": 5,
+            "window_step": 1,
+            "num_samples": 15,
+            "num_iterations": 5,
+            "cache_size": 8,
         },
-        "fusion": {},
+        "fusion": {
+            "min_num_pixels": 4,
+            "check_num_images": 60,
+        },
         "run_meshing": True,
         "run_floor_completion": True,
+        "run_dark_surface_completion": True,
+        "cleanup_intermediate_ply": True,
+        "point_filter_max_points": 600000,
+        "floor_completion_max_points": 200000,
+        "dark_surface_max_points": 200000,
     },
     "rtx4080": {
         "description": (
@@ -49,6 +62,7 @@ DENSE_PROFILES: Dict[str, Dict[str, Any]] = {
             "num_iterations": 6,
             "filter": 1,
             "filter_min_ncc": 0.05,
+            "cache_size": 12,
         },
         "fusion": {
             "min_num_pixels": 3,
@@ -59,6 +73,11 @@ DENSE_PROFILES: Dict[str, Dict[str, Any]] = {
         },
         "run_meshing": True,
         "run_floor_completion": True,
+        "run_dark_surface_completion": True,
+        "cleanup_intermediate_ply": True,
+        "point_filter_max_points": 900000,
+        "floor_completion_max_points": 300000,
+        "dark_surface_max_points": 300000,
     },
     "complete": {
         "description": (
@@ -75,6 +94,7 @@ DENSE_PROFILES: Dict[str, Dict[str, Any]] = {
             "num_iterations": 7,
             "filter": 1,
             "filter_min_ncc": 0.05,
+            "cache_size": 16,
         },
         "fusion": {
             "min_num_pixels": 3,
@@ -85,6 +105,30 @@ DENSE_PROFILES: Dict[str, Dict[str, Any]] = {
         },
         "run_meshing": True,
         "run_floor_completion": True,
+        "run_dark_surface_completion": True,
+        "cleanup_intermediate_ply": True,
+        "point_filter_max_points": 1200000,
+        "floor_completion_max_points": 400000,
+        "dark_surface_max_points": 400000,
+    },
+}
+
+
+LOAD_PROFILES: Dict[str, Dict[str, Any]] = {
+    "low-peak": {
+        "description": "Limit supported COLMAP stages to a few threads and rest between heavy stages.",
+        "num_threads": 2,
+        "stage_cooldown_s": 20,
+    },
+    "standard": {
+        "description": "Moderate throttling for normal desktop use.",
+        "num_threads": 4,
+        "stage_cooldown_s": 5,
+    },
+    "max": {
+        "description": "Use COLMAP defaults with no artificial cooldown.",
+        "num_threads": 0,
+        "stage_cooldown_s": 0,
     },
 }
 
@@ -414,25 +458,65 @@ def build_constrained_match_pairs(
 
     points = sorted(by_point)
     point_row_by_id = {point: by_point[point][0] for point in points if by_point[point]}
+
+    def row_xy(row: Dict[str, str]) -> Optional[Tuple[float, float]]:
+        x = safe_float(row.get("pdr_x"))
+        y = safe_float(row.get("pdr_y"))
+        if math.isnan(x) or math.isnan(y) or math.isinf(x) or math.isinf(y):
+            return None
+        return x, y
+
+    pdr_cell_size = max(1e-6, max_pdr_distance_m)
+    pdr_grid: Dict[Tuple[int, int], List[int]] = {}
+    if not visual_only and max_pdr_distance_m > 0:
+        for point, row in point_row_by_id.items():
+            xy = row_xy(row)
+            if xy is None:
+                continue
+            cell = (math.floor(xy[0] / pdr_cell_size), math.floor(xy[1] / pdr_cell_size))
+            pdr_grid.setdefault(cell, []).append(point)
+
+    def nearby_pdr_points(row: Dict[str, str]) -> List[int]:
+        if visual_only or max_pdr_distance_m <= 0:
+            return []
+        xy = row_xy(row)
+        if xy is None:
+            return []
+        base_cell = (math.floor(xy[0] / pdr_cell_size), math.floor(xy[1] / pdr_cell_size))
+        nearby: List[int] = []
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for point in pdr_grid.get((base_cell[0] + dx, base_cell[1] + dy), []):
+                    point_row = point_row_by_id.get(point)
+                    if point_row is not None and point_distance(row, point_row) <= max_pdr_distance_m:
+                        nearby.append(point)
+        return nearby
+
+    candidate_point_pairs: set[Tuple[int, int]] = set()
     for left_index, point_a in enumerate(points):
         for point_b in points[left_index + 1 :]:
-            point_gap = point_b - point_a
-            pdr_gap = math.inf if visual_only else point_distance(point_row_by_id[point_a], point_row_by_id[point_b])
-            if point_gap > point_window and (visual_only or pdr_gap > max_pdr_distance_m):
-                continue
-            rows_a = by_point[point_a]
-            rows_b = by_point[point_b]
-            slot_count = anchor_slot_count(rows_a + rows_b)
-            for row_a in rows_a:
-                for row_b in rows_b:
-                    slot_gap = circular_slot_distance(
-                        safe_int(row_a.get("image_slot")),
-                        safe_int(row_b.get("image_slot")),
-                        slot_count,
-                    )
-                    if slot_gap <= slot_window:
-                        reason = "nearby_wifi_points" if point_gap <= point_window else "nearby_pdr_points"
-                        add_pair(row_a, row_b, reason)
+            if point_b - point_a > point_window:
+                break
+            candidate_point_pairs.add((point_a, point_b))
+        for point_b in nearby_pdr_points(point_row_by_id[point_a]):
+            if point_b > point_a:
+                candidate_point_pairs.add((point_a, point_b))
+
+    for point_a, point_b in sorted(candidate_point_pairs):
+        point_gap = point_b - point_a
+        rows_a = by_point[point_a]
+        rows_b = by_point[point_b]
+        slot_count = anchor_slot_count(rows_a + rows_b)
+        for row_a in rows_a:
+            for row_b in rows_b:
+                slot_gap = circular_slot_distance(
+                    safe_int(row_a.get("image_slot")),
+                    safe_int(row_b.get("image_slot")),
+                    slot_count,
+                )
+                if slot_gap <= slot_window:
+                    reason = "nearby_wifi_points" if point_gap <= point_window else "nearby_pdr_points"
+                    add_pair(row_a, row_b, reason)
 
     video_rows = [row for row in manifest_rows if row.get("image_file") and is_video_frame_row(row)]
     by_video: Dict[str, List[Dict[str, str]]] = {}
@@ -462,9 +546,7 @@ def build_constrained_match_pairs(
                     candidate_points.add(neighbor)
 
         if not candidate_points and not visual_only:
-            for point, point_row in point_row_by_id.items():
-                if point_distance(video_row, point_row) <= max_pdr_distance_m:
-                    candidate_points.add(point)
+            candidate_points.update(nearby_pdr_points(video_row))
 
         candidate_anchor_rows: List[Dict[str, str]] = []
         for point in sorted(candidate_points):
@@ -533,6 +615,7 @@ def build_constrained_match_pairs(
         "video_frame_window": video_frame_window,
         "video_anchor_point_window": video_anchor_point_window,
         "video_anchor_limit": video_anchor_limit,
+        "candidate_point_pair_count": len(candidate_point_pairs),
         "reason_counts": {},
         "weighted_graph": True,
         "edge_weight": {"min": None, "mean": None, "max": None},
@@ -673,8 +756,58 @@ def prefixed_options(prefix: str, options: Dict[str, Any]) -> List[str]:
 
 def dense_profile_config(dense_profile: str) -> Dict[str, Any]:
     if dense_profile not in DENSE_PROFILES:
-        return DENSE_PROFILES["complete"]
+        return DENSE_PROFILES["balanced"]
     return DENSE_PROFILES[dense_profile]
+
+
+def load_profile_config(load_profile: str) -> Dict[str, Any]:
+    if load_profile not in LOAD_PROFILES:
+        return LOAD_PROFILES["low-peak"]
+    return LOAD_PROFILES[load_profile]
+
+
+def resolve_load_settings(
+    load_profile: str,
+    colmap_num_threads: Optional[int],
+    stage_cooldown_s: Optional[int],
+) -> Tuple[str, Dict[str, Any], int, int]:
+    profile_name = load_profile if load_profile in LOAD_PROFILES else "low-peak"
+    config = load_profile_config(profile_name)
+    default_threads = int(config.get("num_threads") or 0)
+    default_cooldown = int(config.get("stage_cooldown_s") or 0)
+    threads = default_threads if colmap_num_threads is None else max(0, int(colmap_num_threads))
+    cooldown = default_cooldown if stage_cooldown_s is None else max(0, int(stage_cooldown_s))
+    return profile_name, config, threads, cooldown
+
+
+def thread_option(prefix: str, num_threads: int) -> str:
+    return f" ^\n  --{prefix}.num_threads {num_threads}" if num_threads > 0 else ""
+
+
+def prefixed_thread_option(prefix: str, num_threads: int) -> List[str]:
+    return [f"  --{prefix}.num_threads {num_threads}"] if num_threads > 0 else []
+
+
+def cooldown_block(stage_cooldown_s: int, label: str) -> str:
+    if stage_cooldown_s <= 0:
+        return ""
+    return f"""
+echo [cooldown] Waiting {stage_cooldown_s}s after {label} to reduce sustained peak load...
+timeout /t {stage_cooldown_s} /nobreak >nul
+"""
+
+
+def thread_environment_block(num_threads: int) -> str:
+    if num_threads <= 0:
+        return ""
+    return f"""
+set "OMP_NUM_THREADS={num_threads}"
+set "OPENBLAS_NUM_THREADS={num_threads}"
+set "MKL_NUM_THREADS={num_threads}"
+set "NUMEXPR_NUM_THREADS={num_threads}"
+set "OPENCV_FOR_THREADS_NUM={num_threads}"
+echo [load] Low-peak thread cap: {num_threads}
+"""
 
 
 def remove_stale_quality_reports(workspace_dir: Path) -> List[str]:
@@ -687,10 +820,64 @@ def remove_stale_quality_reports(workspace_dir: Path) -> List[str]:
     return removed
 
 
+MASK_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
+
+
+def resolve_optional_path(root: Path, path: Optional[Path]) -> Optional[Path]:
+    if path is None:
+        return None
+    return path if path.is_absolute() else root / path
+
+
+def mask_candidates(mask_dir: Path, image_name: str) -> List[Path]:
+    rel = Path(image_name)
+    candidates = [mask_dir / rel]
+    candidates.append(mask_dir / f"{image_name}.png")
+    if rel.suffix:
+        candidates.append(mask_dir / rel.with_suffix(".png"))
+    else:
+        candidates.extend(mask_dir / f"{image_name}{suffix}" for suffix in MASK_EXTENSIONS)
+    unique: List[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate).lower()
+        if key not in seen:
+            unique.append(candidate)
+            seen.add(key)
+    return unique
+
+
+def mask_dir_summary(mask_dir: Optional[Path], image_names: Sequence[str]) -> Dict[str, Any]:
+    if mask_dir is None:
+        return {"enabled": False, "path": "", "exists": False, "matched_image_count": 0, "missing_image_count": 0}
+    matched = 0
+    missing: List[str] = []
+    if mask_dir.exists():
+        for image_name in image_names:
+            if any(candidate.exists() for candidate in mask_candidates(mask_dir, image_name)):
+                matched += 1
+            elif len(missing) < 20:
+                missing.append(image_name)
+    return {
+        "enabled": mask_dir.exists(),
+        "path": str(mask_dir),
+        "exists": mask_dir.exists(),
+        "matched_image_count": matched,
+        "missing_image_count": max(0, len(image_names) - matched) if mask_dir.exists() else len(image_names),
+        "missing_images": missing,
+        "accepted_name_patterns": [
+            "same relative path as image",
+            "image name plus .png",
+            "same stem with .png",
+        ],
+    }
+
+
 def write_sparse_batch(
     root: Path,
     workspace_dir: Path,
     colmap_exe: Path,
+    mask_dir: Optional[Path],
     camera_model: str,
     single_camera: bool,
     use_gpu: bool,
@@ -699,10 +886,19 @@ def write_sparse_batch(
     feature_max_image_size: int,
     max_num_features: int,
     max_num_matches: int,
+    num_threads: int,
+    stage_cooldown_s: int,
 ) -> None:
     matcher_command = "sequential_matcher" if matcher == "sequential" else "exhaustive_matcher"
     single_camera_flag = "1" if single_camera else "0"
     gpu_flag = "1" if use_gpu else "0"
+    feature_extraction_threads = thread_option("FeatureExtraction", num_threads)
+    feature_matching_threads = thread_option("FeatureMatching", num_threads)
+    mapper_threads = thread_option("Mapper", num_threads)
+    after_feature_cooldown = cooldown_block(stage_cooldown_s, "feature extraction")
+    after_matching_cooldown = cooldown_block(stage_cooldown_s, "feature matching")
+    after_mapper_cooldown = cooldown_block(stage_cooldown_s, "sparse mapping")
+    thread_env = thread_environment_block(num_threads)
     constrained_matching_block = f"""echo [2/4] Matching constrained image pairs from visual/order priors...
 if not exist "%WORKSPACE%\\match_pairs.txt" (
   echo [error] Missing constrained pair list: %WORKSPACE%\\match_pairs.txt
@@ -714,8 +910,9 @@ if not exist "%WORKSPACE%\\match_pairs.txt" (
   --match_type pairs ^
   --FeatureMatching.use_gpu {gpu_flag} ^
   --FeatureMatching.guided_matching 1 ^
-  --FeatureMatching.max_num_matches {max_num_matches}
+  --FeatureMatching.max_num_matches {max_num_matches}{feature_matching_threads}
 if errorlevel 1 exit /b %errorlevel%
+{after_matching_cooldown}
 """
     if matcher == "constrained":
         matching_block = constrained_matching_block
@@ -726,8 +923,9 @@ echo [2b/4] Adding exhaustive visual bridge matches...
   --database_path "%DATABASE%" ^
   --FeatureMatching.use_gpu {gpu_flag} ^
   --FeatureMatching.guided_matching 1 ^
-  --FeatureMatching.max_num_matches {max_num_matches}
+  --FeatureMatching.max_num_matches {max_num_matches}{feature_matching_threads}
 if errorlevel 1 exit /b %errorlevel%
+{after_matching_cooldown}
 """
     else:
         matching_block = f"""echo [2/4] Matching features with {matcher_command}...
@@ -735,14 +933,18 @@ if errorlevel 1 exit /b %errorlevel%
   --database_path "%DATABASE%" ^
   --FeatureMatching.use_gpu {gpu_flag} ^
   --FeatureMatching.guided_matching 1 ^
-  --FeatureMatching.max_num_matches {max_num_matches}
+  --FeatureMatching.max_num_matches {max_num_matches}{feature_matching_threads}
 if errorlevel 1 exit /b %errorlevel%
+{after_matching_cooldown}
 """
     feature_limits = ""
     if feature_max_image_size > 0:
         feature_limits += f" ^\n  --SiftExtraction.max_image_size {feature_max_image_size}"
     if max_num_features > 0:
         feature_limits += f" ^\n  --SiftExtraction.max_num_features {max_num_features}"
+    mask_option = ""
+    if mask_dir is not None:
+        mask_option = f' ^\n  --ImageReader.mask_path "{windows_path(mask_dir)}"'
     alignment_block = ""
     if align_to_pdr:
         alignment_block = """
@@ -750,6 +952,7 @@ echo [4/4] Aligning sparse model to PDR coordinate seeds...
 if exist "%WORKSPACE%\\pdr_alignment_refs.txt" (
   if exist "%WORKSPACE%\\sparse\\0" (
     if not exist "%WORKSPACE%\\sparse_pdr_aligned" mkdir "%WORKSPACE%\\sparse_pdr_aligned"
+    if not exist "%WORKSPACE%\\sparse_pdr_aligned\\0" mkdir "%WORKSPACE%\\sparse_pdr_aligned\\0"
     "%COLMAP_EXE%" model_aligner ^
       --input_path "%WORKSPACE%\\sparse\\0" ^
       --output_path "%WORKSPACE%\\sparse_pdr_aligned\\0" ^
@@ -761,7 +964,15 @@ if exist "%WORKSPACE%\\pdr_alignment_refs.txt" (
     if errorlevel 1 (
       echo [warn] PDR alignment failed; dense step will use raw sparse model.
     ) else (
-      echo [done] PDR-aligned sparse model: %WORKSPACE%\\sparse_pdr_aligned\\0
+      if exist "%WORKSPACE%\\sparse_pdr_aligned\\0\\images.bin" (
+        echo [done] PDR-aligned sparse model: %WORKSPACE%\\sparse_pdr_aligned\\0
+      ) else (
+        if exist "%WORKSPACE%\\sparse_pdr_aligned\\0\\images.txt" (
+          echo [done] PDR-aligned sparse model: %WORKSPACE%\\sparse_pdr_aligned\\0
+        ) else (
+          echo [warn] PDR alignment did not write a model; dense step will use raw sparse model.
+        )
+      )
     )
   )
 )
@@ -770,7 +981,7 @@ if exist "%WORKSPACE%\\pdr_alignment_refs.txt" (
         alignment_block = """
 echo [4/4] Skipping PDR alignment for visual-only reconstruction.
 """
-    content = batch_header(root, workspace_dir, colmap_exe) + f"""
+    content = batch_header(root, workspace_dir, colmap_exe) + f"""{thread_env}
 if exist "%DATABASE%" (
   echo [warn] Existing database found: %DATABASE%
   echo [warn] If you changed matching constraints, run reset_colmap_outputs.bat first.
@@ -784,8 +995,9 @@ echo [1/4] Extracting features...
   --image_list_path "%IMAGE_LIST%" ^
   --ImageReader.camera_model {camera_model} ^
   --ImageReader.single_camera {single_camera_flag} ^
-  --FeatureExtraction.use_gpu {gpu_flag}{feature_limits}
+  --FeatureExtraction.use_gpu {gpu_flag}{mask_option}{feature_limits}{feature_extraction_threads}
 if errorlevel 1 exit /b %errorlevel%
+{after_feature_cooldown}
 
 {matching_block}
 
@@ -794,8 +1006,9 @@ echo [3/4] Building sparse model...
   --database_path "%DATABASE%" ^
   --image_path "%IMAGE_PATH%" ^
   --output_path "%WORKSPACE%\\sparse" ^
-  --Mapper.multiple_models 0
+  --Mapper.multiple_models 0{mapper_threads}
 if errorlevel 1 exit /b %errorlevel%
+{after_mapper_cooldown}
 
 {alignment_block}
 python "%ROOT%\\reconstruction_quality.py" --workspace "%WORKSPACE%" --summary "%WORKSPACE%\\quality_report.json" --markdown "%WORKSPACE%\\QUALITY_REPORT.md"
@@ -810,6 +1023,7 @@ def write_dense_batch(
     root: Path,
     workspace_dir: Path,
     colmap_exe: Path,
+    mask_dir: Optional[Path],
     dense_max_image_size: int,
     align_to_pdr: bool,
     dense_profile: str,
@@ -817,8 +1031,19 @@ def write_dense_batch(
     run_floor_completion: bool,
     run_point_cloud_filter: bool,
     run_dark_surface_completion: bool,
+    num_threads: int,
+    stage_cooldown_s: int,
 ) -> None:
     profile = dense_profile_config(dense_profile)
+    point_filter_max_points = int(profile.get("point_filter_max_points", 600000))
+    floor_completion_max_points = int(profile.get("floor_completion_max_points", 200000))
+    dark_surface_max_points = int(profile.get("dark_surface_max_points", 200000))
+    cleanup_intermediate_ply = bool(profile.get("cleanup_intermediate_ply", True))
+    after_undistort_cooldown = cooldown_block(stage_cooldown_s, "image undistortion")
+    after_patchmatch_cooldown = cooldown_block(stage_cooldown_s, "PatchMatch stereo")
+    after_fusion_cooldown = cooldown_block(stage_cooldown_s, "stereo fusion")
+    after_postprocess_cooldown = cooldown_block(stage_cooldown_s, "post-processing")
+    thread_env = thread_environment_block(num_threads)
     patch_match_args = [
         '  --workspace_path "%WORKSPACE%\\dense"',
         "  --workspace_format COLMAP",
@@ -829,6 +1054,8 @@ def write_dense_batch(
         "  --workspace_format COLMAP",
         "  --input_type geometric",
         *prefixed_options("StereoFusion", profile["fusion"]),
+        *prefixed_thread_option("StereoFusion", num_threads),
+        *([f'  --StereoFusion.mask_path "{windows_path(mask_dir)}"'] if mask_dir is not None else []),
         '  --output_path "%WORKSPACE%\\dense\\fused.ply"',
     ]
     undistorter_command = colmap_command(
@@ -850,17 +1077,19 @@ echo [info] Dense input sparse model: %SPARSE_MODEL%
 """
     point_filter_block = ""
     if run_point_cloud_filter:
-        point_filter_block = """
+        point_filter_block = f"""
 echo [4/8] Filtering dense point cloud outliers...
 python "%ROOT%\\point_cloud_filter.py" ^
   --input "%WORKSPACE%\\dense\\fused.ply" ^
   --output "%WORKSPACE%\\dense\\fused_filtered.ply" ^
-  --summary "%WORKSPACE%\\dense\\point_filter_summary.json"
+  --summary "%WORKSPACE%\\dense\\point_filter_summary.json" ^
+  --max-points {point_filter_max_points}
 if errorlevel 1 (
   echo [warn] Point cloud filtering failed; raw fused.ply is still available.
 ) else (
   set "DENSE_POINT_CLOUD=%WORKSPACE%\\dense\\fused_filtered.ply"
 )
+{after_postprocess_cooldown}
 """
     mesh_block = ""
     if run_meshing and profile.get("run_meshing", True):
@@ -882,14 +1111,16 @@ if errorlevel 1 (
 echo [5/8] Building a Delaunay mesh for robust MeshLab inspection...
 {delaunay_command}
 if errorlevel 1 echo [warn] Delaunay meshing failed; continuing with fused point cloud.
+{after_postprocess_cooldown}
 
 echo [6/8] Building a Poisson mesh for smoother surface inspection...
 {poisson_command}
 if errorlevel 1 echo [warn] Poisson meshing failed; continuing with fused point cloud.
+{after_postprocess_cooldown}
 """
     floor_block = ""
     if run_floor_completion and profile.get("run_floor_completion", True):
-        floor_block = """
+        floor_block = f"""
 echo [7/8] Estimating an explainable floor plane completion layer...
 if not exist "%ROOT%\\floor_plane_completion.py" (
   echo [warn] floor_plane_completion.py not found; skipping floor completion.
@@ -897,13 +1128,15 @@ if not exist "%ROOT%\\floor_plane_completion.py" (
   python "%ROOT%\\floor_plane_completion.py" ^
     --input "%DENSE_POINT_CLOUD%" ^
     --output "%WORKSPACE%\\dense\\floor_completed_mesh.ply" ^
-    --summary "%WORKSPACE%\\dense\\floor_completion_summary.json"
+    --summary "%WORKSPACE%\\dense\\floor_completion_summary.json" ^
+    --max-points {floor_completion_max_points}
   if errorlevel 1 echo [warn] Floor completion failed; raw COLMAP outputs are still available.
 )
+{after_postprocess_cooldown}
 """
     dark_surface_block = ""
-    if run_dark_surface_completion:
-        dark_surface_block = """
+    if run_dark_surface_completion and profile.get("run_dark_surface_completion", True):
+        dark_surface_block = f"""
 echo [8/8] Estimating a dark low-texture surface completion layer...
 if not exist "%ROOT%\\dark_surface_completion.py" (
   echo [warn] dark_surface_completion.py not found; skipping dark surface completion.
@@ -911,16 +1144,27 @@ if not exist "%ROOT%\\dark_surface_completion.py" (
   python "%ROOT%\\dark_surface_completion.py" ^
     --input "%DENSE_POINT_CLOUD%" ^
     --output "%WORKSPACE%\\dense\\dark_surface_completed_mesh.ply" ^
-    --summary "%WORKSPACE%\\dense\\dark_surface_completion_summary.json"
+    --summary "%WORKSPACE%\\dense\\dark_surface_completion_summary.json" ^
+    --max-points {dark_surface_max_points}
   if errorlevel 1 echo [warn] Dark surface completion failed; raw COLMAP outputs are still available.
 )
+{after_postprocess_cooldown}
 """
     quality_block = """
 python "%ROOT%\\reconstruction_quality.py" --workspace "%WORKSPACE%" --summary "%WORKSPACE%\\quality_report.json" --markdown "%WORKSPACE%\\QUALITY_REPORT.md"
 if errorlevel 1 echo [warn] Final quality report failed; reconstruction outputs are still available.
 """
+    keep_intermediate_flag = " ^\n  --keep-intermediate" if not cleanup_intermediate_ply else ""
+    finalize_block = f"""
+echo [finalize] Selecting dense\\final.ply and pruning intermediate PLY files...
+python "%ROOT%\\finalize_dense_outputs.py" ^
+  --dense-dir "%WORKSPACE%\\dense" ^
+  --summary "%WORKSPACE%\\dense\\final_output_summary.json"{keep_intermediate_flag}
+if errorlevel 1 exit /b %errorlevel%
+{after_postprocess_cooldown}
+"""
     pdr_note = "PDR-aligned sparse models are preferred when present." if align_to_pdr else "Visual sparse models are used because visual-only mode is enabled."
-    content = batch_header(root, workspace_dir, colmap_exe) + f"""
+    content = batch_header(root, workspace_dir, colmap_exe) + f"""{thread_env}
 {sparse_selector}if not exist "%SPARSE_MODEL%" (
   echo [error] Sparse model not found: %SPARSE_MODEL%
   echo Run run_colmap_sparse.bat first, or check which sparse model folder COLMAP created.
@@ -928,26 +1172,35 @@ if errorlevel 1 echo [warn] Final quality report failed; reconstruction outputs 
 )
 if not exist "%WORKSPACE%\\dense" mkdir "%WORKSPACE%\\dense"
 set "DENSE_POINT_CLOUD=%WORKSPACE%\\dense\\fused.ply"
+if exist "%WORKSPACE%\\dense\\final.ply" del "%WORKSPACE%\\dense\\final.ply"
+if exist "%WORKSPACE%\\dense\\final_output_summary.json" del "%WORKSPACE%\\dense\\final_output_summary.json"
+if exist "%WORKSPACE%\\dense\\meshed-poisson.ply" del "%WORKSPACE%\\dense\\meshed-poisson.ply"
+if exist "%WORKSPACE%\\dense\\meshed-delaunay.ply" del "%WORKSPACE%\\dense\\meshed-delaunay.ply"
+if exist "%WORKSPACE%\\dense\\fused_filtered.ply" del "%WORKSPACE%\\dense\\fused_filtered.ply"
+if exist "%WORKSPACE%\\dense\\point_filter_summary.json" del "%WORKSPACE%\\dense\\point_filter_summary.json"
+if exist "%WORKSPACE%\\dense\\floor_completed_mesh.ply" del "%WORKSPACE%\\dense\\floor_completed_mesh.ply"
+if exist "%WORKSPACE%\\dense\\floor_completion_summary.json" del "%WORKSPACE%\\dense\\floor_completion_summary.json"
+if exist "%WORKSPACE%\\dense\\dark_surface_completed_mesh.ply" del "%WORKSPACE%\\dense\\dark_surface_completed_mesh.ply"
+if exist "%WORKSPACE%\\dense\\dark_surface_completion_summary.json" del "%WORKSPACE%\\dense\\dark_surface_completion_summary.json"
+if exist "%WORKSPACE%\\dense\\fused.ply.vis" del "%WORKSPACE%\\dense\\fused.ply.vis"
 
 echo [1/8] Undistorting images...
 {undistorter_command}
 if errorlevel 1 exit /b %errorlevel%
+{after_undistort_cooldown}
 
 echo [2/8] Running CUDA PatchMatch stereo...
 {patch_match_command}
 if errorlevel 1 exit /b %errorlevel%
+{after_patchmatch_cooldown}
 
 echo [3/8] Fusing dense point cloud...
 {fusion_command}
 if errorlevel 1 exit /b %errorlevel%
+{after_fusion_cooldown}
 
-{point_filter_block}{mesh_block}{floor_block}{dark_surface_block}{quality_block}
-echo [done] Dense point cloud: %WORKSPACE%\\dense\\fused.ply
-if exist "%WORKSPACE%\\dense\\fused_filtered.ply" echo [done] Filtered dense point cloud: %WORKSPACE%\\dense\\fused_filtered.ply
-if exist "%WORKSPACE%\\dense\\meshed-delaunay.ply" echo [done] Delaunay mesh: %WORKSPACE%\\dense\\meshed-delaunay.ply
-if exist "%WORKSPACE%\\dense\\meshed-poisson.ply" echo [done] Poisson mesh: %WORKSPACE%\\dense\\meshed-poisson.ply
-if exist "%WORKSPACE%\\dense\\floor_completed_mesh.ply" echo [done] Floor completion layer: %WORKSPACE%\\dense\\floor_completed_mesh.ply
-if exist "%WORKSPACE%\\dense\\dark_surface_completed_mesh.ply" echo [done] Dark surface completion layer: %WORKSPACE%\\dense\\dark_surface_completed_mesh.ply
+{point_filter_block}{mesh_block}{floor_block}{dark_surface_block}{finalize_block}{quality_block}
+if exist "%WORKSPACE%\\dense\\final.ply" echo [done] Final dense model: %WORKSPACE%\\dense\\final.ply
 """
     write_text(workspace_dir / "run_colmap_dense.bat", content)
 
@@ -1017,10 +1270,14 @@ if exist "%WORKSPACE%sparse" rmdir /s /q "%WORKSPACE%sparse"
 if exist "%WORKSPACE%sparse_pdr_aligned" rmdir /s /q "%WORKSPACE%sparse_pdr_aligned"
 if exist "%WORKSPACE%dense" rmdir /s /q "%WORKSPACE%dense"
 if exist "%WORKSPACE%stereo" rmdir /s /q "%WORKSPACE%stereo"
+if exist "%WORKSPACE%final.ply" del "%WORKSPACE%final.ply"
+if exist "%WORKSPACE%final_output_summary.json" del "%WORKSPACE%final_output_summary.json"
 if exist "%WORKSPACE%meshed-poisson.ply" del "%WORKSPACE%meshed-poisson.ply"
 if exist "%WORKSPACE%meshed-delaunay.ply" del "%WORKSPACE%meshed-delaunay.ply"
 if exist "%WORKSPACE%fused_filtered.ply" del "%WORKSPACE%fused_filtered.ply"
 if exist "%WORKSPACE%point_filter_summary.json" del "%WORKSPACE%point_filter_summary.json"
+if exist "%WORKSPACE%floor_completed_mesh.ply" del "%WORKSPACE%floor_completed_mesh.ply"
+if exist "%WORKSPACE%floor_completion_summary.json" del "%WORKSPACE%floor_completion_summary.json"
 if exist "%WORKSPACE%dark_surface_completed_mesh.ply" del "%WORKSPACE%dark_surface_completed_mesh.ply"
 if exist "%WORKSPACE%dark_surface_completion_summary.json" del "%WORKSPACE%dark_surface_completion_summary.json"
 if exist "%WORKSPACE%quality_report.json" del "%WORKSPACE%quality_report.json"
@@ -1030,7 +1287,15 @@ echo [done] COLMAP outputs reset.
     write_text(workspace_dir / "reset_colmap_outputs.bat", content)
 
 
-def write_readme(workspace_dir: Path, visual_only: bool, matcher: str, dense_profile: str) -> None:
+def write_readme(
+    workspace_dir: Path,
+    visual_only: bool,
+    matcher: str,
+    dense_profile: str,
+    load_profile: str,
+    num_threads: int,
+    stage_cooldown_s: int,
+) -> None:
     alignment_note = (
         "This workspace is visual-only: no `pdr_alignment_refs.txt` is generated, and sparse models are not aligned to PDR.\n"
         if visual_only
@@ -1048,19 +1313,21 @@ This folder is prepared from the current WiFi/IMU/photo capture.
 ## Start Here
 
 1. Run `run_colmap_sparse.bat` to build sparse SfM model candidates.
-2. Run `run_colmap_dense.bat` to generate dense point cloud, meshes, reports, and the floor completion layer.
-3. Open `dense/fused.ply` plus `dense/floor_completed_mesh.ply` together in MeshLab for the point-cloud-plus-floor view.
+2. Run `run_colmap_dense.bat` to generate the dense result, reports, and optional completion diagnostics.
+3. Open `dense/final.ply` in MeshLab for the final reconstruction view.
 
 For normal rebuilds, prefer `python run_colmap.py full` from the project root; it clears old COLMAP outputs automatically before running sparse and dense reconstruction. If you run these generated `.bat` scripts directly and they report existing outputs, run `reset_colmap_outputs.bat` first; it asks you to type `YES` before deleting old outputs.
 
 The generated scripts favor reconstruction quality over speed. The sparse matcher is `{matcher}` and the dense profile is `{dense_profile}`.
+The load profile is `{load_profile}` with COLMAP thread cap `{num_threads}` and `{stage_cooldown_s}` seconds of cooldown between heavy stages.
 
 ## Why This Setup
 
 - Hybrid matching first uses explainable WiFi/PDR/video-order pairs, then adds COLMAP exhaustive visual bridge matches to reduce disconnected sparse components. `match_graph_edges.csv` explains the constrained pairs; exhaustive bridge matches are generated internally by COLMAP.
 - Dense fusion uses a completeness-oriented profile for indoor weak-texture floor and wall regions.
-- Mesh outputs are generated as separate inspection layers so the raw COLMAP point cloud is still preserved.
-- Floor completion is a separate inferred layer with a JSON summary; it is not mixed silently into the raw point cloud.
+- If `--colmap-mask-dir` was provided during preprocessing and the directory exists, feature extraction and dense fusion use those masks to suppress semantic clutter such as desks and chairs.
+- Mesh outputs are finalized into `dense/final.ply` so the result directory has one obvious model to open.
+- Intermediate dense PLY files are removed by default after `final.ply` is selected; set `KEEP_INTERMEDIATE_PLY=1` before running the batch if you need debug artifacts.
 
 ## Inputs
 
@@ -1081,13 +1348,10 @@ The generated scripts favor reconstruction quality over speed. The sparse matche
 ## Outputs After Running COLMAP
 
 - `QUALITY_REPORT.md` / `quality_report.json`: sparse component counts, largest registered-image count, and dense/floor output availability.
-- `dense/fused.ply`: raw COLMAP dense point cloud.
-- `dense/fused_filtered.ply`: conservative filtered point cloud when filtering is enabled.
-- `dense/meshed-delaunay.ply`: robust mesh for inspection when Delaunay succeeds.
-- `dense/meshed-poisson.ply`: smoother mesh for inspection when Poisson succeeds.
-- `dense/floor_completed_mesh.ply`: inferred floor plane mesh for weak-texture floor holes.
+- `dense/final.ply`: final dense model to open; Poisson mesh is preferred, with Delaunay or point-cloud fallback if meshing fails.
+- `dense/final_output_summary.json`: source chosen for `final.ply` and intermediate files removed during cleanup.
 - `dense/floor_completion_summary.json`: chosen vertical axis, plane height, support count, and hull size.
-- `dense/dark_surface_completed_mesh.ply`: optional inferred dark low-texture surface layer.
+- `dense/dark_surface_completion_summary.json`: optional dark low-texture surface diagnostic summary.
 
 {alignment_note}
 """
@@ -1100,6 +1364,7 @@ def prepare_colmap_workspace(
     workspace_dir: Path,
     colmap_dir: Optional[Path] = None,
     colmap_exe: Optional[Path] = None,
+    colmap_mask_dir: Optional[Path] = None,
     camera_model: str = "SIMPLE_RADIAL",
     single_camera: bool = True,
     use_gpu: bool = True,
@@ -1110,6 +1375,9 @@ def prepare_colmap_workspace(
     feature_max_image_size: int = 3200,
     max_num_features: int = 20000,
     max_num_matches: int = 131072,
+    load_profile: str = "low-peak",
+    colmap_num_threads: Optional[int] = None,
+    stage_cooldown_s: Optional[int] = None,
     dense_profile: str = "complete",
     run_meshing: bool = True,
     run_floor_completion: bool = True,
@@ -1131,10 +1399,24 @@ def prepare_colmap_workspace(
     ]
     removed_stale_reports = remove_stale_quality_reports(workspace_dir)
     resolved_colmap_exe = find_colmap_exe(root, colmap_dir=colmap_dir, colmap_exe=colmap_exe)
-    dense_profile = dense_profile if dense_profile in DENSE_PROFILES else "complete"
+    resolved_mask_dir = resolve_optional_path(root, colmap_mask_dir)
+    dense_profile = dense_profile if dense_profile in DENSE_PROFILES else "balanced"
+    profile_config = DENSE_PROFILES[dense_profile]
+    load_profile, load_config, effective_num_threads, effective_stage_cooldown_s = resolve_load_settings(
+        load_profile,
+        colmap_num_threads,
+        stage_cooldown_s,
+    )
+    effective_run_meshing = run_meshing and bool(profile_config.get("run_meshing", True))
+    effective_run_floor_completion = run_floor_completion and bool(profile_config.get("run_floor_completion", True))
+    effective_run_dark_surface_completion = run_dark_surface_completion and bool(
+        profile_config.get("run_dark_surface_completion", True)
+    )
 
     copied_images, image_names, missing_images = copy_images(reconstruction_dir, workspace_dir, manifest_rows)
     copied_metadata = copy_metadata(reconstruction_dir, workspace_dir)
+    mask_summary = mask_dir_summary(resolved_mask_dir, image_names)
+    active_mask_dir = resolved_mask_dir if mask_summary.get("enabled") else None
     write_image_list(workspace_dir, image_names)
     match_pairs, match_edge_rows, match_pair_summary = build_constrained_match_pairs(
         manifest_rows=manifest_rows,
@@ -1160,6 +1442,7 @@ def prepare_colmap_workspace(
         root=root,
         workspace_dir=workspace_dir,
         colmap_exe=resolved_colmap_exe,
+        mask_dir=active_mask_dir,
         camera_model=camera_model,
         single_camera=single_camera,
         use_gpu=use_gpu,
@@ -1168,11 +1451,14 @@ def prepare_colmap_workspace(
         feature_max_image_size=feature_max_image_size,
         max_num_features=max_num_features,
         max_num_matches=max_num_matches,
+        num_threads=effective_num_threads,
+        stage_cooldown_s=effective_stage_cooldown_s,
     )
     write_dense_batch(
         root=root,
         workspace_dir=workspace_dir,
         colmap_exe=resolved_colmap_exe,
+        mask_dir=active_mask_dir,
         dense_max_image_size=dense_max_image_size,
         align_to_pdr=align_to_pdr,
         dense_profile=dense_profile,
@@ -1180,6 +1466,8 @@ def prepare_colmap_workspace(
         run_floor_completion=run_floor_completion,
         run_point_cloud_filter=run_point_cloud_filter,
         run_dark_surface_completion=run_dark_surface_completion,
+        num_threads=effective_num_threads,
+        stage_cooldown_s=effective_stage_cooldown_s,
     )
     write_full_batch(workspace_dir)
     write_automatic_batch(
@@ -1193,7 +1481,15 @@ def prepare_colmap_workspace(
     )
     write_gui_batch(root=root, workspace_dir=workspace_dir, colmap_exe=resolved_colmap_exe)
     write_reset_batch(root, workspace_dir)
-    write_readme(workspace_dir, visual_only=visual_only, matcher=matcher, dense_profile=dense_profile)
+    write_readme(
+        workspace_dir,
+        visual_only=visual_only,
+        matcher=matcher,
+        dense_profile=dense_profile,
+        load_profile=load_profile,
+        num_threads=effective_num_threads,
+        stage_cooldown_s=effective_stage_cooldown_s,
+    )
 
     summary_status = "ok" if resolved_colmap_exe.exists() else "missing_colmap_exe"
     summary = {
@@ -1209,6 +1505,7 @@ def prepare_colmap_workspace(
         "existing_colmap_outputs": existing_colmap_outputs,
         "colmap_reset_recommended": bool(existing_colmap_outputs),
         "metadata_files": copied_metadata,
+        "colmap_mask": mask_summary,
         "camera_model": camera_model,
         "single_camera": single_camera,
         "use_gpu": use_gpu,
@@ -1218,17 +1515,25 @@ def prepare_colmap_workspace(
         "feature_max_image_size": feature_max_image_size,
         "max_num_features": max_num_features,
         "max_num_matches": max_num_matches,
+        "load_profile": load_profile,
+        "load_profile_config": load_config,
+        "colmap_num_threads": effective_num_threads,
+        "stage_cooldown_s": effective_stage_cooldown_s,
         "constrained_match_pairs": match_pair_summary,
         "match_graph_edges": "match_graph_edges.csv",
         "pdr_alignment_ref_count": pdr_alignment_ref_count,
         "quality": quality,
         "dense_max_image_size": dense_max_image_size,
         "dense_profile": dense_profile,
-        "dense_profile_config": DENSE_PROFILES[dense_profile],
-        "run_meshing": run_meshing,
-        "run_floor_completion": run_floor_completion,
+        "dense_profile_config": profile_config,
+        "run_meshing": effective_run_meshing,
+        "run_floor_completion": effective_run_floor_completion,
         "run_point_cloud_filter": run_point_cloud_filter,
-        "run_dark_surface_completion": run_dark_surface_completion,
+        "run_dark_surface_completion": effective_run_dark_surface_completion,
+        "cleanup_intermediate_ply": bool(profile_config.get("cleanup_intermediate_ply", True)),
+        "requested_run_meshing": run_meshing,
+        "requested_run_floor_completion": run_floor_completion,
+        "requested_run_dark_surface_completion": run_dark_surface_completion,
         "sparse_model_selection": (
             "run_colmap_dense.bat prefers sparse_pdr_aligned/0 when it exists, otherwise it uses sparse/0."
         ),

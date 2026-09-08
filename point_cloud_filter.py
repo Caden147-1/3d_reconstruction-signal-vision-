@@ -120,6 +120,7 @@ def filter_point_cloud(
     input_path: Path,
     output_path: Path,
     summary_path: Optional[Path],
+    max_points: int,
     bbox_quantile: float,
     bbox_padding_ratio: float,
     radial_quantile: float,
@@ -127,7 +128,7 @@ def filter_point_cloud(
     min_neighbors: int,
     skip_density: bool,
 ) -> Dict[str, Any]:
-    properties, rows, io_summary = read_ply_vertices(input_path)
+    properties, rows, io_summary = read_ply_vertices(input_path, max_vertices=max_points)
     xyz = xyz_indices(properties)
     points = [row_xyz(row, xyz) for row in rows]
     if len(points) < 10:
@@ -178,12 +179,16 @@ def filter_point_cloud(
     )
 
     input_count = len(rows)
+    declared_count = int(io_summary.get("declared_vertex_count") or input_count)
     summary = {
         "status": "ok",
         "input": str(input_path.resolve()),
         "output": str(output_path.resolve()),
         "method": "robust_bbox_radial_clip_voxel_density",
         "input_vertex_count": input_count,
+        "source_vertex_count": declared_count,
+        "max_points": max_points,
+        "sample_stride": io_summary.get("sample_stride", 1),
         "output_vertex_count": written_count,
         "removed_vertex_count": input_count - written_count,
         "removed_ratio": round((input_count - written_count) / input_count, 6) if input_count else 0.0,
@@ -216,6 +221,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--summary", type=Path)
+    parser.add_argument("--max-points", type=int, default=750000, help="Uniformly sample very large PLY files before filtering; use 0 to keep every point.")
     parser.add_argument("--bbox-quantile", type=float, default=0.001)
     parser.add_argument("--bbox-padding-ratio", type=float, default=0.05)
     parser.add_argument("--radial-quantile", type=float, default=0.9995)
@@ -231,6 +237,7 @@ def main() -> int:
         input_path=args.input,
         output_path=args.output,
         summary_path=args.summary,
+        max_points=args.max_points,
         bbox_quantile=args.bbox_quantile,
         bbox_padding_ratio=args.bbox_padding_ratio,
         radial_quantile=args.radial_quantile,
