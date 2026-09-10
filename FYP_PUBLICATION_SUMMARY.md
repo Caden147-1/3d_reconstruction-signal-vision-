@@ -258,6 +258,7 @@ The project codebase is modular:
 | `localize_wifi.py` | Estimates position from a new WiFi scan |
 | `colmap_bridge.py` | Prepares COLMAP workspace, constrained match pairs, scripts, and metadata |
 | `run_colmap.py` | Runs generated COLMAP batch scripts from the project root |
+| `trajectory_contour.py` | Builds a continuous, uncertainty-aware IMU/PDR route contour for matching and coverage diagnostics |
 
 The default run command is:
 
@@ -294,12 +295,18 @@ python run_colmap.py dense
    WiFi checkpoints and IMU/PDR coordinates are not treated as black-box reconstruction inputs. They are exported as image manifests, pose seeds, PDR alignment references, and weighted match-graph reasons that explain why each image pair is allowed to match.
 
 7. **Constrained COLMAP matching**
-   The system generates `match_pairs.txt` and `match_graph_edges.csv` based on route order, checkpoint adjacency, image slot direction, PDR distance, and video frame continuity. This reduces the chance of matching visually similar but spatially unrelated indoor images.
+   The system generates `match_pairs.txt` and `match_graph_edges.csv` based on route order, checkpoint adjacency, image slot direction, along-route PDR contour distance, and video frame continuity. This reduces the chance of matching visually similar but spatially unrelated indoor images.
 
-8. **WiFi fingerprint localization support**
+8. **P1 image-similarity diagnostics**
+   The workspace now evaluates constrained match-pair candidates with perceptual hash, color histogram, ORB feature overlap, and fundamental-matrix inliers. The outputs `image_similarity_edges.csv` and `image_similarity_summary.json` provide visual-support evidence without silently deleting COLMAP pairs.
+
+9. **P2 continuous trajectory contour**
+   The ordered IMU/PDR steps are exported as a bounded capture-route corridor. WiFi scans remain sparse fingerprint/checkpoint anchors on this route, and P2 uses along-route distance as a soft matching constraint. It neither turns the WiFi-point convex hull into a room outline nor inserts synthetic geometry into `dense/final.ply`.
+
+10. **WiFi fingerprint localization support**
    The project exports a reusable WiFi localization model and evaluation files, allowing future localization from new WiFi scans.
 
-9. **Reproducible project structure**
+11. **Reproducible project structure**
    The pipeline produces standardized folders such as `processed/`, `reconstruction_dataset/`, and `colmap_workspace/`, making experiments easier to repeat and debug.
 
 ## Current Run Snapshot
@@ -318,6 +325,8 @@ Current deliverables:
 - Route video frame extraction with 17 retained video bridge frames from `video/IMG_1735.MOV`.
 - A reconstruction dataset containing 277 exported images, pose seeds, WiFi fingerprints, signal boundaries, and video metadata.
 - A PDR-enabled COLMAP workspace with constrained matching pairs and PDR alignment references.
+- P1 image-similarity diagnostics for constrained match-pair candidates in the COLMAP workspace.
+- P2 route-contour metadata and along-route constrained match-pair support.
 - A WiFi localization model, leave-one-out evaluation, signal grid, and signal boundary outputs.
 - COLMAP sparse/dense scripts ready to run after resetting older COLMAP outputs in the workspace.
 
@@ -378,7 +387,7 @@ The preprocessing and export outputs are now regenerated from the current defaul
 | `reconstruction_dataset/` | Regenerated with 277 images | Use as current COLMAP input dataset |
 | `wifi_localization_model.json` and evaluation files | Regenerated and copied to metadata | Use as lightweight WiFi baseline, not navigation-grade accuracy |
 | `colmap_workspace/database.db` and `sparse/` | Present, but quality report says `needs_colmap_rerun` because database/image-list freshness is inconsistent | Use only as diagnostic evidence until clean rerun |
-| `colmap_workspace/dense/final.ply` | Present, 2,448,105 vertices and 4,801,827 faces from Poisson mesh | Report as current diagnostic dense output, not as final clean-run evidence |
+| `colmap_workspace/dense/final.ply` | Present, 2,268,717 vertices and 4,443,514 faces from the Poisson mesh | Report as current diagnostic dense output, not as final clean-run evidence |
 
 ### WiFi Localization Interpretation
 

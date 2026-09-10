@@ -337,6 +337,10 @@ def bind_frame_to_route(
             "pdr_x": "",
             "pdr_y": "",
             "pdr_bind_source": "no_anchor_points",
+            "trajectory_contour_id": "",
+            "trajectory_contour_distance_m": "",
+            "trajectory_distance_m": "",
+            "trajectory_position_source": "unavailable",
         }
 
     if len(points) == 1 or frame_count <= 1:
@@ -351,6 +355,10 @@ def bind_frame_to_route(
             "pdr_x": point.get("pdr_x", ""),
             "pdr_y": point.get("pdr_y", ""),
             "pdr_bind_source": "single_anchor_point",
+            "trajectory_contour_id": point.get("trajectory_contour_id", ""),
+            "trajectory_contour_distance_m": point.get("trajectory_contour_distance_m", ""),
+            "trajectory_distance_m": point.get("trajectory_distance_m", ""),
+            "trajectory_position_source": "single_checkpoint_anchor",
         }
 
     max_frame_index = max(0, frame_count - 1)
@@ -363,6 +371,9 @@ def bind_frame_to_route(
     left = points[left_index]
     right = points[right_index]
     nearest = left if ratio <= 0.5 else right
+    left_contour_id = left.get("trajectory_contour_id", "")
+    right_contour_id = right.get("trajectory_contour_id", "")
+    shared_contour_id = left_contour_id if left_contour_id and left_contour_id == right_contour_id else ""
 
     return {
         "bind_type": "order_interpolated_video_base",
@@ -374,6 +385,12 @@ def bind_frame_to_route(
         "pdr_x": interpolate_value(left, right, "pdr_x", ratio),
         "pdr_y": interpolate_value(left, right, "pdr_y", ratio),
         "pdr_bind_source": "route_order_interpolation",
+        "trajectory_contour_id": shared_contour_id,
+        "trajectory_contour_distance_m": interpolate_value(left, right, "trajectory_contour_distance_m", ratio)
+        if shared_contour_id
+        else "",
+        "trajectory_distance_m": interpolate_value(left, right, "trajectory_distance_m", ratio),
+        "trajectory_position_source": "checkpoint_order_interpolation",
     }
 
 

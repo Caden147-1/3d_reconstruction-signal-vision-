@@ -423,7 +423,7 @@ def build_signal_grid(
                 "pdr_y": round(y, 6),
                 "nearest_point_index": source["point_index"],
                 "nearest_global_point_index": source["global_point_index"],
-                "source": "wifi_pdr_convex_hull_with_rssi_metrics",
+                "source": "wifi_fingerprint_convex_hull_for_rssi_interpolation_not_physical_boundary",
             }
         )
         boundary_rows.append(metrics)
@@ -432,6 +432,7 @@ def build_signal_grid(
         "grid_rows": len(grid_rows),
         "cell_size_m": cell_size_m,
         "hull_point_count": len(hull),
+        "domain_semantics": "wifi_fingerprint_interpolation_envelope_not_route_or_room_boundary",
         "min_x": round(min_x, 6),
         "max_x": round(max_x, 6),
         "min_y": round(min_y, 6),

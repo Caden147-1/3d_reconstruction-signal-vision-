@@ -43,10 +43,6 @@ STALE_COLMAP_OUTPUTS = (
     "final_output_summary.json",
     "meshed-poisson.ply",
     "meshed-delaunay.ply",
-    "floor_completed_mesh.ply",
-    "floor_completion_summary.json",
-    "dark_surface_completed_mesh.ply",
-    "dark_surface_completion_summary.json",
     "fused_filtered.ply",
     "point_filter_summary.json",
     "quality_report.json",
@@ -290,12 +286,8 @@ def build_upfront_runtime_estimate(workspace: Path) -> dict[str, Any]:
     post_dense_factor = 0.05
     if summary.get("run_meshing"):
         post_dense_factor += 0.16
-    if summary.get("run_floor_completion"):
-        post_dense_factor += 0.02
     if summary.get("run_point_cloud_filter"):
         post_dense_factor += 0.03
-    if summary.get("run_dark_surface_completion"):
-        post_dense_factor += 0.01
     post_dense_factor += 0.01
     post_dense_seconds = patchmatch_seconds * post_dense_factor
     cooldown_count = 0
@@ -305,10 +297,6 @@ def build_upfront_runtime_estimate(workspace: Path) -> dict[str, Any]:
             cooldown_count += 1
         if summary.get("run_meshing"):
             cooldown_count += 2
-        if summary.get("run_floor_completion"):
-            cooldown_count += 1
-        if summary.get("run_dark_surface_completion"):
-            cooldown_count += 1
     cooldown_seconds = stage_cooldown_s * cooldown_count
 
     stages = [
@@ -318,7 +306,7 @@ def build_upfront_runtime_estimate(workspace: Path) -> dict[str, Any]:
         ("Sparse: mapper + PDR alignment + report", *estimate_range(mapper_seconds, 0.55)),
         ("Dense: image undistortion", *estimate_range(dense_undistort_seconds, 0.45)),
         ("Dense: PatchMatch stereo", *estimate_range(patchmatch_seconds, 0.50)),
-        ("Dense: fusion + filtering + meshing + completion/report", *estimate_range(post_dense_seconds, 0.60)),
+        ("Dense: fusion + filtering + meshing + report", *estimate_range(post_dense_seconds, 0.60)),
     ]
     if cooldown_seconds > 0:
         stages.append((f"Low-peak cooldown waits ({cooldown_count}x)", cooldown_seconds, cooldown_seconds))
@@ -662,12 +650,8 @@ def post_patch_tail_factor(script: Path) -> float:
         factor += 0.08
     if "poisson_mesher" in text:
         factor += 0.08
-    if "floor_plane_completion.py" in text:
-        factor += 0.02
     if "point_cloud_filter.py" in text:
         factor += 0.03
-    if "dark_surface_completion.py" in text:
-        factor += 0.01
     if "reconstruction_quality.py" in text:
         factor += 0.01
     return factor

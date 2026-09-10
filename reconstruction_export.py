@@ -267,7 +267,7 @@ def build_boundary_rows(point_rows: Sequence[Dict[str, str]]) -> Tuple[List[Dict
                 "global_point_index": source.get("global_point_index", ""),
                 "pdr_x": round(coord[0], 6),
                 "pdr_y": round(coord[1], 6),
-                "source": "convex_hull_of_wifi_points",
+                "source": "convex_hull_of_wifi_checkpoint_samples_not_route_contour",
             }
         )
 
@@ -306,7 +306,9 @@ This folder is generated from `processed/image_wifi_long.csv`,
   Z is a configurable camera height, and yaw is assigned from image slot order.
 - `wifi_fingerprint_library.csv`: one row per WiFi point, with selected AP RSSI columns.
 - `wifi_boundary_seed.csv`: convex hull of WiFi/PDR point positions, useful as a rough
-  boundary seed rather than a final room outline.
+  WiFi interpolation envelope rather than a route contour or final room outline.
+- `pdr_trajectory_contour.csv`: continuous IMU/PDR capture-route corridor. It is a
+  soft matching and coverage constraint, not a 3D mesh-completion input.
 - `wifi_localization_model.json`: generated later by the WiFi positioning step.
 - `wifi_localization_eval.csv`: leave-one-out fingerprint localization evaluation.
 - `wifi_signal_grid.csv`: interpolated RSSI field over the sampled area.
@@ -318,7 +320,8 @@ This folder is generated from `processed/image_wifi_long.csv`,
 Use `images/` or `colmap_image_list.txt` as the image input for COLMAP/COMPLab.
 Use `camera_pose_seed.csv` as metadata for alignment and debugging. It is not a
 calibrated camera model. Use `wifi_fingerprint_library.csv` for later indoor
-localization, and use `wifi_boundary_seed.csv` as a soft spatial constraint.
+localization. `wifi_boundary_seed.csv` only bounds RSSI interpolation; use the
+time-ordered `pdr_trajectory_contour.csv` for route continuity.
 The WiFi positioning step turns this fingerprint library into a KNN localization
 model and an RSSI boundary/grid model. Video frames are weak visual base images;
 they are not added to the WiFi fingerprint library.
@@ -417,6 +420,10 @@ def export_reconstruction_dataset(
             "left_global_point_index": row.get("global_point_index", ""),
             "right_global_point_index": row.get("global_point_index", ""),
             "route_ratio": "",
+            "trajectory_contour_id": row.get("trajectory_contour_id", ""),
+            "trajectory_contour_distance_m": row.get("trajectory_contour_distance_m", ""),
+            "trajectory_distance_m": row.get("trajectory_distance_m", ""),
+            "trajectory_position_source": "checkpoint_timestamp_interpolation",
         }
         manifest_rows.append({**common, **pose_seed})
         pose_rows.append(
@@ -477,6 +484,10 @@ def export_reconstruction_dataset(
             "left_global_point_index": row.get("left_global_point_index", ""),
             "right_global_point_index": row.get("right_global_point_index", ""),
             "route_ratio": row.get("route_ratio", ""),
+            "trajectory_contour_id": row.get("trajectory_contour_id", ""),
+            "trajectory_contour_distance_m": row.get("trajectory_contour_distance_m", ""),
+            "trajectory_distance_m": row.get("trajectory_distance_m", ""),
+            "trajectory_position_source": row.get("trajectory_position_source", "checkpoint_order_interpolation"),
         }
         manifest_rows.append({**common, **pose_seed})
         pose_rows.append(
@@ -525,6 +536,10 @@ def export_reconstruction_dataset(
         "left_global_point_index",
         "right_global_point_index",
         "route_ratio",
+        "trajectory_contour_id",
+        "trajectory_contour_distance_m",
+        "trajectory_distance_m",
+        "trajectory_position_source",
         "pdr_x",
         "pdr_y",
         "pdr_z",
@@ -594,6 +609,16 @@ def export_reconstruction_dataset(
             if stale_path.exists():
                 stale_path.unlink()
 
+    for optional_name in (
+        "pdr_trajectory_contour.csv",
+        "pdr_trajectory_edges.csv",
+        "pdr_trajectory_contour_summary.json",
+    ):
+        source = processed_dir / optional_name
+        if source.exists():
+            shutil.copy2(source, output_dir / optional_name)
+            copied_optional_metadata.append(optional_name)
+
     point_image_counts: Dict[str, int] = {point_key(row): 0 for row in point_rows}
     for row in manifest_rows:
         if row.get("source_type") != "wifi_anchor_photo":
@@ -650,6 +675,8 @@ def export_reconstruction_dataset(
             "camera_pose_seed": "camera_pose_seed.csv",
             "wifi_fingerprint_library": "wifi_fingerprint_library.csv",
             "wifi_boundary_seed": "wifi_boundary_seed.csv",
+            "trajectory_contour": "pdr_trajectory_contour.csv",
+            "trajectory_edges": "pdr_trajectory_edges.csv",
             "video_frames_manifest": "video_frames_manifest.csv",
         },
     }

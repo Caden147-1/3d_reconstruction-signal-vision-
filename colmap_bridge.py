@@ -9,6 +9,8 @@ import shutil
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from image_similarity import analyze_workspace_image_similarity
+
 
 METADATA_FILES = [
     "images_manifest.csv",
@@ -22,6 +24,9 @@ METADATA_FILES = [
     "wifi_signal_grid.csv",
     "video_frames_manifest.csv",
     "video_frames_summary.json",
+    "pdr_trajectory_contour.csv",
+    "pdr_trajectory_edges.csv",
+    "pdr_trajectory_contour_summary.json",
     "export_summary.json",
 ]
 
@@ -42,12 +47,8 @@ DENSE_PROFILES: Dict[str, Dict[str, Any]] = {
             "check_num_images": 60,
         },
         "run_meshing": True,
-        "run_floor_completion": True,
-        "run_dark_surface_completion": True,
         "cleanup_intermediate_ply": True,
         "point_filter_max_points": 600000,
-        "floor_completion_max_points": 200000,
-        "dark_surface_max_points": 200000,
     },
     "rtx4080": {
         "description": (
@@ -72,12 +73,8 @@ DENSE_PROFILES: Dict[str, Dict[str, Any]] = {
             "check_num_images": 100,
         },
         "run_meshing": True,
-        "run_floor_completion": True,
-        "run_dark_surface_completion": True,
         "cleanup_intermediate_ply": True,
         "point_filter_max_points": 900000,
-        "floor_completion_max_points": 300000,
-        "dark_surface_max_points": 300000,
     },
     "complete": {
         "description": (
@@ -104,12 +101,8 @@ DENSE_PROFILES: Dict[str, Dict[str, Any]] = {
             "check_num_images": 120,
         },
         "run_meshing": True,
-        "run_floor_completion": True,
-        "run_dark_surface_completion": True,
         "cleanup_intermediate_ply": True,
         "point_filter_max_points": 1200000,
-        "floor_completion_max_points": 400000,
-        "dark_surface_max_points": 400000,
     },
 }
 
@@ -136,6 +129,7 @@ LOAD_PROFILES: Dict[str, Dict[str, Any]] = {
 REASON_BASE_WEIGHTS: Dict[str, float] = {
     "same_wifi_point_nearby_slots": 1.00,
     "nearby_wifi_points": 0.88,
+    "nearby_trajectory_points": 0.82,
     "nearby_pdr_points": 0.74,
     "video_sequence": 0.70,
     "video_to_wifi_anchor": 0.62,
@@ -220,12 +214,13 @@ def copy_images(
     reconstruction_dir: Path,
     workspace_dir: Path,
     manifest_rows: Sequence[Dict[str, str]],
-) -> Tuple[int, List[str], List[str]]:
+) -> Tuple[int, List[str], List[str], List[str]]:
     source_images_dir = reconstruction_dir / "images"
     target_images_dir = workspace_dir / "images"
     target_images_dir.mkdir(parents=True, exist_ok=True)
 
     image_names: List[str] = []
+    copied_image_names: List[str] = []
     missing: List[str] = []
     copied = 0
     for row in manifest_rows:
@@ -239,8 +234,20 @@ def copy_images(
             missing.append(str(source))
             continue
         shutil.copy2(source, target)
+        copied_image_names.append(image_file)
         copied += 1
-    return copied, image_names, missing
+
+    expected_names = set(copied_image_names)
+    removed_stale: List[str] = []
+    for target in target_images_dir.iterdir():
+        if not target.is_file() or target.name in expected_names:
+            continue
+        try:
+            target.unlink()
+        except OSError:
+            continue
+        removed_stale.append(target.name)
+    return copied, image_names, missing, removed_stale
 
 
 def copy_metadata(reconstruction_dir: Path, workspace_dir: Path) -> List[str]:
@@ -282,6 +289,22 @@ def point_distance(row_a: Dict[str, str], row_b: Dict[str, str]) -> float:
     if any(math.isnan(value) for value in (ax, ay, bx, by)):
         return math.inf
     return math.hypot(ax - bx, ay - by)
+
+
+def trajectory_coordinate(row: Dict[str, str]) -> Optional[Tuple[str, float]]:
+    contour_id = str(row.get("trajectory_contour_id", "")).strip()
+    distance_m = safe_float(row.get("trajectory_contour_distance_m"))
+    if not contour_id or not math.isfinite(distance_m):
+        return None
+    return contour_id, distance_m
+
+
+def trajectory_distance(row_a: Dict[str, str], row_b: Dict[str, str]) -> float:
+    left = trajectory_coordinate(row_a)
+    right = trajectory_coordinate(row_b)
+    if left is None or right is None or left[0] != right[0]:
+        return math.inf
+    return abs(left[1] - right[1])
 
 
 def bounded_score(value: Optional[float], scale: float) -> float:
@@ -345,6 +368,7 @@ def score_match_edge(
     row_b: Dict[str, str],
     reason: str,
     pdr_distance: float,
+    trajectory_distance_m: float,
     point_window: int,
     slot_window: int,
     max_pdr_distance_m: float,
@@ -355,18 +379,21 @@ def score_match_edge(
     slot_gap = pair_slot_gap(row_a, row_b)
     video_gap = pair_video_sequence_gap(row_a, row_b)
     pdr_score = 1.0 if visual_only else bounded_score(pdr_distance, max_pdr_distance_m)
+    trajectory_score = 1.0 if visual_only else bounded_score(trajectory_distance_m, max_pdr_distance_m)
     slot_score = bounded_score(float(slot_gap) if slot_gap is not None else None, max(1.0, float(slot_window)))
     point_score = bounded_score(float(point_gap) if point_gap is not None else None, max(1.0, float(point_window + 1)))
     video_score = bounded_score(float(video_gap) if video_gap is not None else None, max(1.0, float(video_frame_window)))
 
     if reason == "same_wifi_point_nearby_slots":
-        combined = 0.35 * pdr_score + 0.45 * slot_score + 0.20 * point_score
+        combined = 0.20 * pdr_score + 0.20 * trajectory_score + 0.40 * slot_score + 0.20 * point_score
+    elif reason == "nearby_trajectory_points":
+        combined = 0.10 * pdr_score + 0.65 * trajectory_score + 0.15 * slot_score + 0.10 * point_score
     elif reason == "video_sequence":
-        combined = 0.45 * pdr_score + 0.15 * point_score + 0.40 * video_score
+        combined = 0.20 * pdr_score + 0.25 * trajectory_score + 0.15 * point_score + 0.40 * video_score
     elif reason == "video_to_wifi_anchor":
-        combined = 0.45 * pdr_score + 0.35 * point_score + 0.20 * video_score
+        combined = 0.20 * pdr_score + 0.25 * trajectory_score + 0.35 * point_score + 0.20 * video_score
     else:
-        combined = 0.50 * pdr_score + 0.25 * slot_score + 0.25 * point_score
+        combined = 0.30 * pdr_score + 0.35 * trajectory_score + 0.20 * slot_score + 0.15 * point_score
 
     reason_weight = REASON_BASE_WEIGHTS.get(reason, 0.60)
     pair_weight = source_pair_weight(row_a, row_b)
@@ -376,13 +403,14 @@ def score_match_edge(
         "reason_weight": round(reason_weight, 6),
         "source_pair_weight": round(pair_weight, 6),
         "pdr_score": round(pdr_score, 6),
+        "trajectory_score": round(trajectory_score, 6),
         "slot_score": round(slot_score, 6),
         "point_score": round(point_score, 6),
         "video_score": round(video_score, 6),
         "point_gap": "" if point_gap is None else point_gap,
         "slot_gap": "" if slot_gap is None else slot_gap,
         "video_sequence_gap": "" if video_gap is None else video_gap,
-        "edge_weight_basis": "reason_source_pdr_slot_point_video",
+        "edge_weight_basis": "reason_source_pdr_trajectory_slot_point_video",
     }
 
 
@@ -466,9 +494,14 @@ def build_constrained_match_pairs(
             return None
         return x, y
 
+    trajectory_constraint_available = (
+        not visual_only
+        and len(point_row_by_id) >= 2
+        and all(trajectory_coordinate(row) is not None for row in point_row_by_id.values())
+    )
     pdr_cell_size = max(1e-6, max_pdr_distance_m)
     pdr_grid: Dict[Tuple[int, int], List[int]] = {}
-    if not visual_only and max_pdr_distance_m > 0:
+    if not visual_only and not trajectory_constraint_available and max_pdr_distance_m > 0:
         for point, row in point_row_by_id.items():
             xy = row_xy(row)
             if xy is None:
@@ -476,8 +509,24 @@ def build_constrained_match_pairs(
             cell = (math.floor(xy[0] / pdr_cell_size), math.floor(xy[1] / pdr_cell_size))
             pdr_grid.setdefault(cell, []).append(point)
 
+    def nearby_trajectory_points(row: Dict[str, str]) -> List[int]:
+        if not trajectory_constraint_available or max_pdr_distance_m <= 0:
+            return []
+        coordinate = trajectory_coordinate(row)
+        if coordinate is None:
+            return []
+        contour_id, route_distance_m = coordinate
+        return [
+            point
+            for point, point_row in point_row_by_id.items()
+            if point_row.get("session") == row.get("session")
+            and (other := trajectory_coordinate(point_row)) is not None
+            and other[0] == contour_id
+            and abs(other[1] - route_distance_m) <= max_pdr_distance_m
+        ]
+
     def nearby_pdr_points(row: Dict[str, str]) -> List[int]:
-        if visual_only or max_pdr_distance_m <= 0:
+        if visual_only or trajectory_constraint_available or max_pdr_distance_m <= 0:
             return []
         xy = row_xy(row)
         if xy is None:
@@ -492,18 +541,34 @@ def build_constrained_match_pairs(
                         nearby.append(point)
         return nearby
 
-    candidate_point_pairs: set[Tuple[int, int]] = set()
+    candidate_point_reasons: Dict[Tuple[int, int], str] = {}
+
+    def add_candidate(point_a: int, point_b: int, reason: str) -> None:
+        if point_a == point_b:
+            return
+        left, right = sorted((point_a, point_b))
+        row_a = point_row_by_id.get(left)
+        row_b = point_row_by_id.get(right)
+        if row_a is None or row_b is None or row_a.get("session") != row_b.get("session"):
+            return
+        key = (left, right)
+        current_reason = candidate_point_reasons.get(key)
+        if current_reason is None or REASON_BASE_WEIGHTS.get(reason, 0.0) > REASON_BASE_WEIGHTS.get(current_reason, 0.0):
+            candidate_point_reasons[key] = reason
+
     for left_index, point_a in enumerate(points):
         for point_b in points[left_index + 1 :]:
             if point_b - point_a > point_window:
                 break
-            candidate_point_pairs.add((point_a, point_b))
-        for point_b in nearby_pdr_points(point_row_by_id[point_a]):
-            if point_b > point_a:
-                candidate_point_pairs.add((point_a, point_b))
+            add_candidate(point_a, point_b, "nearby_wifi_points")
+        if trajectory_constraint_available:
+            for point_b in nearby_trajectory_points(point_row_by_id[point_a]):
+                add_candidate(point_a, point_b, "nearby_trajectory_points")
+        else:
+            for point_b in nearby_pdr_points(point_row_by_id[point_a]):
+                add_candidate(point_a, point_b, "nearby_pdr_points")
 
-    for point_a, point_b in sorted(candidate_point_pairs):
-        point_gap = point_b - point_a
+    for (point_a, point_b), reason in sorted(candidate_point_reasons.items()):
         rows_a = by_point[point_a]
         rows_b = by_point[point_b]
         slot_count = anchor_slot_count(rows_a + rows_b)
@@ -515,7 +580,6 @@ def build_constrained_match_pairs(
                     slot_count,
                 )
                 if slot_gap <= slot_window:
-                    reason = "nearby_wifi_points" if point_gap <= point_window else "nearby_pdr_points"
                     add_pair(row_a, row_b, reason)
 
     video_rows = [row for row in manifest_rows if row.get("image_file") and is_video_frame_row(row)]
@@ -546,7 +610,10 @@ def build_constrained_match_pairs(
                     candidate_points.add(neighbor)
 
         if not candidate_points and not visual_only:
-            candidate_points.update(nearby_pdr_points(video_row))
+            if trajectory_constraint_available:
+                candidate_points.update(nearby_trajectory_points(video_row))
+            else:
+                candidate_points.update(nearby_pdr_points(video_row))
 
         candidate_anchor_rows: List[Dict[str, str]] = []
         for point in sorted(candidate_points):
@@ -573,11 +640,13 @@ def build_constrained_match_pairs(
         row_b = row_by_image.get(image_b, {})
         reason = pairs[(image_a, image_b)]
         pdr_distance = point_distance(row_a, row_b)
+        route_distance_m = trajectory_distance(row_a, row_b)
         edge_scores = score_match_edge(
             row_a=row_a,
             row_b=row_b,
             reason=reason,
             pdr_distance=pdr_distance,
+            trajectory_distance_m=route_distance_m,
             point_window=point_window,
             slot_window=slot_window,
             max_pdr_distance_m=max_pdr_distance_m,
@@ -600,6 +669,9 @@ def build_constrained_match_pairs(
                 "video_sequence_index_a": row_a.get("video_sequence_index", ""),
                 "video_sequence_index_b": row_b.get("video_sequence_index", ""),
                 "pdr_distance_m": "" if visual_only or math.isinf(pdr_distance) else round(pdr_distance, 6),
+                "trajectory_contour_id_a": row_a.get("trajectory_contour_id", ""),
+                "trajectory_contour_id_b": row_b.get("trajectory_contour_id", ""),
+                "trajectory_distance_m": "" if visual_only or math.isinf(route_distance_m) else round(route_distance_m, 6),
                 **edge_scores,
             }
         )
@@ -612,10 +684,13 @@ def build_constrained_match_pairs(
         "point_window": point_window,
         "slot_window": slot_window,
         "max_pdr_distance_m": None if visual_only else max_pdr_distance_m,
+        "max_trajectory_distance_m": None if visual_only else max_pdr_distance_m,
+        "trajectory_constraint_available": trajectory_constraint_available,
+        "trajectory_constraint_mode": "ordered_contour" if trajectory_constraint_available else "legacy_pdr_proximity",
         "video_frame_window": video_frame_window,
         "video_anchor_point_window": video_anchor_point_window,
         "video_anchor_limit": video_anchor_limit,
-        "candidate_point_pair_count": len(candidate_point_pairs),
+        "candidate_point_pair_count": len(candidate_point_reasons),
         "reason_counts": {},
         "weighted_graph": True,
         "edge_weight": {"min": None, "mean": None, "max": None},
@@ -664,6 +739,7 @@ def write_match_graph_edges(workspace_dir: Path, edge_rows: Sequence[Dict[str, A
             "reason_weight",
             "source_pair_weight",
             "pdr_score",
+            "trajectory_score",
             "slot_score",
             "point_score",
             "video_score",
@@ -682,6 +758,9 @@ def write_match_graph_edges(workspace_dir: Path, edge_rows: Sequence[Dict[str, A
             "video_sequence_index_a",
             "video_sequence_index_b",
             "pdr_distance_m",
+            "trajectory_contour_id_a",
+            "trajectory_contour_id_b",
+            "trajectory_distance_m",
         ],
         edge_rows,
     )
@@ -813,6 +892,16 @@ echo [load] Low-peak thread cap: {num_threads}
 def remove_stale_quality_reports(workspace_dir: Path) -> List[str]:
     removed: List[str] = []
     for name in ("quality_report.json", "QUALITY_REPORT.md"):
+        path = workspace_dir / name
+        if path.exists():
+            path.unlink()
+            removed.append(name)
+    return removed
+
+
+def remove_stale_image_similarity_outputs(workspace_dir: Path) -> List[str]:
+    removed: List[str] = []
+    for name in ("image_similarity_edges.csv", "image_similarity_summary.json"):
         path = workspace_dir / name
         if path.exists():
             path.unlink()
@@ -1028,16 +1117,12 @@ def write_dense_batch(
     align_to_pdr: bool,
     dense_profile: str,
     run_meshing: bool,
-    run_floor_completion: bool,
     run_point_cloud_filter: bool,
-    run_dark_surface_completion: bool,
     num_threads: int,
     stage_cooldown_s: int,
 ) -> None:
     profile = dense_profile_config(dense_profile)
     point_filter_max_points = int(profile.get("point_filter_max_points", 600000))
-    floor_completion_max_points = int(profile.get("floor_completion_max_points", 200000))
-    dark_surface_max_points = int(profile.get("dark_surface_max_points", 200000))
     cleanup_intermediate_ply = bool(profile.get("cleanup_intermediate_ply", True))
     after_undistort_cooldown = cooldown_block(stage_cooldown_s, "image undistortion")
     after_patchmatch_cooldown = cooldown_block(stage_cooldown_s, "PatchMatch stereo")
@@ -1118,38 +1203,6 @@ echo [6/8] Building a Poisson mesh for smoother surface inspection...
 if errorlevel 1 echo [warn] Poisson meshing failed; continuing with fused point cloud.
 {after_postprocess_cooldown}
 """
-    floor_block = ""
-    if run_floor_completion and profile.get("run_floor_completion", True):
-        floor_block = f"""
-echo [7/8] Estimating an explainable floor plane completion layer...
-if not exist "%ROOT%\\floor_plane_completion.py" (
-  echo [warn] floor_plane_completion.py not found; skipping floor completion.
-) else (
-  python "%ROOT%\\floor_plane_completion.py" ^
-    --input "%DENSE_POINT_CLOUD%" ^
-    --output "%WORKSPACE%\\dense\\floor_completed_mesh.ply" ^
-    --summary "%WORKSPACE%\\dense\\floor_completion_summary.json" ^
-    --max-points {floor_completion_max_points}
-  if errorlevel 1 echo [warn] Floor completion failed; raw COLMAP outputs are still available.
-)
-{after_postprocess_cooldown}
-"""
-    dark_surface_block = ""
-    if run_dark_surface_completion and profile.get("run_dark_surface_completion", True):
-        dark_surface_block = f"""
-echo [8/8] Estimating a dark low-texture surface completion layer...
-if not exist "%ROOT%\\dark_surface_completion.py" (
-  echo [warn] dark_surface_completion.py not found; skipping dark surface completion.
-) else (
-  python "%ROOT%\\dark_surface_completion.py" ^
-    --input "%DENSE_POINT_CLOUD%" ^
-    --output "%WORKSPACE%\\dense\\dark_surface_completed_mesh.ply" ^
-    --summary "%WORKSPACE%\\dense\\dark_surface_completion_summary.json" ^
-    --max-points {dark_surface_max_points}
-  if errorlevel 1 echo [warn] Dark surface completion failed; raw COLMAP outputs are still available.
-)
-{after_postprocess_cooldown}
-"""
     quality_block = """
 python "%ROOT%\\reconstruction_quality.py" --workspace "%WORKSPACE%" --summary "%WORKSPACE%\\quality_report.json" --markdown "%WORKSPACE%\\QUALITY_REPORT.md"
 if errorlevel 1 echo [warn] Final quality report failed; reconstruction outputs are still available.
@@ -1178,10 +1231,6 @@ if exist "%WORKSPACE%\\dense\\meshed-poisson.ply" del "%WORKSPACE%\\dense\\meshe
 if exist "%WORKSPACE%\\dense\\meshed-delaunay.ply" del "%WORKSPACE%\\dense\\meshed-delaunay.ply"
 if exist "%WORKSPACE%\\dense\\fused_filtered.ply" del "%WORKSPACE%\\dense\\fused_filtered.ply"
 if exist "%WORKSPACE%\\dense\\point_filter_summary.json" del "%WORKSPACE%\\dense\\point_filter_summary.json"
-if exist "%WORKSPACE%\\dense\\floor_completed_mesh.ply" del "%WORKSPACE%\\dense\\floor_completed_mesh.ply"
-if exist "%WORKSPACE%\\dense\\floor_completion_summary.json" del "%WORKSPACE%\\dense\\floor_completion_summary.json"
-if exist "%WORKSPACE%\\dense\\dark_surface_completed_mesh.ply" del "%WORKSPACE%\\dense\\dark_surface_completed_mesh.ply"
-if exist "%WORKSPACE%\\dense\\dark_surface_completion_summary.json" del "%WORKSPACE%\\dense\\dark_surface_completion_summary.json"
 if exist "%WORKSPACE%\\dense\\fused.ply.vis" del "%WORKSPACE%\\dense\\fused.ply.vis"
 
 echo [1/8] Undistorting images...
@@ -1199,7 +1248,7 @@ echo [3/8] Fusing dense point cloud...
 if errorlevel 1 exit /b %errorlevel%
 {after_fusion_cooldown}
 
-{point_filter_block}{mesh_block}{floor_block}{dark_surface_block}{finalize_block}{quality_block}
+{point_filter_block}{mesh_block}{finalize_block}{quality_block}
 if exist "%WORKSPACE%\\dense\\final.ply" echo [done] Final dense model: %WORKSPACE%\\dense\\final.ply
 """
     write_text(workspace_dir / "run_colmap_dense.bat", content)
@@ -1276,10 +1325,6 @@ if exist "%WORKSPACE%meshed-poisson.ply" del "%WORKSPACE%meshed-poisson.ply"
 if exist "%WORKSPACE%meshed-delaunay.ply" del "%WORKSPACE%meshed-delaunay.ply"
 if exist "%WORKSPACE%fused_filtered.ply" del "%WORKSPACE%fused_filtered.ply"
 if exist "%WORKSPACE%point_filter_summary.json" del "%WORKSPACE%point_filter_summary.json"
-if exist "%WORKSPACE%floor_completed_mesh.ply" del "%WORKSPACE%floor_completed_mesh.ply"
-if exist "%WORKSPACE%floor_completion_summary.json" del "%WORKSPACE%floor_completion_summary.json"
-if exist "%WORKSPACE%dark_surface_completed_mesh.ply" del "%WORKSPACE%dark_surface_completed_mesh.ply"
-if exist "%WORKSPACE%dark_surface_completion_summary.json" del "%WORKSPACE%dark_surface_completion_summary.json"
 if exist "%WORKSPACE%quality_report.json" del "%WORKSPACE%quality_report.json"
 if exist "%WORKSPACE%QUALITY_REPORT.md" del "%WORKSPACE%QUALITY_REPORT.md"
 echo [done] COLMAP outputs reset.
@@ -1313,7 +1358,7 @@ This folder is prepared from the current WiFi/IMU/photo capture.
 ## Start Here
 
 1. Run `run_colmap_sparse.bat` to build sparse SfM model candidates.
-2. Run `run_colmap_dense.bat` to generate the dense result, reports, and optional completion diagnostics.
+2. Run `run_colmap_dense.bat` to generate the dense result and reports.
 3. Open `dense/final.ply` in MeshLab for the final reconstruction view.
 
 For normal rebuilds, prefer `python run_colmap.py full` from the project root; it clears old COLMAP outputs automatically before running sparse and dense reconstruction. If you run these generated `.bat` scripts directly and they report existing outputs, run `reset_colmap_outputs.bat` first; it asks you to type `YES` before deleting old outputs.
@@ -1323,8 +1368,10 @@ The load profile is `{load_profile}` with COLMAP thread cap `{num_threads}` and 
 
 ## Why This Setup
 
-- Hybrid matching first uses explainable WiFi/PDR/video-order pairs, then adds COLMAP exhaustive visual bridge matches to reduce disconnected sparse components. `match_graph_edges.csv` explains the constrained pairs; exhaustive bridge matches are generated internally by COLMAP.
+- Hybrid matching first uses explainable WiFi checkpoint, ordered-PDR-contour, and video-order pairs, then adds COLMAP exhaustive visual bridge matches to reduce disconnected sparse components. `match_graph_edges.csv` explains the constrained pairs; exhaustive bridge matches are generated internally by COLMAP.
+- `image_similarity_edges.csv` checks the constrained pairs with perceptual hash, color histogram, ORB matches, and fundamental-matrix inliers. This is diagnostic evidence; it does not delete COLMAP pairs automatically.
 - Dense fusion uses a completeness-oriented profile for indoor weak-texture floor and wall regions.
+- `metadata/pdr_trajectory_contour.csv` is the time-ordered IMU/PDR route corridor used as a soft matching constraint. It is not a room boundary, mesh-completion source, or pose optimizer.
 - If `--colmap-mask-dir` was provided during preprocessing and the directory exists, feature extraction and dense fusion use those masks to suppress semantic clutter such as desks and chairs.
 - Mesh outputs are finalized into `dense/final.ply` so the result directory has one obvious model to open.
 - Intermediate dense PLY files are removed by default after `final.ply` is selected; set `KEEP_INTERMEDIATE_PLY=1` before running the batch if you need debug artifacts.
@@ -1335,23 +1382,23 @@ The load profile is `{load_profile}` with COLMAP thread cap `{num_threads}` and 
 - `image_list.txt`: exact image list passed to COLMAP.
 - `metadata/camera_pose_seed.csv`: PDR XY plus ordered point-photo yaw seed.
 - `metadata/wifi_fingerprint_library.csv`: WiFi fingerprint table.
-- `metadata/wifi_boundary_seed.csv`: rough boundary from WiFi/PDR point hull.
+- `metadata/wifi_boundary_seed.csv`: WiFi interpolation envelope from checkpoint samples, not a route contour or room boundary.
+- `metadata/pdr_trajectory_contour.csv`: ordered PDR route centerline plus a bounded coverage corridor.
 - `metadata/wifi_localization_model.json`: KNN WiFi fingerprint localizer.
 - `metadata/wifi_signal_grid.csv`: interpolated RSSI field inside the sampled area.
 - `metadata/wifi_signal_boundary.csv`: RSSI metrics on the WiFi/PDR boundary.
 - `metadata/video_frames_manifest.csv`: optional video frames used as a weak visual base.
-- `match_pairs.txt`: constrained COLMAP image pairs from WiFi point order,
-  neighboring angular slots, and video-frame sequence order.
+- `match_pairs.txt`: constrained COLMAP image pairs from WiFi checkpoint order,
+  neighboring angular slots, ordered PDR-contour distance, and video-frame sequence order.
 - `match_graph_edges.csv`: diagnostic weighted edge list with pair reasons, scores, and original slot counts.
+- `image_similarity_edges.csv` / `image_similarity_summary.json`: P1 visual-support diagnostics for the constrained match graph.
 {pdr_ref_line}
 
 ## Outputs After Running COLMAP
 
-- `QUALITY_REPORT.md` / `quality_report.json`: sparse component counts, largest registered-image count, and dense/floor output availability.
+- `QUALITY_REPORT.md` / `quality_report.json`: sparse component counts, largest registered-image count, and dense-output availability.
 - `dense/final.ply`: final dense model to open; Poisson mesh is preferred, with Delaunay or point-cloud fallback if meshing fails.
 - `dense/final_output_summary.json`: source chosen for `final.ply` and intermediate files removed during cleanup.
-- `dense/floor_completion_summary.json`: chosen vertical axis, plane height, support count, and hull size.
-- `dense/dark_surface_completion_summary.json`: optional dark low-texture surface diagnostic summary.
 
 {alignment_note}
 """
@@ -1380,15 +1427,18 @@ def prepare_colmap_workspace(
     stage_cooldown_s: Optional[int] = None,
     dense_profile: str = "complete",
     run_meshing: bool = True,
-    run_floor_completion: bool = True,
     run_point_cloud_filter: bool = True,
-    run_dark_surface_completion: bool = True,
     constrained_point_window: int = 2,
     constrained_slot_window: int = 3,
     constrained_max_pdr_distance_m: float = 12.0,
     constrained_video_frame_window: int = 6,
     constrained_video_anchor_point_window: int = 2,
     constrained_video_anchor_limit: int = 24,
+    run_image_similarity: bool = True,
+    image_similarity_max_pairs: int = 0,
+    image_similarity_max_image_size: int = 900,
+    image_similarity_orb_features: int = 1500,
+    image_similarity_min_visual_score: float = 0.22,
 ) -> Dict[str, Any]:
     _fields, manifest_rows = read_csv(reconstruction_dir / "images_manifest.csv")
     workspace_dir.mkdir(parents=True, exist_ok=True)
@@ -1398,6 +1448,7 @@ def prepare_colmap_workspace(
         if (workspace_dir / name).exists()
     ]
     removed_stale_reports = remove_stale_quality_reports(workspace_dir)
+    removed_stale_image_similarity = remove_stale_image_similarity_outputs(workspace_dir)
     resolved_colmap_exe = find_colmap_exe(root, colmap_dir=colmap_dir, colmap_exe=colmap_exe)
     resolved_mask_dir = resolve_optional_path(root, colmap_mask_dir)
     dense_profile = dense_profile if dense_profile in DENSE_PROFILES else "balanced"
@@ -1408,12 +1459,12 @@ def prepare_colmap_workspace(
         stage_cooldown_s,
     )
     effective_run_meshing = run_meshing and bool(profile_config.get("run_meshing", True))
-    effective_run_floor_completion = run_floor_completion and bool(profile_config.get("run_floor_completion", True))
-    effective_run_dark_surface_completion = run_dark_surface_completion and bool(
-        profile_config.get("run_dark_surface_completion", True)
-    )
 
-    copied_images, image_names, missing_images = copy_images(reconstruction_dir, workspace_dir, manifest_rows)
+    copied_images, image_names, missing_images, removed_stale_workspace_images = copy_images(
+        reconstruction_dir,
+        workspace_dir,
+        manifest_rows,
+    )
     copied_metadata = copy_metadata(reconstruction_dir, workspace_dir)
     mask_summary = mask_dir_summary(resolved_mask_dir, image_names)
     active_mask_dir = resolved_mask_dir if mask_summary.get("enabled") else None
@@ -1430,6 +1481,34 @@ def prepare_colmap_workspace(
     )
     write_match_pairs(workspace_dir, match_pairs)
     write_match_graph_edges(workspace_dir, match_edge_rows)
+    if run_image_similarity:
+        try:
+            image_similarity_summary = analyze_workspace_image_similarity(
+                workspace_dir=workspace_dir,
+                edge_rows=match_edge_rows,
+                max_pairs=image_similarity_max_pairs,
+                max_image_size=image_similarity_max_image_size,
+                orb_features=image_similarity_orb_features,
+                min_visual_score=image_similarity_min_visual_score,
+            )
+        except Exception as exc:
+            image_similarity_summary = {
+                "status": "failed",
+                "reason": str(exc),
+                "diagnostic_only": True,
+                "input_pair_count": len(match_edge_rows),
+                "output_csv": str(workspace_dir / "image_similarity_edges.csv"),
+            }
+            write_json(workspace_dir / "image_similarity_summary.json", image_similarity_summary)
+    else:
+        image_similarity_summary = {
+            "status": "disabled",
+            "reason": "disabled_by_command_line",
+            "diagnostic_only": True,
+            "input_pair_count": len(match_edge_rows),
+            "output_csv": str(workspace_dir / "image_similarity_edges.csv"),
+        }
+        write_json(workspace_dir / "image_similarity_summary.json", image_similarity_summary)
     align_to_pdr = not visual_only
     if align_to_pdr:
         pdr_alignment_ref_count = write_pdr_alignment_refs(workspace_dir, manifest_rows)
@@ -1463,9 +1542,7 @@ def prepare_colmap_workspace(
         align_to_pdr=align_to_pdr,
         dense_profile=dense_profile,
         run_meshing=run_meshing,
-        run_floor_completion=run_floor_completion,
         run_point_cloud_filter=run_point_cloud_filter,
-        run_dark_surface_completion=run_dark_surface_completion,
         num_threads=effective_num_threads,
         stage_cooldown_s=effective_stage_cooldown_s,
     )
@@ -1500,10 +1577,13 @@ def prepare_colmap_workspace(
         "colmap_exists": resolved_colmap_exe.exists(),
         "image_count": len(image_names),
         "copied_image_count": copied_images,
+        "removed_stale_workspace_image_count": len(removed_stale_workspace_images),
+        "removed_stale_workspace_images": removed_stale_workspace_images[:20],
         "missing_image_count": len(missing_images),
         "missing_images": missing_images[:20],
         "existing_colmap_outputs": existing_colmap_outputs,
         "colmap_reset_recommended": bool(existing_colmap_outputs),
+        "removed_stale_image_similarity_outputs": removed_stale_image_similarity,
         "metadata_files": copied_metadata,
         "colmap_mask": mask_summary,
         "camera_model": camera_model,
@@ -1521,19 +1601,17 @@ def prepare_colmap_workspace(
         "stage_cooldown_s": effective_stage_cooldown_s,
         "constrained_match_pairs": match_pair_summary,
         "match_graph_edges": "match_graph_edges.csv",
+        "image_similarity": image_similarity_summary,
+        "image_similarity_edges": "image_similarity_edges.csv",
         "pdr_alignment_ref_count": pdr_alignment_ref_count,
         "quality": quality,
         "dense_max_image_size": dense_max_image_size,
         "dense_profile": dense_profile,
         "dense_profile_config": profile_config,
         "run_meshing": effective_run_meshing,
-        "run_floor_completion": effective_run_floor_completion,
         "run_point_cloud_filter": run_point_cloud_filter,
-        "run_dark_surface_completion": effective_run_dark_surface_completion,
         "cleanup_intermediate_ply": bool(profile_config.get("cleanup_intermediate_ply", True)),
         "requested_run_meshing": run_meshing,
-        "requested_run_floor_completion": run_floor_completion,
-        "requested_run_dark_surface_completion": run_dark_surface_completion,
         "sparse_model_selection": (
             "run_colmap_dense.bat prefers sparse_pdr_aligned/0 when it exists, otherwise it uses sparse/0."
         ),

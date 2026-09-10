@@ -20,7 +20,7 @@
 
 ## Claim Boundary
 
-The main technical claim is an explainable signal-motion prior for indoor reconstruction, not signal-only 3D reconstruction. IMU/PDR supplies a relative route, heading seeds, distance constraints, and PDR alignment references. WiFi supplies checkpoint labels, fingerprint assets, and signal-boundary summaries. COLMAP remains the geometric reconstruction backbone, while `match_graph_edges.csv`, `camera_pose_seed.csv`, `pdr_alignment_refs.txt`, and the quality reports make the WiFi/IMU contribution inspectable.
+The main technical claim is an explainable signal-motion prior for indoor reconstruction, not signal-only 3D reconstruction. IMU/PDR supplies a relative route, heading seeds, an ordered route-contour constraint, and PDR alignment references. WiFi supplies checkpoint labels, fingerprint assets, and signal-boundary summaries. The WiFi-point hull is only an RSSI interpolation envelope, not a room outline. COLMAP remains the geometric reconstruction backbone, while `match_graph_edges.csv`, `pdr_trajectory_contour.csv`, `camera_pose_seed.csv`, `pdr_alignment_refs.txt`, and the quality reports make the WiFi/IMU contribution inspectable.
 
 This README describes the reusable workflow rather than one fixed dataset result. Current-run numbers belong in `colmap_workspace/QUALITY_REPORT.md`, `colmap_workspace/quality_report.json`, and the evaluation section of the project summary. If the quality report says `needs_colmap_rerun`, use a clean sparse+dense rerun before treating reconstruction metrics as final.
 
@@ -37,9 +37,9 @@ This README describes the reusable workflow rather than one fixed dataset result
 |-- reconstruction_export.py        # COLMAP dataset export
 |-- colmap_bridge.py                # COLMAP workspace and batch-script generation
 |-- reconstruction_quality.py       # Sparse/dense quality report and model selection
-|-- floor_plane_completion.py       # Separate explainable floor mesh layer
+|-- image_similarity.py             # P1 visual-similarity diagnostics for COLMAP match pairs
+|-- trajectory_contour.py           # P2 continuous IMU/PDR route-contour builder
 |-- point_cloud_filter.py           # Conservative far/isolated dense outlier filter
-|-- dark_surface_completion.py      # Separate dark low-texture surface fill layer
 |-- ply_io.py                       # Shared PLY vertex IO helpers
 |-- wifi_positioning.py             # WiFi fingerprint localization model generation
 |-- localize_wifi.py                # Localize a new WiFi scan
@@ -137,11 +137,11 @@ python run_colmap.py full --no-upfront-estimate
 2. IMU/PDR parsing
    - Reads accelerometer, rotation, and movement logs.
    - Estimates steps, heading, and relative PDR coordinates.
-   - Produces `pdr_x` / `pdr_y` trajectories.
+   - Produces a time-ordered `pdr_x` / `pdr_y` centerline and bounded route corridor.
 
 3. WiFi/PDR fusion
    - Assigns WiFi scans to PDR positions.
-   - Creates the spatial basis for fingerprints, boundaries, and pose seeds.
+   - Treats WiFi as sparse fingerprints/checkpoint anchors on the route, not as room geometry.
 
 4. Photo mapping
    - Groups ordered photos into checkpoint slots.
@@ -164,6 +164,8 @@ python run_colmap.py full --no-upfront-estimate
 8. COLMAP workspace generation
    - Writes `image_list.txt`, `match_pairs.txt`, `match_graph_edges.csv`, and batch scripts.
    - Generates sparse, dense, automatic, GUI, and reset scripts.
+   - Writes P1 image-similarity diagnostics for constrained pairs as `image_similarity_edges.csv` and `image_similarity_summary.json`.
+   - Uses P2 ordered-route distance for extra checkpoint matches when trajectory metadata is present.
 
 ## Reconstruction Profiles
 
@@ -193,6 +195,20 @@ python main.py --colmap-load-profile standard
 python main.py --colmap-load-profile max
 python main.py --colmap-num-threads 2 --colmap-stage-cooldown-s 20
 ```
+
+P1 image-similarity diagnostics are enabled during COLMAP workspace preparation. They do not filter COLMAP pairs automatically; they inspect the generated constrained pair graph and write visual-support evidence:
+
+```powershell
+python image_similarity.py --workspace colmap_workspace
+python image_similarity.py --workspace colmap_workspace --max-pairs 200
+python main.py --skip-image-similarity
+```
+
+P2 writes `processed/pdr_trajectory_contour.csv` and `pdr_trajectory_edges.csv`.
+This is the observed IMU/PDR capture-route corridor: WiFi checkpoints attach to it
+as sparse fingerprint anchors, and the matching graph uses along-route distance
+instead of treating a WiFi-point convex hull as a physical room contour. P2 never
+adds synthetic surfaces to `dense/final.ply`.
 
 ## Useful Commands
 
@@ -274,12 +290,7 @@ python main.py --colmap-dense-profile rtx4080
 python main.py --colmap-dense-profile complete
 ```
 
-Skip post-processing layers if you only want raw COLMAP outputs:
-
-```powershell
-python main.py --skip-point-cloud-filter
-python main.py --skip-dark-surface-completion
-```
+P2 is the IMU/PDR trajectory-contour constraint, not a mesh-completion step.
 
 Tighten same-point angular matching:
 
@@ -473,11 +484,9 @@ python run_colmap.py reset
 colmap_workspace/dense/final.ply
 colmap_workspace/dense/final_output_summary.json
 colmap_workspace/dense/point_filter_summary.json
-colmap_workspace/dense/floor_completion_summary.json
-colmap_workspace/dense/dark_surface_completion_summary.json
 ```
 
-`final.ply` is the only dense model you normally open. The pipeline prefers the Poisson mesh, falls back to Delaunay or the dense point cloud if needed, and records the choice in `final_output_summary.json`. Intermediate dense PLY files are removed by default after `final.ply` is selected.
+`final.ply` is the only dense model you normally open. The pipeline prefers the Poisson mesh, then falls back to Delaunay or the dense point cloud if needed. It contains reconstructed COLMAP geometry only; intermediate dense PLY files are removed by default after `final.ply` is selected.
 
 ## Quality Reports
 
@@ -493,7 +502,8 @@ The report checks:
 - COLMAP database image count.
 - Sparse component count and registered-image ratio.
 - Final dense model availability and vertex/face counts.
-- Intermediate dense point cloud, filtered point cloud, mesh, floor-completion, and dark-surface completion availability when those files are kept.
+- Intermediate dense point cloud, filtered point cloud, and mesh availability when those files are kept.
+- Whether P2's route-contour constraint was available for the generated match graph.
 - Match-pair reason counts.
 
 If the report says `database image count does not match image_list.txt`, rebuild with:
@@ -562,10 +572,6 @@ python main.py --colmap-dense-max-image-size 1600
 ```
 
 ## 7. 推荐完整运行顺序
-
-### Dark low-texture gaps remain
-
-Inspect `dense/dark_surface_completion_summary.json` together with `dense/final_output_summary.json`. Dark-surface completion is a diagnostic layer before final cleanup, so report it separately from the raw COLMAP output.
 
 ### Video frames are missing
 

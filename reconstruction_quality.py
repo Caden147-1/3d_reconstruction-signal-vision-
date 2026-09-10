@@ -47,6 +47,20 @@ def safe_float(value: Any, default: float = math.nan) -> float:
         return default
 
 
+def summarize_numbers(values: Sequence[float]) -> Dict[str, Any]:
+    if not values:
+        return {"min": None, "mean": None, "median": None, "max": None}
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    median = ordered[middle] if len(ordered) % 2 else (ordered[middle - 1] + ordered[middle]) * 0.5
+    return {
+        "min": round(min(values), 6),
+        "mean": round(sum(values) / len(values), 6),
+        "median": round(median, 6),
+        "max": round(max(values), 6),
+    }
+
+
 def file_line_count(path: Path) -> int:
     if not path.exists():
         return 0
@@ -185,10 +199,6 @@ def summarize_dense(workspace_dir: Path) -> Dict[str, Any]:
         "point_filter_summary": read_json(dense_dir / "point_filter_summary.json"),
         "meshed_delaunay_exists": (dense_dir / "meshed-delaunay.ply").exists(),
         "meshed_poisson_exists": (dense_dir / "meshed-poisson.ply").exists(),
-        "floor_completed_mesh_exists": (dense_dir / "floor_completed_mesh.ply").exists(),
-        "floor_completion_summary": read_json(dense_dir / "floor_completion_summary.json"),
-        "dark_surface_completed_mesh_exists": (dense_dir / "dark_surface_completed_mesh.ply").exists(),
-        "dark_surface_completion_summary": read_json(dense_dir / "dark_surface_completion_summary.json"),
     }
 
 
@@ -228,6 +238,58 @@ def summarize_match_graph(path: Path) -> Dict[str, Any]:
         "reason_counts": dict(sorted(reason_counts.items())),
         "source_pair_counts": dict(sorted(source_pair_counts.items())),
         "edge_weight": edge_weight,
+    }
+
+
+def summarize_image_similarity(workspace_dir: Path) -> Dict[str, Any]:
+    summary_path = workspace_dir / "image_similarity_summary.json"
+    csv_path = workspace_dir / "image_similarity_edges.csv"
+    summary = read_json(summary_path)
+    if summary:
+        summary.setdefault("exists", csv_path.exists() or summary_path.exists())
+        summary.setdefault("summary_path", str(summary_path))
+        summary.setdefault("output_csv", str(csv_path))
+        return summary
+    if not csv_path.exists():
+        return {
+            "exists": False,
+            "status": "missing",
+            "evaluated_pair_count": 0,
+            "visual_supported_pair_count": 0,
+            "visual_decision_counts": {},
+            "visual_overlap_score": None,
+        }
+
+    decision_counts: Dict[str, int] = {}
+    status_counts: Dict[str, int] = {}
+    scores: List[float] = []
+    row_count = 0
+    with csv_path.open("r", newline="", encoding="utf-8", errors="replace") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            row_count += 1
+            decision = row.get("visual_decision") or "unknown"
+            decision_counts[decision] = decision_counts.get(decision, 0) + 1
+            pair_status = row.get("pair_status") or "unknown"
+            status_counts[pair_status] = status_counts.get(pair_status, 0) + 1
+            score = safe_float(row.get("visual_overlap_score"))
+            if not math.isnan(score):
+                scores.append(score)
+
+    visual_supported = sum(
+        decision_counts.get(name, 0)
+        for name in ("geometry_supported", "feature_overlap", "near_duplicate")
+    )
+    return {
+        "exists": True,
+        "status": "ok",
+        "summary_path": str(summary_path),
+        "output_csv": str(csv_path),
+        "evaluated_pair_count": row_count,
+        "visual_supported_pair_count": visual_supported,
+        "visual_decision_counts": dict(sorted(decision_counts.items())),
+        "pair_status_counts": dict(sorted(status_counts.items())),
+        "visual_overlap_score": summarize_numbers(scores),
     }
 
 
@@ -274,6 +336,7 @@ def relative_status(
     workspace_summary: Dict[str, Any],
     database: Dict[str, Any],
     image_directory: Dict[str, Any],
+    image_similarity: Dict[str, Any],
     sparse: Dict[str, Any],
     dense: Dict[str, Any],
     input_image_count: int,
@@ -323,24 +386,31 @@ def relative_status(
         and not cleanup_intermediate_ply
     ):
         warnings.append("Filtered dense point cloud is not present yet.")
-    if (
-        dense["fused_exists"]
-        and not dense["floor_completed_mesh_exists"]
-        and not cleanup_intermediate_ply
-    ):
-        warnings.append("Floor completion layer is not present yet.")
-    if (
-        dense["fused_exists"]
-        and workspace_summary.get("run_dark_surface_completion")
-        and not dense["dark_surface_completed_mesh_exists"]
-        and not cleanup_intermediate_ply
-    ):
-        warnings.append("Dark surface completion layer is not present yet.")
-
     if workspace_summary.get("matcher") == "hybrid":
-        notes.append("Hybrid matching uses constrained WiFi/PDR/video-order pairs plus COLMAP visual bridge matches.")
+        notes.append("Hybrid matching uses constrained WiFi/checkpoint, ordered-PDR-contour, and video-order pairs plus COLMAP visual bridge matches.")
     if workspace_summary.get("colmap_reset_recommended"):
         notes.append("Workspace preparation previously saw old COLMAP outputs; this report uses the files present now.")
+    if image_similarity.get("status") == "ok":
+        notes.append(
+            "P1 image-similarity diagnostics evaluated "
+            f"{image_similarity.get('evaluated_pair_count', 0)} constrained pairs; "
+            f"{image_similarity.get('visual_supported_pair_count', 0)} have visual support labels."
+        )
+    elif image_similarity.get("status") in {"skipped", "failed"}:
+        notes.append(
+            "P1 image-similarity diagnostics are "
+            f"{image_similarity.get('status')}: {image_similarity.get('reason', '')}"
+        )
+    trajectory_constraint = workspace_summary.get("constrained_match_pairs", {})
+    if trajectory_constraint.get("trajectory_constraint_available"):
+        notes.append(
+            "P2 uses the ordered IMU/PDR route contour as a soft match-pair constraint; "
+            "it does not add synthetic geometry to final.ply."
+        )
+    elif not workspace_summary.get("visual_only") and workspace_summary:
+        warnings.append(
+            "Trajectory-contour metadata is unavailable, so constrained matching falls back to XY PDR proximity."
+        )
 
     needs_rerun = (
         bool(database.get("error"))
@@ -395,6 +465,7 @@ def build_report(root: Path, processed_dir: Path, reconstruction_dir: Path, work
         or file_line_count(workspace_dir / "image_list.txt")
     )
     match_graph = summarize_match_graph(workspace_dir / "match_graph_edges.csv")
+    image_similarity = summarize_image_similarity(workspace_dir)
     sparse = collect_sparse_models(workspace_dir, input_image_count)
     dense = summarize_dense(workspace_dir)
     database = database_status(workspace_dir)
@@ -403,6 +474,7 @@ def build_report(root: Path, processed_dir: Path, reconstruction_dir: Path, work
         workspace_summary=workspace_summary,
         database=database,
         image_directory=image_directory,
+        image_similarity=image_similarity,
         sparse=sparse,
         dense=dense,
         input_image_count=input_image_count,
@@ -422,6 +494,7 @@ def build_report(root: Path, processed_dir: Path, reconstruction_dir: Path, work
         "image_directory": image_directory,
         "database": database,
         "match_graph": match_graph,
+        "image_similarity": image_similarity,
         "sparse": sparse,
         "dense": dense,
         "warnings": warnings,
@@ -454,6 +527,7 @@ def render_markdown(report: Dict[str, Any]) -> str:
     sparse = report["sparse"]
     dense = report["dense"]
     match_graph = report["match_graph"]
+    image_similarity = report["image_similarity"]
     images = report["image_directory"]
     largest = sparse.get("largest_component") or {}
     selected = sparse.get("selected_model") or {}
@@ -465,6 +539,10 @@ def render_markdown(report: Dict[str, Any]) -> str:
         ("Missing image_list.txt files", images["missing_listed_count"]),
         ("Database images", report["database"]["image_count"] if report["database"]["exists"] else "missing"),
         ("Match graph edges", match_graph["edge_count"]),
+        ("P1 image similarity status", image_similarity.get("status", "missing")),
+        ("P1 image pairs evaluated", image_similarity.get("evaluated_pair_count", 0)),
+        ("P1 visually supported pairs", image_similarity.get("visual_supported_pair_count", 0)),
+        ("P1 near-duplicate pairs", image_similarity.get("near_duplicate_pair_count", 0)),
         ("Sparse components", sparse["component_count"]),
         ("Largest sparse model", largest.get("label", "-")),
         ("Largest registered images", largest.get("registered_images", 0)),
@@ -483,13 +561,19 @@ def render_markdown(report: Dict[str, Any]) -> str:
         ("Intermediate filtered vertex count", dense["filtered_vertex_count"]),
         ("Intermediate Delaunay mesh kept", dense["meshed_delaunay_exists"]),
         ("Intermediate Poisson mesh kept", dense["meshed_poisson_exists"]),
-        ("Floor completion PLY kept", dense["floor_completed_mesh_exists"]),
-        ("Dark surface completion PLY kept", dense["dark_surface_completed_mesh_exists"]),
+        (
+            "P2 trajectory contour mode",
+            report["workspace_summary"].get("constrained_match_pairs", {}).get("trajectory_constraint_mode", "missing"),
+        ),
     ]
 
     reason_lines = ["| Reason | Count |", "| --- | --- |"]
     for reason, count in match_graph.get("reason_counts", {}).items():
         reason_lines.append(f"| {reason} | {count} |")
+
+    similarity_lines = ["| Decision | Count |", "| --- | --- |"]
+    for decision, count in image_similarity.get("visual_decision_counts", {}).items():
+        similarity_lines.append(f"| {decision} | {count} |")
 
     warning_lines = "\n".join(f"- {warning}" for warning in report.get("warnings", [])) or "- None"
     note_lines = "\n".join(f"- {note}" for note in report.get("notes", [])) or "- None"
@@ -499,6 +583,8 @@ def render_markdown(report: Dict[str, Any]) -> str:
         f"{markdown_table(rows)}\n\n"
         "## Match Pair Reasons\n\n"
         f"{chr(10).join(reason_lines)}\n\n"
+        "## P1 Image Similarity\n\n"
+        f"{chr(10).join(similarity_lines)}\n\n"
         "## Warnings\n\n"
         f"{warning_lines}\n\n"
         "## Notes\n\n"
