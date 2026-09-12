@@ -96,7 +96,7 @@ PROFILE_DEFAULTS = {
         "colmap_feature_max_image_size": 2400,
         "colmap_max_num_features": 12000,
         "colmap_max_num_matches": 65536,
-        "colmap_matcher": "hybrid",
+        "colmap_matcher": "constrained",
         "colmap_quality": "extreme",
         "colmap_dense_profile": "complete",
         "colmap_load_profile": "low-peak",
@@ -124,7 +124,7 @@ PROFILE_DEFAULTS = {
         "colmap_feature_max_image_size": 2800,
         "colmap_max_num_features": 16000,
         "colmap_max_num_matches": 98304,
-        "colmap_matcher": "hybrid",
+        "colmap_matcher": "constrained",
         "colmap_quality": "extreme",
         "colmap_dense_profile": "rtx4080",
         "colmap_load_profile": "low-peak",
@@ -152,7 +152,7 @@ PROFILE_DEFAULTS = {
         "colmap_feature_max_image_size": 3200,
         "colmap_max_num_features": 20000,
         "colmap_max_num_matches": 131072,
-        "colmap_matcher": "hybrid",
+        "colmap_matcher": "constrained",
         "colmap_quality": "extreme",
         "colmap_dense_profile": "complete",
         "colmap_load_profile": "low-peak",
@@ -1398,6 +1398,7 @@ def prepare_colmap_workspace_from_args(
         image_similarity_max_image_size=image_similarity_max_image_size,
         image_similarity_orb_features=image_similarity_orb_features,
         image_similarity_min_visual_score=image_similarity_min_visual_score,
+        visual_recovery_neighbors=effective_args.visual_recovery_neighbors,
     )
 
 
@@ -1464,8 +1465,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--colmap-mask-dir",
         type=Path,
         help=(
-            "Optional COLMAP mask directory for semantic clutter filtering. "
-            "Masks should follow image_list names, for example image.jpg.png or image.png."
+            "Optional COLMAP mask directory for semantic clutter or known reflective-region filtering. "
+            "Masks must follow generated image_list names, for example anchors/image.png or video/frame.png."
         ),
     )
     parser.add_argument("--skip-colmap-prepare", action="store_true")
@@ -1490,7 +1491,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=int,
         help="Seconds to wait between heavy COLMAP stages to lower sustained peak load.",
     )
-    parser.add_argument("--skip-colmap-meshing", action="store_true", help="Skip Delaunay/Poisson mesh commands in the generated dense script.")
+    meshing = parser.add_mutually_exclusive_group()
+    meshing.add_argument("--colmap-meshing", dest="skip_colmap_meshing", action="store_false", help="Generate and retain Delaunay/Poisson inspection meshes; final.ply remains the observed point cloud.")
+    meshing.add_argument("--skip-colmap-meshing", dest="skip_colmap_meshing", action="store_true", help="Skip optional inspection meshes (default).")
+    parser.set_defaults(skip_colmap_meshing=True)
     parser.add_argument("--skip-point-cloud-filter", action="store_true", help="Skip the filtered fused point cloud post-processing output.")
     parser.add_argument("--colmap-feature-max-image-size", type=int)
     parser.add_argument("--colmap-max-num-features", type=int)
@@ -1508,7 +1512,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--constrained-video-frame-window", type=int)
     parser.add_argument("--constrained-video-anchor-point-window", type=int)
     parser.add_argument("--constrained-video-anchor-limit", type=int)
-    parser.add_argument("--skip-image-similarity", action="store_true", help="Skip P1 image-similarity diagnostics for constrained match pairs.")
+    parser.add_argument("--skip-image-similarity", action="store_true", help="Disable P1 selection and visual recovery; retain route/order candidates.")
+    parser.add_argument("--visual-recovery-neighbors", type=int, default=12, help="Appearance-retrieved candidates per image outside route/slot windows; require geometric verification. Use 0 to disable.")
     parser.add_argument("--image-similarity-max-pairs", type=int, help="Analyze all constrained pairs by default when profile value is 0; set a positive cap for a faster sample.")
     parser.add_argument("--image-similarity-max-image-size", type=int, help="Resize longest image side before ORB similarity analysis.")
     parser.add_argument("--image-similarity-orb-features", type=int, help="ORB feature count per image for match-pair diagnostics.")
@@ -1733,6 +1738,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             image_similarity_max_image_size=image_similarity_max_image_size,
             image_similarity_orb_features=image_similarity_orb_features,
             image_similarity_min_visual_score=profile_value(args, "image_similarity_min_visual_score"),
+            visual_recovery_neighbors=args.visual_recovery_neighbors,
         )
     )
     log_stage_done(8, colmap_summary, "COLMAP preparation disabled or reconstruction export was skipped")

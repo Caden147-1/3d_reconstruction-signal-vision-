@@ -102,7 +102,7 @@ DENSE_PROFILES: Dict[str, Dict[str, Any]] = {
         },
         "run_meshing": True,
         "cleanup_intermediate_ply": True,
-        "point_filter_max_points": 1200000,
+        "point_filter_max_points": 0,
     },
 }
 
@@ -129,16 +129,30 @@ LOAD_PROFILES: Dict[str, Dict[str, Any]] = {
 REASON_BASE_WEIGHTS: Dict[str, float] = {
     "same_wifi_point_nearby_slots": 1.00,
     "nearby_wifi_points": 0.88,
-    "nearby_trajectory_points": 0.82,
+    "trajectory_contour_neighbors": 0.90,
+    "nearby_trajectory_points": 0.92,
     "nearby_pdr_points": 0.74,
     "video_sequence": 0.70,
     "video_to_wifi_anchor": 0.62,
+    "video_to_trajectory_anchor": 0.66,
 }
 
 SOURCE_PAIR_WEIGHTS: Dict[Tuple[str, str], float] = {
     ("wifi_anchor_photo", "wifi_anchor_photo"): 1.00,
     ("video_base_frame", "video_base_frame"): 0.82,
     ("wifi_anchor_photo", "video_base_frame"): 0.72,
+}
+
+
+P2_CONTOUR_REASONS = {
+    "trajectory_contour_neighbors",
+    "nearby_trajectory_points",
+    "video_to_trajectory_anchor",
+}
+P1_VISUAL_SUPPORT_DECISIONS = {
+    "geometry_supported",
+    "feature_overlap",
+    "near_duplicate",
 }
 
 
@@ -210,6 +224,66 @@ def find_colmap_exe(root: Path, colmap_dir: Optional[Path] = None, colmap_exe: O
     return candidates[0].resolve() if candidates else (root / "colmap.exe").resolve()
 
 
+def workspace_image_group(row: Dict[str, str]) -> str:
+    """Keep inputs with distinct capture geometry in separate camera folders."""
+    return "video" if row.get("source_type") == "video_base_frame" else "anchors"
+
+
+def workspace_image_name(row: Dict[str, str]) -> str:
+    source_name = Path(row.get("image_file", ""))
+    if not source_name.name or source_name.is_absolute() or ".." in source_name.parts:
+        raise ValueError(f"Unsafe or missing reconstruction image name: {source_name}")
+    return (Path(workspace_image_group(row)) / source_name.name).as_posix()
+
+
+def build_workspace_manifest(manifest_rows: Sequence[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Map exported filenames to source-specific workspace folders.
+
+    COLMAP can then share intrinsics within the photo group and within the video
+    group, instead of forcing their visibly different image geometries into one
+    camera model.
+    """
+    rows: List[Dict[str, str]] = []
+    seen: set[str] = set()
+    for source_row in manifest_rows:
+        source_name = source_row.get("image_file", "")
+        if not source_name:
+            continue
+        row = dict(source_row)
+        target_name = workspace_image_name(row)
+        if target_name in seen:
+            raise ValueError(f"Duplicate workspace image name: {target_name}")
+        seen.add(target_name)
+        row["source_image_file"] = source_name
+        row["image_file"] = target_name
+        row["workspace_image_group"] = workspace_image_group(row)
+        rows.append(row)
+    return rows
+
+
+def camera_grouping_summary(manifest_rows: Sequence[Dict[str, str]]) -> Dict[str, Any]:
+    groups: Dict[str, int] = {}
+    for row in manifest_rows:
+        image_name = row.get("image_file", "")
+        if not image_name:
+            continue
+        group = row.get("workspace_image_group") or workspace_image_group(row)
+        groups[group] = groups.get(group, 0) + 1
+    use_folder_groups = len(groups) > 1
+    return {
+        "mode": "source_folder_groups" if use_folder_groups else "single_camera",
+        "groups": dict(sorted(groups.items())),
+        "single_camera": not use_folder_groups,
+        "single_camera_per_folder": use_folder_groups,
+        "explanation": (
+            "Anchor photos and video frames are kept in separate folders so COLMAP "
+            "can estimate one shared camera per capture source."
+            if use_folder_groups
+            else "All current inputs belong to one capture-source group."
+        ),
+    }
+
+
 def copy_images(
     reconstruction_dir: Path,
     workspace_dir: Path,
@@ -227,26 +301,40 @@ def copy_images(
         image_file = row.get("image_file", "")
         if not image_file:
             continue
-        source = source_images_dir / image_file
+        source_image_file = row.get("source_image_file") or image_file
+        source = source_images_dir / source_image_file
         target = target_images_dir / image_file
         image_names.append(image_file)
         if not source.exists():
             missing.append(str(source))
             continue
+        target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
         copied_image_names.append(image_file)
         copied += 1
 
     expected_names = set(copied_image_names)
     removed_stale: List[str] = []
-    for target in target_images_dir.iterdir():
-        if not target.is_file() or target.name in expected_names:
+    for target in target_images_dir.rglob("*"):
+        if not target.is_file():
+            continue
+        target_name = target.relative_to(target_images_dir).as_posix()
+        if target_name in expected_names:
             continue
         try:
             target.unlink()
         except OSError:
             continue
-        removed_stale.append(target.name)
+        removed_stale.append(target_name)
+    for directory in sorted(
+        (path for path in target_images_dir.rglob("*") if path.is_dir()),
+        key=lambda path: len(path.parts),
+        reverse=True,
+    ):
+        try:
+            directory.rmdir()
+        except OSError:
+            continue
     return copied, image_names, missing, removed_stale
 
 
@@ -390,7 +478,7 @@ def score_match_edge(
         combined = 0.10 * pdr_score + 0.65 * trajectory_score + 0.15 * slot_score + 0.10 * point_score
     elif reason == "video_sequence":
         combined = 0.20 * pdr_score + 0.25 * trajectory_score + 0.15 * point_score + 0.40 * video_score
-    elif reason == "video_to_wifi_anchor":
+    elif reason in {"video_to_wifi_anchor", "video_to_trajectory_anchor"}:
         combined = 0.20 * pdr_score + 0.25 * trajectory_score + 0.35 * point_score + 0.20 * video_score
     else:
         combined = 0.30 * pdr_score + 0.35 * trajectory_score + 0.20 * slot_score + 0.15 * point_score
@@ -494,15 +582,14 @@ def build_constrained_match_pairs(
             return None
         return x, y
 
-    trajectory_constraint_available = (
-        not visual_only
-        and len(point_row_by_id) >= 2
-        and all(trajectory_coordinate(row) is not None for row in point_row_by_id.values())
-    )
+    contour_point_count = sum(trajectory_coordinate(row) is not None for row in point_row_by_id.values())
+    trajectory_constraint_available = not visual_only and contour_point_count > 0
     pdr_cell_size = max(1e-6, max_pdr_distance_m)
     pdr_grid: Dict[Tuple[int, int], List[int]] = {}
-    if not visual_only and not trajectory_constraint_available and max_pdr_distance_m > 0:
+    if not visual_only and max_pdr_distance_m > 0:
         for point, row in point_row_by_id.items():
+            if trajectory_coordinate(row) is not None:
+                continue
             xy = row_xy(row)
             if xy is None:
                 continue
@@ -519,14 +606,50 @@ def build_constrained_match_pairs(
         return [
             point
             for point, point_row in point_row_by_id.items()
-            if point_row.get("session") == row.get("session")
+            if point != safe_int(row.get("global_point_index"), -1)
             and (other := trajectory_coordinate(point_row)) is not None
             and other[0] == contour_id
             and abs(other[1] - route_distance_m) <= max_pdr_distance_m
         ]
 
+    def trajectory_topology_points(row: Dict[str, str], neighbor_depth: int) -> List[int]:
+        """Return bounded predecessor/successor anchors on the same route contour.
+
+        P2 should preserve route topology even when sparse WiFi checkpoints are
+        farther apart than the metric matching radius. The contour id already
+        scopes the route to one session, so video rows need not carry a copied
+        session name to use this constraint.
+        """
+        if not trajectory_constraint_available:
+            return []
+        coordinate = trajectory_coordinate(row)
+        if coordinate is None:
+            return []
+        contour_id, route_distance_m = coordinate
+        self_point = safe_int(row.get("global_point_index"), -1)
+        before: List[Tuple[float, int]] = []
+        after: List[Tuple[float, int]] = []
+        exact: List[int] = []
+        for point, point_row in point_row_by_id.items():
+            if point == self_point:
+                continue
+            other = trajectory_coordinate(point_row)
+            if other is None or other[0] != contour_id:
+                continue
+            delta = other[1] - route_distance_m
+            if abs(delta) <= 1e-9:
+                exact.append(point)
+            elif delta < 0:
+                before.append((abs(delta), point))
+            else:
+                after.append((abs(delta), point))
+        depth = max(1, neighbor_depth)
+        before.sort()
+        after.sort()
+        return sorted(set(exact + [point for _distance, point in before[:depth]] + [point for _distance, point in after[:depth]]))
+
     def nearby_pdr_points(row: Dict[str, str]) -> List[int]:
-        if visual_only or trajectory_constraint_available or max_pdr_distance_m <= 0:
+        if visual_only or trajectory_coordinate(row) is not None or max_pdr_distance_m <= 0:
             return []
         xy = row_xy(row)
         if xy is None:
@@ -551,20 +674,27 @@ def build_constrained_match_pairs(
         row_b = point_row_by_id.get(right)
         if row_a is None or row_b is None or row_a.get("session") != row_b.get("session"):
             return
+        if not visual_only and reason not in P2_CONTOUR_REASONS:
+            # Missing metadata cannot override a known contour or join two breaks.
+            if trajectory_coordinate(row_a) is not None or trajectory_coordinate(row_b) is not None:
+                return
         key = (left, right)
         current_reason = candidate_point_reasons.get(key)
         if current_reason is None or REASON_BASE_WEIGHTS.get(reason, 0.0) > REASON_BASE_WEIGHTS.get(current_reason, 0.0):
             candidate_point_reasons[key] = reason
 
     for left_index, point_a in enumerate(points):
-        for point_b in points[left_index + 1 :]:
-            if point_b - point_a > point_window:
-                break
-            add_candidate(point_a, point_b, "nearby_wifi_points")
-        if trajectory_constraint_available:
-            for point_b in nearby_trajectory_points(point_row_by_id[point_a]):
+        if not visual_only and trajectory_coordinate(point_row_by_id[point_a]) is not None:
+            anchor_row = point_row_by_id[point_a]
+            for point_b in trajectory_topology_points(anchor_row, point_window):
+                add_candidate(point_a, point_b, "trajectory_contour_neighbors")
+            for point_b in nearby_trajectory_points(anchor_row):
                 add_candidate(point_a, point_b, "nearby_trajectory_points")
         else:
+            for point_b in points[left_index + 1 :]:
+                if point_b - point_a > point_window:
+                    break
+                add_candidate(point_a, point_b, "nearby_wifi_points")
             for point_b in nearby_pdr_points(point_row_by_id[point_a]):
                 add_candidate(point_a, point_b, "nearby_pdr_points")
 
@@ -601,13 +731,22 @@ def build_constrained_match_pairs(
 
     for video_row in video_rows:
         candidate_points: set[int] = set()
-        for field in ("nearest_global_point_index", "left_global_point_index", "right_global_point_index"):
-            point = safe_int(video_row.get(field), -1)
-            if point < 0:
-                continue
-            for neighbor in range(point - video_anchor_point_window, point + video_anchor_point_window + 1):
-                if neighbor in by_point:
-                    candidate_points.add(neighbor)
+        used_trajectory_candidates = False
+        if trajectory_constraint_available and not visual_only:
+            trajectory_points = set(nearby_trajectory_points(video_row))
+            trajectory_points.update(trajectory_topology_points(video_row, video_anchor_point_window))
+            if trajectory_points:
+                candidate_points.update(trajectory_points)
+                used_trajectory_candidates = True
+
+        if not candidate_points and not trajectory_constraint_available:
+            for field in ("nearest_global_point_index", "left_global_point_index", "right_global_point_index"):
+                point = safe_int(video_row.get(field), -1)
+                if point < 0:
+                    continue
+                for neighbor in range(point - video_anchor_point_window, point + video_anchor_point_window + 1):
+                    if neighbor in by_point:
+                        candidate_points.add(neighbor)
 
         if not candidate_points and not visual_only:
             if trajectory_constraint_available:
@@ -620,13 +759,18 @@ def build_constrained_match_pairs(
             candidate_anchor_rows.extend(by_point.get(point, []))
         candidate_anchor_rows.sort(
             key=lambda row: (
+                trajectory_distance(video_row, row),
                 point_distance(video_row, row),
                 safe_int(row.get("global_point_index")),
                 safe_int(row.get("image_slot")),
             )
         )
         for anchor_row in select_evenly_spaced(candidate_anchor_rows, video_anchor_limit):
-            add_pair(video_row, anchor_row, "video_to_wifi_anchor")
+            add_pair(
+                video_row,
+                anchor_row,
+                "video_to_trajectory_anchor" if used_trajectory_candidates else "video_to_wifi_anchor",
+            )
 
     sorted_pairs = sorted(pairs)
     row_by_image = {
@@ -679,6 +823,16 @@ def build_constrained_match_pairs(
         "point_count": len(by_point),
         "image_count": len(rows),
         "video_frame_count": len(video_rows),
+        "video_frames_with_trajectory_contour": sum(
+            1 for row in video_rows if trajectory_coordinate(row) is not None
+        ),
+        "video_frames_without_trajectory_contour": sum(
+            1 for row in video_rows if trajectory_coordinate(row) is None
+        ),
+        "video_trajectory_note": (
+            "Video frames use interpolated positions along the observed PDR contour "
+            "only as soft matching evidence; they are excluded from PDR model alignment."
+        ),
         "pair_count": len(sorted_pairs),
         "visual_only": visual_only,
         "point_window": point_window,
@@ -686,11 +840,20 @@ def build_constrained_match_pairs(
         "max_pdr_distance_m": None if visual_only else max_pdr_distance_m,
         "max_trajectory_distance_m": None if visual_only else max_pdr_distance_m,
         "trajectory_constraint_available": trajectory_constraint_available,
-        "trajectory_constraint_mode": "ordered_contour" if trajectory_constraint_available else "legacy_pdr_proximity",
+        "trajectory_constraint_mode": (
+            "visual_order_only" if visual_only else
+            "partial_ordered_contour" if 0 < contour_point_count < len(point_row_by_id) else
+            "ordered_contour" if trajectory_constraint_available else "legacy_pdr_proximity"
+        ),
+        "anchor_points_with_contour": contour_point_count,
+        "anchor_points_without_contour": len(point_row_by_id) - contour_point_count,
+        "p2_count_semantics": "Candidate edges constructed from contour metadata, not incremental edges or measured reconstruction improvement.",
+        "trajectory_topology_neighbor_depth": max(1, point_window) if trajectory_constraint_available else 0,
         "video_frame_window": video_frame_window,
         "video_anchor_point_window": video_anchor_point_window,
         "video_anchor_limit": video_anchor_limit,
         "candidate_point_pair_count": len(candidate_point_reasons),
+        "p2_contour_edge_count": 0,
         "reason_counts": {},
         "weighted_graph": True,
         "edge_weight": {"min": None, "mean": None, "max": None},
@@ -701,6 +864,8 @@ def build_constrained_match_pairs(
     for row in edge_rows:
         reason = str(row.get("reason", "unknown"))
         summary["reason_counts"][reason] = summary["reason_counts"].get(reason, 0) + 1
+        if reason in P2_CONTOUR_REASONS:
+            summary["p2_contour_edge_count"] += 1
         weight = safe_float(row.get("edge_weight"), math.nan)
         if math.isnan(weight):
             continue
@@ -726,6 +891,126 @@ def write_match_pairs(workspace_dir: Path, pairs: Sequence[Tuple[str, str]]) -> 
     with (workspace_dir / "match_pairs.txt").open("w", encoding="utf-8") as handle:
         for image_a, image_b in pairs:
             handle.write(f"{image_a} {image_b}\n")
+
+
+def write_named_match_pairs(workspace_dir: Path, filename: str, pairs: Sequence[Tuple[str, str]]) -> None:
+    with (workspace_dir / filename).open("w", encoding="utf-8") as handle:
+        for image_a, image_b in pairs:
+            handle.write(f"{image_a} {image_b}\n")
+
+
+def select_visually_supported_match_pairs(
+    pairs: Sequence[Tuple[str, str]],
+    edge_rows: Sequence[Dict[str, Any]],
+    similarity_rows: Sequence[Dict[str, str]],
+    similarity_summary: Dict[str, Any],
+) -> Tuple[List[Tuple[str, str]], List[Dict[str, Any]], Dict[str, Any]]:
+    """Apply P1 decisions to the P2-constrained COLMAP pair list.
+
+    COLMAP's ``matches_importer`` accepts a pair list, not per-pair prior
+    weights. P2 therefore supplies the route-topology candidate graph and P1
+    turns evaluated visual evidence into a keep/drop decision. Unevaluated route
+    pairs remain candidates; visual recovery always requires geometric evidence.
+    """
+    edge_by_pair = {
+        tuple(sorted((str(row.get("image_a", "")), str(row.get("image_b", ""))))): row
+        for row in edge_rows
+        if row.get("image_a") and row.get("image_b")
+    }
+    similarity_by_pair = {
+        tuple(sorted((str(row.get("image_a", "")), str(row.get("image_b", ""))))): row
+        for row in similarity_rows
+        if row.get("image_a") and row.get("image_b")
+    }
+    p1_status = str(similarity_summary.get("status", "missing"))
+    p1_available = p1_status == "ok"
+    selected: List[Tuple[str, str]] = []
+    selection_rows: List[Dict[str, Any]] = []
+    selection_reason_counts: Dict[str, int] = {}
+    rejected_decision_counts: Dict[str, int] = {}
+    unreviewed_count = 0
+
+    for image_a, image_b in pairs:
+        key = tuple(sorted((image_a, image_b)))
+        edge = edge_by_pair.get(key, {})
+        similarity = similarity_by_pair.get(key)
+        decision = "not_evaluated" if similarity is None else str(similarity.get("visual_decision", "not_evaluated"))
+        pair_status = "not_evaluated" if similarity is None else str(similarity.get("pair_status", "not_evaluated"))
+        selected_pair = True
+        selection_reason = "p1_unavailable_kept"
+        if edge.get("reason") == "visual_recovery":
+            selected_pair = p1_available and pair_status == "ok" and decision == "geometry_supported"
+            selection_reason = "p1_recovery_geometry_supported" if selected_pair else "p1_recovery_unverified_rejected"
+            if not selected_pair:
+                rejected_decision_counts[decision] = rejected_decision_counts.get(decision, 0) + 1
+        elif p1_available:
+            if similarity is None:
+                selection_reason = "p1_not_evaluated_kept"
+                unreviewed_count += 1
+            elif pair_status != "ok":
+                selection_reason = "p1_unreadable_kept"
+            elif decision in P1_VISUAL_SUPPORT_DECISIONS:
+                selection_reason = "p1_visual_supported"
+            else:
+                selected_pair = False
+                selection_reason = f"p1_rejected_{decision}"
+                rejected_decision_counts[decision] = rejected_decision_counts.get(decision, 0) + 1
+        selection_reason_counts[selection_reason] = selection_reason_counts.get(selection_reason, 0) + 1
+        if selected_pair:
+            selected.append((image_a, image_b))
+        selection_rows.append(
+            {
+                "image_a": image_a,
+                "image_b": image_b,
+                "reason": edge.get("reason", ""),
+                "edge_weight": edge.get("edge_weight", ""),
+                "visual_decision": decision,
+                "pair_status": pair_status,
+                "visual_overlap_score": "" if similarity is None else similarity.get("visual_overlap_score", ""),
+                "selected": int(selected_pair),
+                "selection_reason": selection_reason,
+            }
+        )
+
+    summary = {
+        "status": "empty_selection" if pairs and not selected else "applied" if p1_available else "not_applied",
+        "p1_status": p1_status,
+        "input_pair_count": len(pairs),
+        "selected_pair_count": len(selected),
+        "rejected_pair_count": len(pairs) - len(selected),
+        "unreviewed_pair_count": unreviewed_count,
+        "fallback_used": False,
+        "selected_p2_contour_pair_count": sum(row["selected"] for row in selection_rows if row["reason"] in P2_CONTOUR_REASONS),
+        "selected_visual_recovery_pair_count": selection_reason_counts.get("p1_recovery_geometry_supported", 0),
+        "selection_reason_counts": dict(sorted(selection_reason_counts.items())),
+        "rejected_visual_decision_counts": dict(sorted(rejected_decision_counts.items())),
+        "explanation": (
+            "P2 determines the route-contour candidate graph. P1 keeps evaluated "
+            "pairs with visual support and rejects evaluated weak/no-overlap pairs; "
+            "unevaluated route pairs remain candidates. Recovery pairs require geometry, "
+            "and an all-rejected graph stays empty instead of restoring rejected pairs."
+        ),
+    }
+    return selected, selection_rows, summary
+
+
+def write_match_pair_filter(workspace_dir: Path, rows: Sequence[Dict[str, Any]], summary: Dict[str, Any]) -> None:
+    write_csv_rows(
+        workspace_dir / "match_pair_filter.csv",
+        [
+            "image_a",
+            "image_b",
+            "reason",
+            "edge_weight",
+            "visual_decision",
+            "pair_status",
+            "visual_overlap_score",
+            "selected",
+            "selection_reason",
+        ],
+        rows,
+    )
+    write_json(workspace_dir / "match_pair_filter_summary.json", summary)
 
 
 def write_match_graph_edges(workspace_dir: Path, edge_rows: Sequence[Dict[str, Any]]) -> None:
@@ -901,7 +1186,12 @@ def remove_stale_quality_reports(workspace_dir: Path) -> List[str]:
 
 def remove_stale_image_similarity_outputs(workspace_dir: Path) -> List[str]:
     removed: List[str] = []
-    for name in ("image_similarity_edges.csv", "image_similarity_summary.json"):
+    for name in (
+        "image_similarity_edges.csv",
+        "image_similarity_summary.json",
+        "match_pair_filter.csv",
+        "match_pair_filter_summary.json",
+    ):
         path = workspace_dir / name
         if path.exists():
             path.unlink()
@@ -969,6 +1259,7 @@ def write_sparse_batch(
     mask_dir: Optional[Path],
     camera_model: str,
     single_camera: bool,
+    single_camera_per_folder: bool,
     use_gpu: bool,
     matcher: str,
     align_to_pdr: bool,
@@ -980,6 +1271,7 @@ def write_sparse_batch(
 ) -> None:
     matcher_command = "sequential_matcher" if matcher == "sequential" else "exhaustive_matcher"
     single_camera_flag = "1" if single_camera else "0"
+    single_camera_per_folder_flag = "1" if single_camera_per_folder else "0"
     gpu_flag = "1" if use_gpu else "0"
     feature_extraction_threads = thread_option("FeatureExtraction", num_threads)
     feature_matching_threads = thread_option("FeatureMatching", num_threads)
@@ -988,7 +1280,7 @@ def write_sparse_batch(
     after_matching_cooldown = cooldown_block(stage_cooldown_s, "feature matching")
     after_mapper_cooldown = cooldown_block(stage_cooldown_s, "sparse mapping")
     thread_env = thread_environment_block(num_threads)
-    constrained_matching_block = f"""echo [2/4] Matching constrained image pairs from visual/order priors...
+    constrained_matching_block = f"""echo [2/4] Matching selected route pairs and geometry-supported visual recovery pairs...
 if not exist "%WORKSPACE%\\match_pairs.txt" (
   echo [error] Missing constrained pair list: %WORKSPACE%\\match_pairs.txt
   exit /b 1
@@ -1007,7 +1299,7 @@ if errorlevel 1 exit /b %errorlevel%
         matching_block = constrained_matching_block
     elif matcher == "hybrid":
         matching_block = constrained_matching_block + f"""
-echo [2b/4] Adding exhaustive visual bridge matches...
+echo [2b/4] Adding opt-in exhaustive visual bridge matches outside the P1/P2 pair gate...
 "%COLMAP_EXE%" exhaustive_matcher ^
   --database_path "%DATABASE%" ^
   --FeatureMatching.use_gpu {gpu_flag} ^
@@ -1071,6 +1363,10 @@ if exist "%WORKSPACE%\\pdr_alignment_refs.txt" (
 echo [4/4] Skipping PDR alignment for visual-only reconstruction.
 """
     content = batch_header(root, workspace_dir, colmap_exe) + f"""{thread_env}
+echo [preflight] Checking that sparse reconstruction starts from the current input set...
+python "%ROOT%\\colmap_workspace_check.py" --workspace "%WORKSPACE%" --require-clean-database
+if errorlevel 1 exit /b %errorlevel%
+
 if exist "%DATABASE%" (
   echo [warn] Existing database found: %DATABASE%
   echo [warn] If you changed matching constraints, run reset_colmap_outputs.bat first.
@@ -1084,6 +1380,7 @@ echo [1/4] Extracting features...
   --image_list_path "%IMAGE_LIST%" ^
   --ImageReader.camera_model {camera_model} ^
   --ImageReader.single_camera {single_camera_flag} ^
+  --ImageReader.single_camera_per_folder {single_camera_per_folder_flag} ^
   --FeatureExtraction.use_gpu {gpu_flag}{mask_option}{feature_limits}{feature_extraction_threads}
 if errorlevel 1 exit /b %errorlevel%
 {after_feature_cooldown}
@@ -1161,16 +1458,25 @@ if exist "%WORKSPACE%\\sparse_pdr_aligned\\0\\cameras.txt" set "SPARSE_MODEL=%WO
 echo [info] Dense input sparse model: %SPARSE_MODEL%
 """
     point_filter_block = ""
+    filter_preflight = ""
     if run_point_cloud_filter:
+        filter_preflight = """python -c "import numpy"
+if errorlevel 1 (
+  echo [error] Connected-density filtering requires NumPy in this Python environment.
+  exit /b 1
+)
+"""
         point_filter_block = f"""
 echo [4/8] Filtering dense point cloud outliers...
 python "%ROOT%\\point_cloud_filter.py" ^
   --input "%WORKSPACE%\\dense\\fused.ply" ^
   --output "%WORKSPACE%\\dense\\fused_filtered.ply" ^
   --summary "%WORKSPACE%\\dense\\point_filter_summary.json" ^
+  --method connected-density ^
   --max-points {point_filter_max_points}
 if errorlevel 1 (
-  echo [warn] Point cloud filtering failed; raw fused.ply is still available.
+  echo [error] Point cloud filtering failed; stopping before final promotion. Raw fused.ply is still available.
+  exit /b 1
 ) else (
   set "DENSE_POINT_CLOUD=%WORKSPACE%\\dense\\fused_filtered.ply"
 )
@@ -1207,26 +1513,29 @@ if errorlevel 1 echo [warn] Poisson meshing failed; continuing with fused point 
 python "%ROOT%\\reconstruction_quality.py" --workspace "%WORKSPACE%" --summary "%WORKSPACE%\\quality_report.json" --markdown "%WORKSPACE%\\QUALITY_REPORT.md"
 if errorlevel 1 echo [warn] Final quality report failed; reconstruction outputs are still available.
 """
-    keep_intermediate_flag = " ^\n  --keep-intermediate" if not cleanup_intermediate_ply else ""
+    keep_intermediate_default = "--keep-intermediate" if mesh_block or not cleanup_intermediate_ply else ""
     finalize_block = f"""
-echo [finalize] Selecting dense\\final.ply and pruning intermediate PLY files...
+set "FINALIZE_KEEP={keep_intermediate_default}"
+if "%KEEP_INTERMEDIATE_PLY%"=="1" set "FINALIZE_KEEP=--keep-intermediate"
+echo [finalize] Validating and selecting dense\\final.ply; applying the intermediate retention setting...
 python "%ROOT%\\finalize_dense_outputs.py" ^
   --dense-dir "%WORKSPACE%\\dense" ^
-  --summary "%WORKSPACE%\\dense\\final_output_summary.json"{keep_intermediate_flag}
+  --summary "%WORKSPACE%\\dense\\final_output_summary.json" %FINALIZE_KEEP%
 if errorlevel 1 exit /b %errorlevel%
 {after_postprocess_cooldown}
 """
     pdr_note = "PDR-aligned sparse models are preferred when present." if align_to_pdr else "Visual sparse models are used because visual-only mode is enabled."
     content = batch_header(root, workspace_dir, colmap_exe) + f"""{thread_env}
-{sparse_selector}if not exist "%SPARSE_MODEL%" (
+{filter_preflight}{sparse_selector}if not exist "%SPARSE_MODEL%" (
   echo [error] Sparse model not found: %SPARSE_MODEL%
   echo Run run_colmap_sparse.bat first, or check which sparse model folder COLMAP created.
   exit /b 1
 )
+echo [preflight] Verifying that database.db covers the current image list...
+python "%ROOT%\\colmap_workspace_check.py" --workspace "%WORKSPACE%" --require-database-coverage --require-sparse-model
+if errorlevel 1 exit /b %errorlevel%
 if not exist "%WORKSPACE%\\dense" mkdir "%WORKSPACE%\\dense"
 set "DENSE_POINT_CLOUD=%WORKSPACE%\\dense\\fused.ply"
-if exist "%WORKSPACE%\\dense\\final.ply" del "%WORKSPACE%\\dense\\final.ply"
-if exist "%WORKSPACE%\\dense\\final_output_summary.json" del "%WORKSPACE%\\dense\\final_output_summary.json"
 if exist "%WORKSPACE%\\dense\\meshed-poisson.ply" del "%WORKSPACE%\\dense\\meshed-poisson.ply"
 if exist "%WORKSPACE%\\dense\\meshed-delaunay.ply" del "%WORKSPACE%\\dense\\meshed-delaunay.ply"
 if exist "%WORKSPACE%\\dense\\fused_filtered.ply" del "%WORKSPACE%\\dense\\fused_filtered.ply"
@@ -1271,12 +1580,18 @@ def write_automatic_batch(
     colmap_exe: Path,
     camera_model: str,
     single_camera: bool,
+    single_camera_per_folder: bool,
     use_gpu: bool,
     quality: str,
 ) -> None:
     single_camera_flag = "1" if single_camera else "0"
+    single_camera_per_folder_flag = "1" if single_camera_per_folder else "0"
     gpu_flag = "1" if use_gpu else "0"
     content = batch_header(root, workspace_dir, colmap_exe) + f"""
+echo [preflight] Checking that automatic reconstruction starts from the current input set...
+python "%ROOT%\\colmap_workspace_check.py" --workspace "%WORKSPACE%" --require-clean-database
+if errorlevel 1 exit /b %errorlevel%
+
 echo [info] Running COLMAP automatic_reconstructor...
 "%COLMAP_EXE%" automatic_reconstructor ^
   --workspace_path "%WORKSPACE%" ^
@@ -1284,6 +1599,7 @@ echo [info] Running COLMAP automatic_reconstructor...
   --image_list_path "%IMAGE_LIST%" ^
   --camera_model {camera_model} ^
   --single_camera {single_camera_flag} ^
+  --single_camera_per_folder {single_camera_per_folder_flag} ^
   --use_gpu {gpu_flag} ^
   --quality {quality} ^
   --dense 1
@@ -1361,24 +1677,33 @@ This folder is prepared from the current WiFi/IMU/photo capture.
 2. Run `run_colmap_dense.bat` to generate the dense result and reports.
 3. Open `dense/final.ply` in MeshLab for the final reconstruction view.
 
-For normal rebuilds, prefer `python run_colmap.py full` from the project root; it clears old COLMAP outputs automatically before running sparse and dense reconstruction. If you run these generated `.bat` scripts directly and they report existing outputs, run `reset_colmap_outputs.bat` first; it asks you to type `YES` before deleting old outputs.
+For normal rebuilds, prefer `python run_colmap.py full` from the project root; it clears old COLMAP outputs automatically before running sparse and dense reconstruction. The generated dense script verifies that `database.db` covers the current `image_list.txt` before it can replace an existing dense result. If you run these generated `.bat` scripts directly and they report existing outputs, run `reset_colmap_outputs.bat` first; it asks you to type `YES` before deleting old outputs.
 
 The generated scripts favor reconstruction quality over speed. The sparse matcher is `{matcher}` and the dense profile is `{dense_profile}`.
 The load profile is `{load_profile}` with COLMAP thread cap `{num_threads}` and `{stage_cooldown_s}` seconds of cooldown between heavy stages.
 
 ## Why This Setup
 
-- Hybrid matching first uses explainable WiFi checkpoint, ordered-PDR-contour, and video-order pairs, then adds COLMAP exhaustive visual bridge matches to reduce disconnected sparse components. `match_graph_edges.csv` explains the constrained pairs; exhaustive bridge matches are generated internally by COLMAP.
-- `image_similarity_edges.csv` checks the constrained pairs with perceptual hash, color histogram, ORB matches, and fundamental-matrix inliers. This is diagnostic evidence; it does not delete COLMAP pairs automatically.
+- P2 builds route candidates from adjacent WiFi/PDR anchors, bounded along-route distance, nearby photo slots, and video order. `match_pairs_route.txt` preserves them. Missing contour annotations only permit fallback among unannotated anchors, without removing known contour breaks.
+- P1 requires actual ORB matches for feature/near-duplicate support. Evaluated weak/no-overlap route candidates are removed; unreviewed or unreadable route candidates remain. An all-rejected graph is not restored.
+- Visual recovery retrieves up to 12 non-route neighbors per image by default; only geometry-supported candidates enter the selected list. `--visual-recovery-neighbors 0` disables recovery. `--skip-image-similarity` disables both P1 and recovery. The route evaluation cap does not apply to the separate recovery neighbor budget.
+- `match_pairs_unfiltered.txt` contains route and recovery candidates; `match_pair_filter.csv` records every decision. These are preparation counts, not verified COLMAP matches or measured gains.
+- The default `constrained` matcher imports only the selected route/recovery list. `hybrid` additionally runs exhaustive visual matching outside this gate. COLMAP performs its own matching and geometric verification.
 - Dense fusion uses a completeness-oriented profile for indoor weak-texture floor and wall regions.
 - `metadata/pdr_trajectory_contour.csv` is the time-ordered IMU/PDR route corridor used as a soft matching constraint. It is not a room boundary, mesh-completion source, or pose optimizer.
-- If `--colmap-mask-dir` was provided during preprocessing and the directory exists, feature extraction and dense fusion use those masks to suppress semantic clutter such as desks and chairs.
-- Mesh outputs are finalized into `dense/final.ply` so the result directory has one obvious model to open.
-- Intermediate dense PLY files are removed by default after `final.ply` is selected; set `KEEP_INTERMEDIATE_PLY=1` before running the batch if you need debug artifacts.
+- Video frames can inherit interpolated contour positions only as soft matching evidence; they are intentionally excluded from PDR model alignment.
+- When both sources are present, checkpoint photos and video frames use `images/anchors/` and `images/video/` so COLMAP can share intrinsics within each source group rather than across them.
+- If `--colmap-mask-dir` was provided during preprocessing and the directory exists, feature extraction and dense fusion use those masks to suppress semantic clutter or known reflective regions. Masks must follow the generated relative input names.
+- No synthetic mirror, floor, or wall completion is added to `final.ply`.
+- `dense/final.ply` defaults to the filtered observed point cloud. Meshing is disabled unless `--colmap-meshing` is requested; then inspection meshes and other intermediates are retained. Meshes may interpolate unobserved surfaces.
+- Finalization validates the complete PLY, stages a verified copy, and replaces `final.ply` before removing known intermediates. Invalid sources and failed promotions cannot trigger that cleanup. A full rebuild still deliberately resets outputs first.
+- Dense filtering selects the dominant density-connected observed component before any sampling. The complete profile retains all supported points in binary PLY; smaller profiles use fixed-seed uniform sampling. No synthetic surfaces or trajectory-boundary crop are used.
+- Raw `fused.ply` is retained for comparison and recovery. Other known intermediate dense PLY files are removed by default after successful finalization; set `KEEP_INTERMEDIATE_PLY=1` before running the batch to retain all of them. Unrelated PLY files are not removed.
 
 ## Inputs
 
-- `images/`: renamed WiFi-point photos plus optional video base frames.
+- `images/anchors/`: renamed WiFi checkpoint photos.
+- `images/video/`: optional route-video base frames.
 - `image_list.txt`: exact image list passed to COLMAP.
 - `metadata/camera_pose_seed.csv`: PDR XY plus ordered point-photo yaw seed.
 - `metadata/wifi_fingerprint_library.csv`: WiFi fingerprint table.
@@ -1388,16 +1713,18 @@ The load profile is `{load_profile}` with COLMAP thread cap `{num_threads}` and 
 - `metadata/wifi_signal_grid.csv`: interpolated RSSI field inside the sampled area.
 - `metadata/wifi_signal_boundary.csv`: RSSI metrics on the WiFi/PDR boundary.
 - `metadata/video_frames_manifest.csv`: optional video frames used as a weak visual base.
-- `match_pairs.txt`: constrained COLMAP image pairs from WiFi checkpoint order,
-  neighboring angular slots, ordered PDR-contour distance, and video-frame sequence order.
+- `match_pairs_route.txt`: raw P2 route-contour candidate pairs retained for inspection and ablation.
+- `match_pairs_unfiltered.txt`: combined route and visual-recovery candidates before selection.
+- `match_pairs.txt`: P1-selected pairs passed to the default constrained COLMAP matcher.
 - `match_graph_edges.csv`: diagnostic weighted edge list with pair reasons, scores, and original slot counts.
-- `image_similarity_edges.csv` / `image_similarity_summary.json`: P1 visual-support diagnostics for the constrained match graph.
+- `image_similarity_edges.csv` / `image_similarity_summary.json`: P1 visual evidence for route and recovery candidates.
+- `match_pair_filter.csv` / `match_pair_filter_summary.json`: P1 keep/drop decisions and selected-pair counts.
 {pdr_ref_line}
 
 ## Outputs After Running COLMAP
 
 - `QUALITY_REPORT.md` / `quality_report.json`: sparse component counts, largest registered-image count, and dense-output availability.
-- `dense/final.ply`: final dense model to open; Poisson mesh is preferred, with Delaunay or point-cloud fallback if meshing fails.
+- `dense/final.ply`: final dense model to open; filtered observed point cloud is preferred, with raw point-cloud and mesh fallback only when needed.
 - `dense/final_output_summary.json`: source chosen for `final.ply` and intermediate files removed during cleanup.
 
 {alignment_note}
@@ -1426,7 +1753,7 @@ def prepare_colmap_workspace(
     colmap_num_threads: Optional[int] = None,
     stage_cooldown_s: Optional[int] = None,
     dense_profile: str = "complete",
-    run_meshing: bool = True,
+    run_meshing: bool = False,
     run_point_cloud_filter: bool = True,
     constrained_point_window: int = 2,
     constrained_slot_window: int = 3,
@@ -1439,8 +1766,14 @@ def prepare_colmap_workspace(
     image_similarity_max_image_size: int = 900,
     image_similarity_orb_features: int = 1500,
     image_similarity_min_visual_score: float = 0.22,
+    visual_recovery_neighbors: int = 12,
 ) -> Dict[str, Any]:
-    _fields, manifest_rows = read_csv(reconstruction_dir / "images_manifest.csv")
+    matcher = matcher if matcher in {"constrained", "hybrid", "exhaustive", "sequential"} else "constrained"
+    manifest_fields, manifest_rows = read_csv(reconstruction_dir / "images_manifest.csv")
+    workspace_manifest_rows = build_workspace_manifest(manifest_rows)
+    camera_groups = camera_grouping_summary(workspace_manifest_rows)
+    effective_single_camera = bool(single_camera and camera_groups["single_camera"])
+    effective_single_camera_per_folder = bool(camera_groups["single_camera_per_folder"])
     workspace_dir.mkdir(parents=True, exist_ok=True)
     existing_colmap_outputs = [
         name
@@ -1463,14 +1796,27 @@ def prepare_colmap_workspace(
     copied_images, image_names, missing_images, removed_stale_workspace_images = copy_images(
         reconstruction_dir,
         workspace_dir,
-        manifest_rows,
+        workspace_manifest_rows,
     )
     copied_metadata = copy_metadata(reconstruction_dir, workspace_dir)
+    workspace_manifest_fields = [
+        *manifest_fields,
+        *[
+            field
+            for field in ("source_image_file", "workspace_image_group")
+            if field not in manifest_fields
+        ],
+    ]
+    write_csv_rows(
+        workspace_dir / "metadata" / "images_manifest.csv",
+        workspace_manifest_fields,
+        workspace_manifest_rows,
+    )
     mask_summary = mask_dir_summary(resolved_mask_dir, image_names)
     active_mask_dir = resolved_mask_dir if mask_summary.get("enabled") else None
     write_image_list(workspace_dir, image_names)
     match_pairs, match_edge_rows, match_pair_summary = build_constrained_match_pairs(
-        manifest_rows=manifest_rows,
+        manifest_rows=workspace_manifest_rows,
         point_window=constrained_point_window,
         slot_window=constrained_slot_window,
         max_pdr_distance_m=constrained_max_pdr_distance_m,
@@ -1479,8 +1825,8 @@ def prepare_colmap_workspace(
         video_anchor_limit=constrained_video_anchor_limit,
         visual_only=visual_only,
     )
-    write_match_pairs(workspace_dir, match_pairs)
-    write_match_graph_edges(workspace_dir, match_edge_rows)
+    route_pair_count = len(match_pairs)
+    write_named_match_pairs(workspace_dir, "match_pairs_route.txt", match_pairs)
     if run_image_similarity:
         try:
             image_similarity_summary = analyze_workspace_image_similarity(
@@ -1490,6 +1836,8 @@ def prepare_colmap_workspace(
                 max_image_size=image_similarity_max_image_size,
                 orb_features=image_similarity_orb_features,
                 min_visual_score=image_similarity_min_visual_score,
+                recovery_image_names=image_names,
+                recovery_neighbors=visual_recovery_neighbors,
             )
         except Exception as exc:
             image_similarity_summary = {
@@ -1509,21 +1857,70 @@ def prepare_colmap_workspace(
             "output_csv": str(workspace_dir / "image_similarity_edges.csv"),
         }
         write_json(workspace_dir / "image_similarity_summary.json", image_similarity_summary)
+    _similarity_fields, similarity_rows = read_csv(workspace_dir / "image_similarity_edges.csv")
+    source_by_image = {row["image_file"]: row.get("source_type", "") for row in workspace_manifest_rows}
+    recovery_edges = [
+        {
+            "image_a": row["image_a"], "image_b": row["image_b"], "reason": "visual_recovery",
+            "source_type_a": source_by_image.get(row["image_a"], ""),
+            "source_type_b": source_by_image.get(row["image_b"], ""),
+            "edge_weight": row.get("edge_weight", ""),
+            "edge_weight_basis": "appearance_retrieval_only_requires_geometry",
+        }
+        for row in similarity_rows if row.get("reason") == "visual_recovery"
+    ]
+    match_edge_rows.extend(recovery_edges)
+    match_pairs = sorted(set(match_pairs) | {(row["image_a"], row["image_b"]) for row in recovery_edges})
+    write_named_match_pairs(workspace_dir, "match_pairs_unfiltered.txt", match_pairs)
+    write_match_graph_edges(workspace_dir, match_edge_rows)
+    colmap_match_pairs, match_pair_filter_rows, match_pair_filter_summary = select_visually_supported_match_pairs(
+        pairs=match_pairs,
+        edge_rows=match_edge_rows,
+        similarity_rows=similarity_rows,
+        similarity_summary=image_similarity_summary,
+    )
+    write_match_pairs(workspace_dir, colmap_match_pairs)
+    match_pair_filter_summary.update({
+        "matcher": matcher,
+        "pair_list_used_by_sparse_matcher": matcher in {"constrained", "hybrid"},
+        "pair_gate_enforced": matcher == "constrained",
+    })
+    write_match_pair_filter(workspace_dir, match_pair_filter_rows, match_pair_filter_summary)
+    match_pair_summary.update(
+        {
+            "unfiltered_pair_count": len(match_pairs),
+            "pair_count": len(match_pairs),
+            "route_candidate_pair_count": route_pair_count,
+            "visual_recovery_candidate_pair_count": len(recovery_edges),
+            "weight_statistics_scope": "route_candidates_only",
+            "colmap_pair_count": len(colmap_match_pairs),
+            "p1_pair_filter": match_pair_filter_summary,
+        }
+    )
+    if recovery_edges:
+        match_pair_summary["reason_counts"]["visual_recovery"] = len(recovery_edges)
+    image_similarity_summary["used_for_colmap_pair_selection"] = (
+        match_pair_filter_summary.get("status") == "applied" and matcher in {"constrained", "hybrid"}
+    )
+    image_similarity_summary["diagnostic_only"] = not image_similarity_summary["used_for_colmap_pair_selection"]
+    write_json(workspace_dir / "image_similarity_summary.json", image_similarity_summary)
+    if not colmap_match_pairs and matcher in {"constrained", "hybrid"}:
+        raise ValueError("No supported match pairs remain. Inspect match_pair_filter_summary.json and image coverage before reconstruction.")
     align_to_pdr = not visual_only
     if align_to_pdr:
-        pdr_alignment_ref_count = write_pdr_alignment_refs(workspace_dir, manifest_rows)
+        pdr_alignment_ref_count = write_pdr_alignment_refs(workspace_dir, workspace_manifest_rows)
     else:
         remove_pdr_alignment_refs(workspace_dir)
         pdr_alignment_ref_count = 0
 
-    matcher = matcher if matcher in {"constrained", "hybrid", "exhaustive", "sequential"} else "constrained"
     write_sparse_batch(
         root=root,
         workspace_dir=workspace_dir,
         colmap_exe=resolved_colmap_exe,
         mask_dir=active_mask_dir,
         camera_model=camera_model,
-        single_camera=single_camera,
+        single_camera=effective_single_camera,
+        single_camera_per_folder=effective_single_camera_per_folder,
         use_gpu=use_gpu,
         matcher=matcher,
         align_to_pdr=align_to_pdr,
@@ -1552,7 +1949,8 @@ def prepare_colmap_workspace(
         workspace_dir=workspace_dir,
         colmap_exe=resolved_colmap_exe,
         camera_model=camera_model,
-        single_camera=single_camera,
+        single_camera=effective_single_camera,
+        single_camera_per_folder=effective_single_camera_per_folder,
         use_gpu=use_gpu,
         quality=quality,
     )
@@ -1587,7 +1985,9 @@ def prepare_colmap_workspace(
         "metadata_files": copied_metadata,
         "colmap_mask": mask_summary,
         "camera_model": camera_model,
-        "single_camera": single_camera,
+        "single_camera": effective_single_camera,
+        "single_camera_per_folder": effective_single_camera_per_folder,
+        "camera_grouping": camera_groups,
         "use_gpu": use_gpu,
         "matcher": matcher,
         "visual_only": visual_only,
@@ -1610,7 +2010,8 @@ def prepare_colmap_workspace(
         "dense_profile_config": profile_config,
         "run_meshing": effective_run_meshing,
         "run_point_cloud_filter": run_point_cloud_filter,
-        "cleanup_intermediate_ply": bool(profile_config.get("cleanup_intermediate_ply", True)),
+        "cleanup_intermediate_ply": bool(profile_config.get("cleanup_intermediate_ply", True)) and not effective_run_meshing,
+        "cleanup_runtime_override": "KEEP_INTERMEDIATE_PLY=1 retains intermediate PLY files",
         "requested_run_meshing": run_meshing,
         "sparse_model_selection": (
             "run_colmap_dense.bat prefers sparse_pdr_aligned/0 when it exists, otherwise it uses sparse/0."

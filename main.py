@@ -7,7 +7,6 @@ from pathlib import Path
 
 from preprocess_pipeline import main as run_pipeline
 from preprocess_pipeline import parse_args as parse_pipeline_args
-from preprocess_pipeline import prepare_colmap_workspace_from_args
 from run_colmap import confirm_full_colmap_run, run_colmap_script
 
 
@@ -55,19 +54,10 @@ def ask_low_peak_colmap_mode() -> bool:
     return answer not in {"n", "no"}
 
 
-def prepare_selected_colmap_mode(args, use_low_peak: bool) -> None:
+def selected_colmap_mode_args(use_low_peak: bool) -> list[str]:
     if use_low_peak:
-        print("[info] enabling quality-preserving low-peak COLMAP mode...")
-        prepare_colmap_workspace_from_args(args, load_profile_override="low-peak")
-        return
-
-    print("[warn] low-peak mode disabled; COLMAP may use higher instantaneous CPU/GPU load.")
-    prepare_colmap_workspace_from_args(
-        args,
-        load_profile_override="max",
-        colmap_num_threads_override=0,
-        stage_cooldown_s_override=0,
-    )
+        return ["--colmap-load-profile", "low-peak"]
+    return ["--colmap-load-profile", "max", "--colmap-num-threads", "0", "--colmap-stage-cooldown-s", "0"]
 
 
 def ask_colmap_run_plan(args) -> tuple[bool, bool]:
@@ -93,11 +83,12 @@ def main() -> int:
     argv = [*DEFAULT_ARGS, *sys.argv[1:]]
     args = parse_pipeline_args(argv)
     run_after_preprocess, use_low_peak_colmap = ask_colmap_run_plan(args)
+    if run_after_preprocess:
+        argv.extend(selected_colmap_mode_args(use_low_peak_colmap))
     pipeline_result = run_pipeline(argv)
     if pipeline_result != 0:
         return pipeline_result
     if run_after_preprocess:
-        prepare_selected_colmap_mode(args, use_low_peak_colmap)
         return run_colmap(args)
     return 0
 

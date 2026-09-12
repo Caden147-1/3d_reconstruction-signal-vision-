@@ -12,6 +12,9 @@ import struct
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from colmap_workspace_check import dense_input_model, inspect_sparse_model, inspect_workspace
+from point_cloud_filter import sampling_quality_warning
+
 
 SPARSE_ROOTS = ("sparse",)
 ALIGNED_SPARSE_ROOTS = ("sparse_pdr_aligned", "sparse_pose_prior")
@@ -90,9 +93,14 @@ def sparse_model_has_files(model_dir: Path) -> bool:
 
 
 def sparse_model_stats(model_dir: Path, root_name: str) -> Dict[str, Any]:
-    registered_images = read_uint64_prefix(model_dir / "images.bin")
-    sparse_points = read_uint64_prefix(model_dir / "points3D.bin")
-    exists = sparse_model_has_files(model_dir)
+    error = ""
+    registered_images = sparse_points = 0
+    try:
+        model = inspect_sparse_model(model_dir)
+        registered_images, sparse_points = len(model["names"]), model["point_count"]
+    except (OSError, ValueError, struct.error) as exc:
+        error = str(exc)
+    exists = not error
     return {
         "model": model_dir.name,
         "root": root_name,
@@ -101,6 +109,7 @@ def sparse_model_stats(model_dir: Path, root_name: str) -> Dict[str, Any]:
         "registered_images": registered_images,
         "sparse_points": sparse_points,
         "exists": exists,
+        "error": error,
     }
 
 
@@ -128,12 +137,14 @@ def collect_sparse_models(
             if stats["exists"]:
                 aligned_models.append(stats)
 
-    largest = max(raw_models, key=lambda row: row.get("registered_images") or 0, default=None)
-    selected = aligned_models[0] if aligned_models else largest
+    valid_raw = [row for row in raw_models if row["exists"]]
+    largest = max(valid_raw, key=lambda row: row.get("registered_images") or 0, default=None)
+    dense_path = dense_input_model(workspace_dir)
+    selected = next((row for row in [*raw_models, *aligned_models] if Path(row["path"]) == dense_path), None)
     largest_registered = (largest or {}).get("registered_images") or 0
     selected_registered = (selected or {}).get("registered_images") or 0
     return {
-        "component_count": len(raw_models),
+        "component_count": len(valid_raw),
         "models": raw_models,
         "largest_component": largest,
         "registered_image_ratio": (
@@ -293,6 +304,31 @@ def summarize_image_similarity(workspace_dir: Path) -> Dict[str, Any]:
     }
 
 
+def summarize_match_pair_filter(workspace_dir: Path, workspace_summary: Dict[str, Any]) -> Dict[str, Any]:
+    summary_path = workspace_dir / "match_pair_filter_summary.json"
+    csv_path = workspace_dir / "match_pair_filter.csv"
+    summary = read_json(summary_path)
+    if not summary:
+        constrained = workspace_summary.get("constrained_match_pairs", {})
+        embedded = constrained.get("p1_pair_filter", {}) if isinstance(constrained, dict) else {}
+        summary = dict(embedded) if isinstance(embedded, dict) else {}
+    if summary:
+        summary.setdefault("exists", summary_path.exists() or csv_path.exists())
+        summary.setdefault("summary_path", str(summary_path))
+        summary.setdefault("output_csv", str(csv_path))
+        return summary
+    return {
+        "exists": False,
+        "status": "missing",
+        "input_pair_count": 0,
+        "selected_pair_count": 0,
+        "rejected_pair_count": 0,
+        "unreviewed_pair_count": 0,
+        "fallback_used": False,
+        "selection_reason_counts": {},
+    }
+
+
 def database_status(workspace: Path) -> Dict[str, Any]:
     database = workspace / "database.db"
     if not database.exists():
@@ -335,8 +371,10 @@ def image_directory_status(workspace: Path, image_list: Sequence[str]) -> Dict[s
 def relative_status(
     workspace_summary: Dict[str, Any],
     database: Dict[str, Any],
+    input_coverage: Dict[str, Any],
     image_directory: Dict[str, Any],
     image_similarity: Dict[str, Any],
+    match_pair_filter: Dict[str, Any],
     sparse: Dict[str, Any],
     dense: Dict[str, Any],
     input_image_count: int,
@@ -357,8 +395,32 @@ def relative_status(
 
     if database.get("error"):
         warnings.append(f"Could not inspect COLMAP database: {database['error']}")
+    database_coverage = input_coverage.get("database", {})
+    sparse_coverage = input_coverage.get("dense_input_sparse", {})
+    if sparse_coverage.get("error"):
+        warnings.append(f"Dense input sparse model is invalid: {sparse_coverage['error']}")
+    if sparse_coverage.get("extra_names"):
+        warnings.append("Dense input sparse model includes images outside the current input list.")
+    database_name_mismatch = bool(
+        database_coverage.get("missing_names") or database_coverage.get("extra_names")
+    )
     if database["exists"] and input_image_count and database["image_count"] != input_image_count:
         warnings.append("COLMAP database image count does not match image_list.txt; rebuild sparse from a reset workspace.")
+    elif database_name_mismatch:
+        warnings.append("COLMAP database image names do not match image_list.txt; rebuild sparse from a reset workspace.")
+
+    expected_video = database_coverage.get("source_coverage", {}).get("video_base_frame", {})
+    database_video = expected_video.get("present_count", 0)
+    video_count = expected_video.get("expected_count", 0)
+    sparse_video = sparse_coverage.get("source_coverage", {}).get("video_base_frame", {}).get("present_count", 0)
+    if video_count and database_video < video_count:
+        warnings.append(
+            f"Only {database_video}/{video_count} video frame(s) reached the COLMAP database; dense output cannot use the missing frames."
+        )
+    elif video_count and sparse_coverage.get("exists") and sparse_video == 0:
+        warnings.append(
+            "Video frames reached the COLMAP database but none registered in the selected sparse model; they currently provide no dense coverage."
+        )
 
     if sparse["component_count"] == 0:
         warnings.append("No sparse COLMAP model was found yet.")
@@ -375,6 +437,9 @@ def relative_status(
         workspace_summary.get("cleanup_intermediate_ply") or dense.get("intermediate_ply_cleanup")
     )
     dense_available = bool(dense["final_exists"] or dense["fused_exists"])
+    filter_warning = sampling_quality_warning(dense.get("point_filter_summary", {}))
+    if filter_warning:
+        warnings.append(filter_warning)
     if not dense_available:
         warnings.append("Dense final.ply does not exist yet.")
     elif not dense["final_exists"]:
@@ -401,12 +466,33 @@ def relative_status(
             "P1 image-similarity diagnostics are "
             f"{image_similarity.get('status')}: {image_similarity.get('reason', '')}"
         )
+    if match_pair_filter.get("status") == "applied":
+        notes.append(
+            "P1 prepared "
+            f"{match_pair_filter.get('selected_pair_count', 0)}/"
+            f"{match_pair_filter.get('input_pair_count', 0)} route/recovery candidates in match_pairs.txt "
+            f"and rejected {match_pair_filter.get('rejected_pair_count', 0)} candidates. These are input-list counts, not COLMAP-verified matches."
+        )
+    elif match_pair_filter.get("status") == "empty_selection":
+        warnings.append("P1 rejected all candidates. The empty match list must be resolved before constrained reconstruction.")
+    elif match_pair_filter.get("status") in {"not_applied", "missing"}:
+        notes.append(
+            "P1 pair selection was not recorded or was disabled; no visual selection benefit can be inferred."
+        )
+    if match_pair_filter.get("pair_gate_enforced") is False:
+        notes.append("The selected matcher can generate matches outside this pair list; P1/P2 selection does not bound its final match graph.")
     trajectory_constraint = workspace_summary.get("constrained_match_pairs", {})
     if trajectory_constraint.get("trajectory_constraint_available"):
+        p2_contour_edges = trajectory_constraint.get("p2_contour_edge_count")
         notes.append(
-            "P2 uses the ordered IMU/PDR route contour as a soft match-pair constraint; "
-            "it does not add synthetic geometry to final.ply."
+            "P2 uses the ordered IMU/PDR route contour as a soft match-pair constraint and contributed "
+            f"{p2_contour_edges if p2_contour_edges is not None else 'unreported'} route-contour candidate edge(s). "
+            "This counts construction reasons, not incremental edges or a measured reconstruction gain; P2 adds no synthetic geometry."
         )
+        if p2_contour_edges == 0:
+            warnings.append(
+                "P2 contour metadata is available but produced no route-contour candidate edges; inspect match_graph_edges.csv before relying on the constraint."
+            )
     elif not workspace_summary.get("visual_only") and workspace_summary:
         warnings.append(
             "Trajectory-contour metadata is unavailable, so constrained matching falls back to XY PDR proximity."
@@ -415,7 +501,10 @@ def relative_status(
     needs_rerun = (
         bool(database.get("error"))
         or (database["exists"] and input_image_count and database["image_count"] != input_image_count)
+        or database_name_mismatch
         or bool(image_directory["missing_listed_count"])
+        or bool(sparse_coverage.get("error"))
+        or bool(sparse_coverage.get("extra_names"))
     )
     if needs_rerun:
         status = "needs_colmap_rerun"
@@ -423,6 +512,8 @@ def relative_status(
         status = "missing_sparse"
     elif not dense_available:
         status = "sparse_available_dense_missing"
+    elif filter_warning:
+        status = "dense_needs_review"
     else:
         status = "ok"
     return status, warnings, notes
@@ -434,9 +525,16 @@ def build_next_actions(report: Dict[str, Any]) -> List[str]:
     images = report["image_directory"]
     sparse = report["sparse"]
     dense = report["dense"]
+    if sampling_quality_warning(dense.get("point_filter_summary", {})):
+        actions.append("Inspect fused.ply and rerun only post-filtering with the corrected sampler; if fused.ply was deleted, re-fuse the retained depth maps first.")
     input_count = report["input_image_count"]
+    coverage = report.get("input_coverage", {})
+    database_coverage = coverage.get("database", {})
+    sparse_coverage = coverage.get("dense_input_sparse", {})
     needs_clean_sparse = (
         (database["exists"] and input_count and database["image_count"] != input_count)
+        or bool(database_coverage.get("missing_names"))
+        or bool(database_coverage.get("extra_names"))
         or bool(images["extra_file_count"])
         or bool(images["missing_listed_count"])
     )
@@ -447,6 +545,10 @@ def build_next_actions(report: Dict[str, Any]) -> List[str]:
         actions.append("Run `python run_colmap.py sparse` to create a sparse model.")
     elif not sparse.get("pdr_aligned_exists") and report["workspace_summary"].get("pdr_alignment_enabled"):
         actions.append("Rerun `python run_colmap.py sparse`; PDR alignment should now create sparse_pdr_aligned/0 first.")
+    expected_video = database_coverage.get("source_coverage", {}).get("video_base_frame", {})
+    selected_video = sparse_coverage.get("source_coverage", {}).get("video_base_frame", {})
+    if expected_video.get("expected_count", 0) and selected_video.get("present_count", 0) == 0 and not needs_clean_sparse:
+        actions.append("Video frames are not registered in the selected sparse model; inspect video/anchor overlap and P1 diagnostics before judging dense completeness.")
     if sparse["component_count"] > 0 and not dense["final_exists"]:
         actions.append("Run `python run_colmap.py dense` to create `colmap_workspace/dense/final.ply`.")
     return actions
@@ -466,15 +568,19 @@ def build_report(root: Path, processed_dir: Path, reconstruction_dir: Path, work
     )
     match_graph = summarize_match_graph(workspace_dir / "match_graph_edges.csv")
     image_similarity = summarize_image_similarity(workspace_dir)
+    match_pair_filter = summarize_match_pair_filter(workspace_dir, workspace_summary)
     sparse = collect_sparse_models(workspace_dir, input_image_count)
     dense = summarize_dense(workspace_dir)
     database = database_status(workspace_dir)
     image_directory = image_directory_status(workspace_dir, image_list)
+    input_coverage = inspect_workspace(workspace_dir)
     status, warnings, notes = relative_status(
         workspace_summary=workspace_summary,
         database=database,
+        input_coverage=input_coverage,
         image_directory=image_directory,
         image_similarity=image_similarity,
+        match_pair_filter=match_pair_filter,
         sparse=sparse,
         dense=dense,
         input_image_count=input_image_count,
@@ -493,8 +599,10 @@ def build_report(root: Path, processed_dir: Path, reconstruction_dir: Path, work
         "colmap_reset_recommended": bool(workspace_summary.get("colmap_reset_recommended")),
         "image_directory": image_directory,
         "database": database,
+        "input_coverage": input_coverage,
         "match_graph": match_graph,
         "image_similarity": image_similarity,
+        "match_pair_filter": match_pair_filter,
         "sparse": sparse,
         "dense": dense,
         "warnings": warnings,
@@ -528,7 +636,23 @@ def render_markdown(report: Dict[str, Any]) -> str:
     dense = report["dense"]
     match_graph = report["match_graph"]
     image_similarity = report["image_similarity"]
+    match_pair_filter = report.get("match_pair_filter", {})
     images = report["image_directory"]
+    coverage = report.get("input_coverage", {})
+    database_coverage = coverage.get("database", {}).get("source_coverage", {})
+    sparse_coverage = coverage.get("dense_input_sparse", {}).get("source_coverage", {})
+    expected_video = database_coverage.get("video_base_frame", {})
+    selected_video = sparse_coverage.get("video_base_frame", {})
+    database_video_coverage = (
+        f"{expected_video.get('present_count', 0)}/{expected_video.get('expected_count', 0)}"
+        if expected_video
+        else "-"
+    )
+    sparse_video_coverage = (
+        f"{selected_video.get('present_count', 0)}/{selected_video.get('expected_count', 0)}"
+        if selected_video
+        else "-"
+    )
     largest = sparse.get("largest_component") or {}
     selected = sparse.get("selected_model") or {}
     rows = [
@@ -538,11 +662,20 @@ def render_markdown(report: Dict[str, Any]) -> str:
         ("Extra image files not in image_list.txt", images["extra_file_count"]),
         ("Missing image_list.txt files", images["missing_listed_count"]),
         ("Database images", report["database"]["image_count"] if report["database"]["exists"] else "missing"),
+        ("Video frames in database", database_video_coverage),
+        ("Video frames in selected sparse model", sparse_video_coverage),
         ("Match graph edges", match_graph["edge_count"]),
         ("P1 image similarity status", image_similarity.get("status", "missing")),
         ("P1 image pairs evaluated", image_similarity.get("evaluated_pair_count", 0)),
         ("P1 visually supported pairs", image_similarity.get("visual_supported_pair_count", 0)),
         ("P1 near-duplicate pairs", image_similarity.get("near_duplicate_pair_count", 0)),
+        ("P1 pair selection status", match_pair_filter.get("status", "missing")),
+        ("P1 prepared pair list", f"{match_pair_filter.get('selected_pair_count', 0)}/{match_pair_filter.get('input_pair_count', 0)}"),
+        ("Pair list used by configured matcher", match_pair_filter.get("pair_list_used_by_sparse_matcher", "unreported")),
+        ("Pair gate enforced", match_pair_filter.get("pair_gate_enforced", "unreported")),
+        ("Selected P2 contour pairs", match_pair_filter.get("selected_p2_contour_pair_count", "unreported")),
+        ("Selected geometry-supported recovery pairs", match_pair_filter.get("selected_visual_recovery_pair_count", "unreported")),
+        ("P1 rejected evaluated pairs", match_pair_filter.get("rejected_pair_count", 0)),
         ("Sparse components", sparse["component_count"]),
         ("Largest sparse model", largest.get("label", "-")),
         ("Largest registered images", largest.get("registered_images", 0)),
@@ -565,6 +698,16 @@ def render_markdown(report: Dict[str, Any]) -> str:
             "P2 trajectory contour mode",
             report["workspace_summary"].get("constrained_match_pairs", {}).get("trajectory_constraint_mode", "missing"),
         ),
+        (
+            "P2 route-contour candidate edges",
+            report["workspace_summary"].get("constrained_match_pairs", {}).get("p2_contour_edge_count", "missing"),
+        ),
+        (
+            "P2 video frames with contour coordinates",
+            report["workspace_summary"].get("constrained_match_pairs", {}).get(
+                "video_frames_with_trajectory_contour", "missing"
+            ),
+        ),
     ]
 
     reason_lines = ["| Reason | Count |", "| --- | --- |"]
@@ -574,6 +717,10 @@ def render_markdown(report: Dict[str, Any]) -> str:
     similarity_lines = ["| Decision | Count |", "| --- | --- |"]
     for decision, count in image_similarity.get("visual_decision_counts", {}).items():
         similarity_lines.append(f"| {decision} | {count} |")
+
+    selection_lines = ["| Selection reason | Count |", "| --- | --- |"]
+    for reason, count in match_pair_filter.get("selection_reason_counts", {}).items():
+        selection_lines.append(f"| {reason} | {count} |")
 
     warning_lines = "\n".join(f"- {warning}" for warning in report.get("warnings", [])) or "- None"
     note_lines = "\n".join(f"- {note}" for note in report.get("notes", [])) or "- None"
@@ -585,6 +732,8 @@ def render_markdown(report: Dict[str, Any]) -> str:
         f"{chr(10).join(reason_lines)}\n\n"
         "## P1 Image Similarity\n\n"
         f"{chr(10).join(similarity_lines)}\n\n"
+        "## P1 Pair Selection\n\n"
+        f"{chr(10).join(selection_lines)}\n\n"
         "## Warnings\n\n"
         f"{warning_lines}\n\n"
         "## Notes\n\n"

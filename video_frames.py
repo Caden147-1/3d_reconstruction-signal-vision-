@@ -573,4 +573,8 @@ VIDEO_FRAME_FIELDS = [
     "pdr_x",
     "pdr_y",
     "pdr_bind_source",
+    "trajectory_contour_id",
+    "trajectory_contour_distance_m",
+    "trajectory_distance_m",
+    "trajectory_position_source",
 ]

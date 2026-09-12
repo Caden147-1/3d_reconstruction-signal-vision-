@@ -50,6 +50,8 @@ class SimilarityConfig:
     near_duplicate_hist_correlation: float = 0.82
     geometry_min_inliers: int = 15
     geometry_min_inlier_ratio: float = 0.22
+    feature_min_matches: int = 8
+    recovery_neighbors: int = 12
 
 
 @dataclass
@@ -246,10 +248,12 @@ def fundamental_inliers(
     src = np.float32([features_a.keypoints[match.queryIdx].pt for match in matches]).reshape(-1, 1, 2)
     dst = np.float32([features_b.keypoints[match.trainIdx].pt for match in matches]).reshape(-1, 1, 2)
     try:
-        _matrix, mask = cv2.findFundamentalMat(src, dst, cv2.FM_RANSAC, 3.0, 0.99)
+        matrix, mask = cv2.findFundamentalMat(src, dst, cv2.FM_RANSAC, 3.0, 0.99)
     except cv2.error:
         return 0, None
-    if mask is None:
+    if matrix is None or matrix.shape != (3, 3) or not np.isfinite(matrix).all() or mask is None:
+        return 0, None
+    if mask.size != len(matches):
         return 0, None
     inliers = int(mask.ravel().astype(bool).sum())
     return inliers, inliers / max(1, len(matches))
@@ -288,19 +292,21 @@ def visual_decision(
     score: float,
 ) -> str:
     if (
-        dhash_distance is not None
+        inlier_ratio is not None
+        and good_match_count >= config.geometry_min_inliers
+        and inlier_count >= config.geometry_min_inliers
+        and inlier_ratio >= config.geometry_min_inlier_ratio
+    ):
+        return "geometry_supported"
+    if (
+        good_match_count >= config.feature_min_matches
+        and dhash_distance is not None
         and hist_correlation is not None
         and dhash_distance <= config.near_duplicate_hash_distance
         and hist_correlation >= config.near_duplicate_hist_correlation
     ):
         return "near_duplicate"
-    if (
-        inlier_ratio is not None
-        and inlier_count >= config.geometry_min_inliers
-        and inlier_ratio >= config.geometry_min_inlier_ratio
-    ):
-        return "geometry_supported"
-    if score >= config.min_visual_score or good_match_count >= 30:
+    if good_match_count >= config.feature_min_matches and (score >= config.min_visual_score or good_match_count >= 30):
         return "feature_overlap"
     if good_match_count == 0:
         return "no_feature_overlap"
@@ -344,8 +350,7 @@ def analyze_pair(
     dhash_distance, dhash_similarity = pair_dhash(features_a, features_b)
     hist_correlation = pair_hist_correlation(cv2, features_a, features_b)
     all_matches, good_matches, _threshold = good_orb_matches(cv2, features_a.descriptors, features_b.descriptors)
-    geometry_matches = good_matches if len(good_matches) >= 8 else all_matches[: min(100, len(all_matches))]
-    inlier_count, inlier_ratio = fundamental_inliers(cv2, np, features_a, features_b, geometry_matches)
+    inlier_count, inlier_ratio = fundamental_inliers(cv2, np, features_a, features_b, good_matches)
     score = visual_overlap_score(
         dhash_similarity=dhash_similarity,
         hist_correlation=hist_correlation,
@@ -441,15 +446,47 @@ def build_summary(
             "near_duplicate_hist_correlation": config.near_duplicate_hist_correlation,
             "geometry_min_inliers": config.geometry_min_inliers,
             "geometry_min_inlier_ratio": config.geometry_min_inlier_ratio,
+            "feature_min_matches": config.feature_min_matches,
+            "recovery_neighbors": config.recovery_neighbors,
         },
         "explanation": (
             "Each constrained match-pair candidate is checked with perceptual hash, "
             "HSV color histogram correlation, ORB feature matches, and optional "
-            "fundamental-matrix RANSAC inliers. The table is used for diagnostics "
-            "and ablation planning; it does not filter COLMAP pairs automatically."
+            "fundamental-matrix RANSAC inliers. Workspace preparation consumes this "
+            "table to select evaluated P1-supported pairs; standalone analysis only "
+            "writes evidence and does not rewrite match_pairs.txt."
         ),
     }
     return summary
+
+
+def recovery_candidates(
+    features: Sequence[ImageFeatures],
+    existing_pairs: set[Tuple[str, str]],
+    cv2: Any,
+    neighbors: int,
+) -> List[Dict[str, Any]]:
+    """Retrieve bounded non-route candidates; appearance never grants admission."""
+    if neighbors <= 0:
+        return []
+    valid = [f for f in features if f.status == "ok" and f.keypoint_count >= 15]
+    candidates: Dict[Tuple[str, str], float] = {}
+    for left in valid:
+        ranked: List[Tuple[float, str]] = []
+        for right in valid:
+            pair = tuple(sorted((left.image_name, right.image_name)))
+            if left is right or pair in existing_pairs:
+                continue
+            _distance, hash_similarity = pair_dhash(left, right)
+            correlation = pair_hist_correlation(cv2, left, right)
+            score = 0.5 * (hash_similarity or 0.0) + 0.5 * max(0.0, correlation or 0.0)
+            ranked.append((score, right.image_name))
+        for score, name in sorted(ranked, key=lambda item: (-item[0], item[1]))[:neighbors]:
+            candidates[tuple(sorted((left.image_name, name)))] = score
+    return [
+        {"image_a": a, "image_b": b, "reason": "visual_recovery", "edge_weight": score}
+        for (a, b), score in sorted(candidates.items())
+    ]
 
 
 def analyze_image_similarity_edges(
@@ -458,6 +495,7 @@ def analyze_image_similarity_edges(
     output_csv: Path,
     summary_path: Optional[Path] = None,
     config: Optional[SimilarityConfig] = None,
+    recovery_image_names: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
     config = config or SimilarityConfig()
     selected_rows = select_rows(edge_rows, config.max_pairs)
@@ -508,6 +546,20 @@ def analyze_image_similarity_edges(
             )
         )
 
+    recovery_rows: List[Dict[str, Any]] = []
+    if recovery_image_names is not None and config.recovery_neighbors > 0:
+        existing_pairs = {tuple(sorted((row["image_a"], row["image_b"]))) for row in edge_rows}
+        recovery_edges = recovery_candidates(
+            [features_for(name) for name in sorted(set(recovery_image_names))],
+            existing_pairs,
+            cv2,
+            config.recovery_neighbors,
+        )
+        for row in recovery_edges:
+            recovery_rows.append(analyze_pair(
+                row, features_for(row["image_a"]), features_for(row["image_b"]), cv2, np, config,
+            ))
+    rows.extend(recovery_rows)
     write_csv_rows(output_csv, IMAGE_SIMILARITY_FIELDS, rows)
     summary = build_summary(
         rows=rows,
@@ -519,6 +571,17 @@ def analyze_image_similarity_edges(
         {
             "images_dir": str(images_dir),
             "unique_image_count": len(feature_cache),
+            "input_pair_count": len(edge_rows) + len(recovery_rows),
+            "route_input_pair_count": len(edge_rows),
+            "route_evaluated_pair_count": len(rows) - len(recovery_rows),
+            "max_pairs_scope": "route_candidates_only; recovery uses a separate per-image neighbor budget",
+            "visual_recovery": {
+                "status": "evaluated" if recovery_image_names is not None and config.recovery_neighbors > 0 else "disabled",
+                "candidate_pair_count": len(recovery_rows),
+                "geometry_supported_pair_count": sum(row["visual_decision"] == "geometry_supported" for row in recovery_rows),
+                "neighbors_per_image": config.recovery_neighbors,
+                "explanation": "Appearance retrieves candidates outside route/slot windows; only geometry-supported candidates can be added to the COLMAP list.",
+            },
             "image_status_counts": count_by(
                 [
                     {"status": features.status}
@@ -540,6 +603,8 @@ def analyze_workspace_image_similarity(
     max_image_size: int = 900,
     orb_features: int = 1500,
     min_visual_score: float = 0.22,
+    recovery_image_names: Optional[Sequence[str]] = None,
+    recovery_neighbors: int = 12,
 ) -> Dict[str, Any]:
     if edge_rows is None:
         _fields, edge_rows = read_csv(workspace_dir / "match_graph_edges.csv")
@@ -548,6 +613,7 @@ def analyze_workspace_image_similarity(
         max_image_size=max_image_size,
         orb_features=orb_features,
         min_visual_score=min_visual_score,
+        recovery_neighbors=recovery_neighbors,
     )
     return analyze_image_similarity_edges(
         images_dir=workspace_dir / "images",
@@ -555,6 +621,7 @@ def analyze_workspace_image_similarity(
         output_csv=workspace_dir / "image_similarity_edges.csv",
         summary_path=workspace_dir / "image_similarity_summary.json",
         config=config,
+        recovery_image_names=recovery_image_names,
     )
 
 

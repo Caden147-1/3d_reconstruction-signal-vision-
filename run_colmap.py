@@ -15,6 +15,8 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+from colmap_workspace_check import inspect_workspace, print_summary as print_workspace_coverage, validation_failures
+
 
 SCRIPT_BY_MODE = {
     "sparse": "run_colmap_sparse.bat",
@@ -158,6 +160,23 @@ def existing_colmap_outputs(workspace: Path) -> list[str]:
     return [name for name in STALE_COLMAP_OUTPUTS if (workspace / name).exists()]
 
 
+def validate_dense_input_coverage(workspace: Path) -> int:
+    """Stop before dense output cleanup when sparse/database inputs are stale."""
+    coverage = inspect_workspace(workspace)
+    print_workspace_coverage(coverage)
+    failures = validation_failures(
+        coverage,
+        require_database_coverage=True,
+        require_sparse_model=True,
+    )
+    if not failures:
+        return 0
+    for failure in failures:
+        print(f"[error] Dense preflight: {failure}")
+    print("[info] Run `python run_colmap.py sparse` to rebuild from the current image list.")
+    return 2
+
+
 def reset_existing_colmap_outputs(
     workspace: Path,
     *,
@@ -222,7 +241,19 @@ def build_upfront_runtime_estimate(workspace: Path) -> dict[str, Any]:
 
     image_count = int(positive_number(summary.get("image_count"), count_nonempty_lines(workspace / "image_list.txt")))
     image_count = max(1, image_count)
-    constrained_pairs = int(positive_number(constrained.get("pair_count"), count_nonempty_lines(workspace / "match_pairs.txt")))
+    p1_filter = constrained.get("p1_pair_filter") if isinstance(constrained.get("p1_pair_filter"), dict) else {}
+    unfiltered_constrained_pairs = int(
+        positive_number(
+            constrained.get("unfiltered_pair_count", constrained.get("pair_count")),
+            count_nonempty_lines(workspace / "match_pairs_unfiltered.txt"),
+        )
+    )
+    constrained_pairs = int(
+        positive_number(
+            p1_filter.get("selected_pair_count", constrained.get("colmap_pair_count")),
+            count_nonempty_lines(workspace / "match_pairs.txt"),
+        )
+    )
     matcher = str(summary.get("matcher") or "unknown").lower()
     feature_max_image_size = positive_number(summary.get("feature_max_image_size"), 1600.0)
     max_num_features = positive_number(summary.get("max_num_features"), 6000.0)
@@ -317,6 +348,7 @@ def build_upfront_runtime_estimate(workspace: Path) -> dict[str, Any]:
         "summary": summary,
         "image_count": image_count,
         "dense_views": dense_views,
+        "unfiltered_constrained_pairs": unfiltered_constrained_pairs,
         "constrained_pairs": constrained_pairs,
         "matching_pairs": matching_pairs,
         "matcher": matcher,
@@ -347,7 +379,8 @@ def print_upfront_runtime_estimate(workspace: Path) -> None:
     )
     print(
         "[estimate]   "
-        f"constrained_pairs={estimate['constrained_pairs']}, matching_pairs~={estimate['matching_pairs']}, "
+        f"candidate_pairs={estimate['unfiltered_constrained_pairs']}, "
+        f"p1_selected_pairs={estimate['constrained_pairs']}, matching_pairs~={estimate['matching_pairs']}, "
         f"patchmatch_per_view~={format_duration(estimate['patch_per_view_seconds'])}"
     )
     for label, low_seconds, high_seconds in estimate["stages"]:
@@ -739,6 +772,10 @@ def run_full_pipeline(
         return sparse_result
     print(f"[timing] Sparse step elapsed: {format_duration(time.monotonic() - full_start)}")
 
+    coverage_result = validate_dense_input_coverage(workspace)
+    if coverage_result != 0:
+        return coverage_result
+
     print("[info] running COLMAP dense step...")
     dense_result = call_batch_with_runtime_estimate(
         dense_script,
@@ -789,6 +826,9 @@ def run_colmap_script(
         )
 
     if mode == "dense":
+        coverage_result = validate_dense_input_coverage(workspace)
+        if coverage_result != 0:
+            return coverage_result
         return call_batch_with_runtime_estimate(
             script,
             workspace,

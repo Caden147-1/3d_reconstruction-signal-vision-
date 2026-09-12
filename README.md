@@ -14,9 +14,9 @@
 - Bind ordered checkpoint photos to WiFi/PDR sampling points.
 - Extract route-video keyframes as weak visual bridge frames.
 - Export a COLMAP-friendly image dataset and metadata tables.
-- Generate constrained or hybrid COLMAP match pairs from WiFi point order, PDR distance, photo slot angle, and video order.
+- Build a P2 route-contour candidate graph from WiFi/PDR checkpoint order, then let P1 visual evidence select evaluated COLMAP pairs.
 - Build WiFi fingerprint localization models and signal-boundary summaries.
-- Generate sparse/dense COLMAP batch scripts, filtered dense point clouds, dense meshes, quality reports, and explicit completion inspection layers.
+- Generate sparse/dense COLMAP batch scripts, density-preserving sampled point clouds, optional dense meshes, and quality reports without synthetic scene completion.
 
 ## Claim Boundary
 
@@ -37,7 +37,7 @@ This README describes the reusable workflow rather than one fixed dataset result
 |-- reconstruction_export.py        # COLMAP dataset export
 |-- colmap_bridge.py                # COLMAP workspace and batch-script generation
 |-- reconstruction_quality.py       # Sparse/dense quality report and model selection
-|-- image_similarity.py             # P1 visual-similarity diagnostics for COLMAP match pairs
+|-- image_similarity.py             # P1 visual evidence used to select evaluated COLMAP match pairs
 |-- trajectory_contour.py           # P2 continuous IMU/PDR route-contour builder
 |-- point_cloud_filter.py           # Conservative far/isolated dense outlier filter
 |-- ply_io.py                       # Shared PLY vertex IO helpers
@@ -99,7 +99,7 @@ colmap_workspace/
 [done] preprocessing complete
 ```
 
-At the start of `full`, `run_colmap.py` prints a rough stage-by-stage estimate for reset, sparse reconstruction, dense PatchMatch, fusion, filtering, meshing, completion layers, and reports. It then asks whether to run the complete COLMAP pipeline. Old COLMAP outputs are still removed automatically after you confirm; cleanup itself does not ask for another prompt.
+At the start of `full`, `run_colmap.py` prints a rough stage-by-stage estimate for reset, sparse reconstruction, dense PatchMatch, fusion, filtering, meshing, and reports. It then asks whether to run the complete COLMAP pipeline. Old COLMAP outputs are still removed automatically after you confirm; cleanup itself does not ask for another prompt.
 
 To run without the upfront prompt:
 
@@ -162,10 +162,10 @@ python run_colmap.py full --no-upfront-estimate
    - Writes localization evaluation, RSSI grid, and signal boundary summaries.
 
 8. COLMAP workspace generation
-   - Writes `image_list.txt`, `match_pairs.txt`, `match_graph_edges.csv`, and batch scripts.
+   - Writes the raw P2 graph as `match_pairs_route.txt`, route plus visual-recovery candidates as `match_pairs_unfiltered.txt`, and the selected list as `match_pairs.txt`, plus `match_graph_edges.csv` and batch scripts.
    - Generates sparse, dense, automatic, GUI, and reset scripts.
-   - Writes P1 image-similarity diagnostics for constrained pairs as `image_similarity_edges.csv` and `image_similarity_summary.json`.
-   - Uses P2 ordered-route distance for extra checkpoint matches when trajectory metadata is present.
+   - Writes P1 visual evidence as `image_similarity_edges.csv`, `image_similarity_summary.json`, and the keep/drop audit `match_pair_filter.csv`.
+   - Uses P2 route topology (adjacent anchors plus bounded along-route distance) as the primary checkpoint relation when trajectory metadata is present.
 
 ## Reconstruction Profiles
 
@@ -180,7 +180,7 @@ python main.py --reconstruction-profile complete
 ```
 
 - `preview`: faster checks with lower image/feature limits.
-- `balanced`: moderate image/feature limits with all generated inspection layers still enabled.
+- `balanced`: moderate image/feature limits.
 - `final`: quality-oriented settings for moderate compute.
 - `rtx4080`: recommended default for RTX 4080; balances dense resolution, feature count, and PatchMatch cost.
 - `complete`: highest-completeness profile, using more frames/features and the `complete` dense profile.
@@ -196,7 +196,13 @@ python main.py --colmap-load-profile max
 python main.py --colmap-num-threads 2 --colmap-stage-cooldown-s 20
 ```
 
-P1 image-similarity diagnostics are enabled during COLMAP workspace preparation. They do not filter COLMAP pairs automatically; they inspect the generated constrained pair graph and write visual-support evidence:
+P2 describes the observed route topology. It first forms a candidate graph from adjacent anchors on the same IMU/PDR contour, bounded along-route distance, nearby angular photo slots, and nearby video frames. A missing contour annotation only triggers fallback among unannotated anchors; it does not remove known contour breaks. `match_pairs_route.txt` preserves this route graph.
+
+P1 evaluates route candidates with actual ORB matches: hash or color similarity alone cannot establish feature overlap or a near duplicate. Evaluated `weak_visual_support` and `no_feature_overlap` pairs are excluded; unreviewed or unreadable route pairs remain candidates. An all-rejected graph stays empty and stops constrained workspace preparation instead of silently restoring rejected pairs.
+
+Bounded visual recovery also retrieves up to 12 non-route candidates per image by appearance, without hard route/slot restrictions. Only candidates passing ORB fundamental-matrix RANSAC support enter the selected list; COLMAP still performs its own matching and geometric verification. `--visual-recovery-neighbors 0` disables this recovery for ablation. `--image-similarity-max-pairs` caps route evaluations only; recovery has its separate neighbor budget. `--skip-image-similarity` disables both P1 and recovery, retaining the base route/order graph.
+
+`match_pairs_unfiltered.txt` contains both candidate sources, and `match_pair_filter.csv` records the selection decisions. These counts describe prepared pairs, not actual verified COLMAP matches or measured reconstruction gains. The default `constrained` matcher imports the selected list. `--colmap-matcher hybrid` explicitly adds exhaustive visual matches outside this gate.
 
 ```powershell
 python image_similarity.py --workspace colmap_workspace
@@ -206,9 +212,26 @@ python main.py --skip-image-similarity
 
 P2 writes `processed/pdr_trajectory_contour.csv` and `pdr_trajectory_edges.csv`.
 This is the observed IMU/PDR capture-route corridor: WiFi checkpoints attach to it
-as sparse fingerprint anchors, and the matching graph uses along-route distance
-instead of treating a WiFi-point convex hull as a physical room contour. P2 never
-adds synthetic surfaces to `dense/final.ply`.
+as sparse fingerprint anchors, and the matching graph follows its predecessor/
+successor relations plus along-route distance instead of treating a WiFi-point
+convex hull as a physical room contour. P2 never adds synthetic surfaces to
+`dense/final.ply`.
+
+Route-video frames inherit an interpolated position on that observed contour only
+as weak matching evidence. They remain excluded from PDR model alignment, so an
+unsynchronized video cannot masquerade as a calibrated IMU/PDR measurement.
+
+When both checkpoint photos and extracted video frames are present, the generated
+workspace places them under `images/anchors/` and `images/video/`. COLMAP then uses
+one shared camera per source folder instead of forcing their different aspect ratios
+and intrinsics into a single camera. Dense preflight requires database coverage of
+the current image list, complete sparse image/camera/point records, and registered
+image names belonging to the current inputs. Partial image registration is allowed.
+
+Reflective surfaces are not completed synthetically. For a known mirror or glass
+region, provide a manual `--colmap-mask-dir` with masks matching the generated
+relative names, such as `anchors/point_001_slot_01_DSC00001.png` or
+`video/video_base_000001_IMG_1735_frame_000078.png`.
 
 ## Useful Commands
 
@@ -486,7 +509,23 @@ colmap_workspace/dense/final_output_summary.json
 colmap_workspace/dense/point_filter_summary.json
 ```
 
-`final.ply` is the only dense model you normally open. The pipeline prefers the Poisson mesh, then falls back to Delaunay or the dense point cloud if needed. It contains reconstructed COLMAP geometry only; intermediate dense PLY files are removed by default after `final.ply` is selected.
+`final.ply` is the dense model you normally open. The pipeline prefers a valid `fused_filtered.ply`. Filtering now measures voxel occupancy on all observed points, selects the dominant density-connected component, and retains original points in a small neighborhood around it. This removes many peripheral streaks and disconnected fragments before any optional sampling. Voxels are selection masks, not replacement vertices: positions, normals and colors are not averaged or invented. The filter uses NumPy, not SciPy. The generated dense batch checks this dependency before reconstruction and stops before final promotion if filtering fails.
+
+Finalization checks the complete PLY payload, finite XYZ values, and mesh indices, stages a verified copy, and replaces `final.ply` before cleaning derived intermediates. Sampling audits compare the output with the point budget available **after geometry filtering**, so intentional noise removal is not mistaken for an underfilled sampler. Raw `fused.ply` is retained for comparison and recovery, as are unrelated PLY files. Manual finalization still permits raw fallback when a filtered source is unavailable. A failed promotion preserves source files and the previous final. This protection applies to finalization, not the deliberate output reset at the start of a full rebuild.
+
+Meshing is disabled by default. `python main.py --colmap-meshing` explicitly enables Poisson/Delaunay inspection meshes and retains the intermediate files; `final.ply` still prefers the observed point cloud. Meshes can interpolate unobserved surfaces and are not evidence of wireless or visual observations. For mesh-oriented inspection, run `python finalize_dense_outputs.py --dense-dir colmap_workspace/dense --prefer-mesh --keep-intermediate` while the mesh artifact is retained. Outside mesh mode, `$env:KEEP_INTERMEDIATE_PLY = "1"` before running the generated batch also retains intermediates.
+
+The `complete` dense profile, also used by the default `final` reconstruction profile, now retains all points that pass geometry filtering (`--max-points 0`) and writes binary PLY in bounded-memory chunks. The `balanced` and `rtx4080` profiles uniformly sample up to 0.6/0.9 million points **after** filtering. Full-resolution output reduces sampling gaps but costs more viewer memory. Binary PLY is supported by MeshLab; it is not intended for text-editor inspection.
+
+This is an observed-density heuristic, not a semantic room mask or a calibration fix. Weak real surfaces can be removed, and dense reflection artifacts can survive. Ambiguous large components or removal of more than half the finite source points cause an explicit failure rather than silent acceptance. WiFi/IMU still constrain the capture route and alignment; the filter never treats that route as a room boundary and adds no mirror, floor or wall patches.
+
+To rerun only filtering without changing the current final, write an inspection candidate:
+
+```powershell
+python point_cloud_filter.py --input colmap_workspace/dense/fused.ply --output colmap_workspace/dense/filtered_candidate.ply --summary colmap_workspace/dense/filtered_candidate_summary.json
+```
+
+Inspect it before promotion. `--core-quantile` (default `0.15`) controls the point-weighted dense-core threshold; larger values are stricter. `--support-halo` (default `1`) retains nearby observed detail in voxel-cell units. `--surface-cell-ratio` (default `0.0025`) sets the cell width relative to the robust scene diagonal. These distances are model units, not verified physical meters. `--method legacy` retains the previous weak bbox/radial/neighborhood implementation for comparisons.
 
 ## Quality Reports
 
@@ -503,7 +542,8 @@ The report checks:
 - Sparse component count and registered-image ratio.
 - Final dense model availability and vertex/face counts.
 - Intermediate dense point cloud, filtered point cloud, and mesh availability when those files are kept.
-- Whether P2's route-contour constraint was available for the generated match graph.
+- Whether P2's route-contour constraint was available and how many actual candidate edges it contributed.
+- P1 prepared-pair selection, separate P2/recovery counts, and whether the configured matcher enforces that pair list; these are not measured reconstruction gains.
 - Match-pair reason counts.
 
 If the report says `database image count does not match image_list.txt`, rebuild with:
