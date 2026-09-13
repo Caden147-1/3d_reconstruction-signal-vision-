@@ -36,6 +36,11 @@ DEFAULT_RUNTIME_TARGET_ERROR_SECONDS = 30.0 * 60.0
 
 STALE_COLMAP_OUTPUTS = (
     "database.db",
+    "database.db-wal",
+    "database.db-shm",
+    "database.db-journal",
+    "sparse_run_inputs.json",
+    "sparse_run_provenance.json",
     "sparse",
     "sparse_pdr_aligned",
     "sparse_pose_prior",
@@ -158,6 +163,22 @@ def allow_stale_colmap_outputs() -> bool:
 
 def existing_colmap_outputs(workspace: Path) -> list[str]:
     return [name for name in STALE_COLMAP_OUTPUTS if (workspace / name).exists()]
+
+
+def validate_sparse_runner_provenance(script: Path) -> int:
+    """Reject pre-provenance generated scripts before any rebuild cleanup."""
+    try:
+        commands = [line.strip() for line in script.read_text(encoding="utf-8").splitlines()]
+    except (OSError, UnicodeError) as exc:
+        print(f"[error] Cannot inspect sparse runner: {exc}")
+        return 2
+    actions = ("--record-sparse-start", "--record-sparse-complete")
+    if all(any(line.startswith("python ") and "colmap_workspace_check.py" in line and action in line
+               for line in commands) for action in actions):
+        return 0
+    print(f"[error] {script.name} predates run-time sparse provenance recording.")
+    print("[info] Regenerate workspace scripts with the current preprocessing code before rebuilding. Existing outputs were not cleared.")
+    return 2
 
 
 def validate_dense_input_coverage(workspace: Path) -> int:
@@ -812,6 +833,9 @@ def run_colmap_script(
         script = require_script(workspace, mode)
 
     if mode in CLEAN_REBUILD_MODES:
+        sparse_script = require_script(workspace, "sparse" if mode == "full" else mode)
+        if validate_sparse_runner_provenance(sparse_script):
+            return 2
         reset_result = reset_existing_colmap_outputs(workspace, report_dir=report_dir)
         if reset_result != 0:
             return reset_result

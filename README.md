@@ -20,7 +20,7 @@
 
 ## Claim Boundary
 
-The main technical claim is an explainable signal-motion prior for indoor reconstruction, not signal-only 3D reconstruction. IMU/PDR supplies a relative route, heading seeds, an ordered route-contour constraint, and PDR alignment references. WiFi supplies checkpoint labels, fingerprint assets, and signal-boundary summaries. The WiFi-point hull is only an RSSI interpolation envelope, not a room outline. COLMAP remains the geometric reconstruction backbone, while `match_graph_edges.csv`, `pdr_trajectory_contour.csv`, `camera_pose_seed.csv`, `pdr_alignment_refs.txt`, and the quality reports make the WiFi/IMU contribution inspectable.
+The main technical claim is an explainable signal-motion prior for indoor reconstruction, not signal-only 3D reconstruction. IMU/PDR supplies a relative route, heading seeds, an ordered route-contour constraint, and PDR alignment references. Fresh WiFi measurements supply fingerprint assets and optional RSSI-similar image-pair candidates that require visual geometric verification. Checkpoint ordering alone is not an RF measurement. The WiFi-point hull is only an RSSI interpolation envelope, not a room outline. COLMAP remains the geometric reconstruction backbone; candidate counts and PDR consistency are not measured reconstruction gains or surveyed accuracy.
 
 This README describes the reusable workflow rather than one fixed dataset result. Current-run numbers belong in `colmap_workspace/QUALITY_REPORT.md`, `colmap_workspace/quality_report.json`, and the evaluation section of the project summary. If the quality report says `needs_colmap_rerun`, use a clean sparse+dense rerun before treating reconstruction metrics as final.
 
@@ -65,7 +65,7 @@ This README describes the reusable workflow rather than one fixed dataset result
 1 个 WiFi 点位 = 20 张照片
 ```
 
-这 20 张照片会被强绑定到对应 WiFi 指纹点。`video/` 里的视频会被抽帧，作为弱绑定的视觉基底，帮助 COLMAP 把相邻点位连接起来。
+这 20 张照片按采集顺序绑定到对应检查点。只有存在有效的新鲜 AP 测量时才附加 WiFi 指纹；缺少 WiFi 不会删除照片或 PDR 路线。视频只通过帧序列和视觉几何证据参与重建，不按帧序号推算其所在检查点。
 
 如果 `pic/` 里照片数量超过 `WiFi 点位数 * images-per-wifi-point`，多出的照片不会被悄悄当成 WiFi 锚点使用；流水线会写入 `processed/unassigned_images.csv`，方便在报告里说明或回头重新分组。
 
@@ -140,7 +140,7 @@ python run_colmap.py full --no-upfront-estimate
    - Produces a time-ordered `pdr_x` / `pdr_y` centerline and bounded route corridor.
 
 3. WiFi/PDR fusion
-   - Assigns WiFi scans to PDR positions.
+   - Retains logger-time PDR states separately from AP measurement timestamps and freshness.
    - Treats WiFi as sparse fingerprints/checkpoint anchors on the route, not as room geometry.
 
 4. Photo mapping
@@ -151,7 +151,7 @@ python run_colmap.py full --no-upfront-estimate
 5. Video frame extraction
    - Extracts route-video frames.
    - Filters blurry or near-duplicate frames.
-   - Weakly assigns frames along the PDR route.
+   - Spreads a bounded frame budget across the whole clip; no route position is assigned without video/sensor synchronization.
 
 6. Reconstruction dataset export
    - Copies and renames COLMAP input images.
@@ -162,7 +162,7 @@ python run_colmap.py full --no-upfront-estimate
    - Writes localization evaluation, RSSI grid, and signal boundary summaries.
 
 8. COLMAP workspace generation
-   - Writes the raw P2 graph as `match_pairs_route.txt`, route plus visual-recovery candidates as `match_pairs_unfiltered.txt`, and the selected list as `match_pairs.txt`, plus `match_graph_edges.csv` and batch scripts.
+   - Writes the raw P2 graph as `match_pairs_route.txt`, route plus visual/RSSI retrieval candidates as `match_pairs_unfiltered.txt`, and the selected list as `match_pairs.txt`, plus `match_graph_edges.csv` and batch scripts.
    - Generates sparse, dense, automatic, GUI, and reset scripts.
    - Writes P1 visual evidence as `image_similarity_edges.csv`, `image_similarity_summary.json`, and the keep/drop audit `match_pair_filter.csv`.
    - Uses P2 route topology (adjacent anchors plus bounded along-route distance) as the primary checkpoint relation when trajectory metadata is present.
@@ -200,7 +200,19 @@ P2 describes the observed route topology. It first forms a candidate graph from 
 
 P1 evaluates route candidates with actual ORB matches: hash or color similarity alone cannot establish feature overlap or a near duplicate. Evaluated `weak_visual_support` and `no_feature_overlap` pairs are excluded; unreviewed or unreadable route pairs remain candidates. An all-rejected graph stays empty and stops constrained workspace preparation instead of silently restoring rejected pairs.
 
-Bounded visual recovery also retrieves up to 12 non-route candidates per image by appearance, without hard route/slot restrictions. Only candidates passing ORB fundamental-matrix RANSAC support enter the selected list; COLMAP still performs its own matching and geometric verification. `--visual-recovery-neighbors 0` disables this recovery for ablation. `--image-similarity-max-pairs` caps route evaluations only; recovery has its separate neighbor budget. `--skip-image-similarity` disables both P1 and recovery, retaining the base route/order graph.
+Bounded visual recovery also retrieves up to 12 non-route candidates per image by appearance, without hard route/slot restrictions. Only candidates passing ORB fundamental-matrix RANSAC support enter the selected list; COLMAP still performs its own matching and geometric verification. `--visual-recovery-neighbors 0` disables this recovery for ablation. `--image-similarity-max-pairs` caps route/RSSI candidate evaluations; appearance retrieval has its separate neighbor budget. `--skip-image-similarity` disables P1 and both retrieval paths, retaining the base route/order graph.
+
+Fresh-RSSI retrieval proposes up to two similar checkpoint neighbors per checkpoint,
+using up to six photos per endpoint. It requires at least three shared APs, AP-set
+overlap of at least 0.6, and an RSSI RMS difference no greater than 6 dB (missing APs
+are included at -110 dBm). Only independent, timestamp-validated observations from
+the same session are compared. These are conservative retrieval settings, not a
+calibrated RF ranging model. New `wifi_fingerprint_recovery` pairs require P1
+geometry support; missing, disabled, or capped P1 evidence rejects them. Unlike
+appearance retrieval, these candidates share the normal P1 evaluation budget.
+`--skip-wifi-recovery` disables this contribution while keeping IMU/PDR and visual
+retrieval unchanged. `wifi_recovery_summary.json` reports candidate and accepted
+pair counts. RSSI never directly changes a camera pose or crops the point cloud.
 
 `match_pairs_unfiltered.txt` contains both candidate sources, and `match_pair_filter.csv` records the selection decisions. These counts describe prepared pairs, not actual verified COLMAP matches or measured reconstruction gains. The default `constrained` matcher imports the selected list. `--colmap-matcher hybrid` explicitly adds exhaustive visual matches outside this gate.
 
@@ -217,21 +229,56 @@ successor relations plus along-route distance instead of treating a WiFi-point
 convex hull as a physical room contour. P2 never adds synthetic surfaces to
 `dense/final.ply`.
 
-Route-video frames inherit an interpolated position on that observed contour only
-as weak matching evidence. They remain excluded from PDR model alignment, so an
-unsynchronized video cannot masquerade as a calibrated IMU/PDR measurement.
+Unexplained PDR sampling gaps longer than 10 seconds now break the contour, even
+when the endpoint distance is small. A recorded CHECKPOINT_PAUSE to RESTART with
+unchanged step index and position may preserve continuity under the stationary
+capture protocol; this is an assumption backed by capture events, not proof from
+RF sensing. No pose is interpolated across a contour break. Detected steps also
+require finite heading coverage with a maximum 1-second interpolation gap;
+unavailable heading marks the session's PDR coordinates unavailable instead of
+inventing a northward route. Visual reconstruction can still use the photos.
+
+Route-video frames have no PDR/contour position without explicit synchronization.
+Legacy checkpoint-order interpolation is also excluded from route candidate
+generation. They remain eligible for video sequence and verified visual retrieval
+and remain excluded from PDR model alignment. `video_time_source` distinguishes
+decoded video timestamps from approximate sampling-grid times; neither establishes
+a sensor clock offset. For a 1004.975-second clip and a 240-frame budget, the nominal
+interval is 4.187396 seconds, not the first 240 seconds stretched over the route.
 
 When both checkpoint photos and extracted video frames are present, the generated
 workspace places them under `images/anchors/` and `images/video/`. COLMAP then uses
 one shared camera per source folder instead of forcing their different aspect ratios
 and intrinsics into a single camera. Dense preflight requires database coverage of
-the current image list, complete sparse image/camera/point records, and registered
-image names belonging to the current inputs. Partial image registration is allowed.
+the current image list, complete sparse image/camera/point records, registered
+image names belonging to the current inputs, and recorded content provenance.
+Partial image registration is allowed.
+
+The generated sparse and automatic scripts write `sparse_run_inputs.json` before
+feature extraction and `sparse_run_provenance.json` after successful reconstruction.
+SHA-256 checks cover image bytes, used mask paths, matching pairs, pose references,
+the image manifest and sparse runner, then the resulting database and model files.
+Changed inputs during a run prevent certification. Same-name replacements cannot
+reuse an old database/model. Inspection is read-only; a post-hoc snapshot is not
+accepted as evidence that old models were built from today's inputs.
+
+Existing PLY files remain usable for viewing and post-filtering. Old sparse models
+without these run records are reported as `unverified_reconstruction_inputs` and
+blocked from a new dense run, not declared geometrically damaged. A newly recorded
+sparse run is needed only when resuming verified reconstruction. Do not run `main`
+merely to adopt this check: a full rebuild deliberately resets previous outputs.
+The launcher also rejects old generated sparse/automatic scripts that lack the
+recording steps before clearing any existing outputs. Regenerate those scripts
+through current preprocessing when preparing the next intended rebuild.
 
 Reflective surfaces are not completed synthetically. For a known mirror or glass
 region, provide a manual `--colmap-mask-dir` with masks matching the generated
-relative names, such as `anchors/point_001_slot_01_DSC00001.png` or
-`video/video_base_000001_IMG_1735_frame_000078.png`.
+relative names, such as `anchors/point_001_slot_01_DSC00001.jpg.png` for a `.jpg`
+input or `video/video_base_000001_IMG_1735_frame_000078.jpg.png`. The original image
+extension must be retained before the added `.png`, as specified by the
+[COLMAP mask convention](https://colmap.github.io/faq.html#mask-image-regions).
+Incorrect same-stem names no longer count as usable masks. A missing mask directory
+or zero matching paths stops preparation; intentionally partial masks remain allowed.
 
 ## Useful Commands
 
@@ -380,8 +427,10 @@ processed/wifi_pdr_features.csv
 
 作用：
 
-- 每条 WiFi scan 绑定一个 PDR 位置
-- 后续 WiFi 指纹库、边界和图像位置种子都基于这个表
+- 每条日志保留对应的 PDR 状态；AP 的实际测量时间单独记录
+- AP 测量时间距日志超过 5 秒、来自未来、缺失或重复时，不作为新的 RSSI 观测
+- 检查点指纹至少需要 3 个有效 AP，每个 AP 测量时间距检查点均不超过 5 秒
+- 没有新鲜 WiFi 时保留照片与 PDR 路线，指纹明确标为不可用
 
 ### Step 4: 绑定点位照片和 WiFi 点
 
@@ -404,7 +453,7 @@ processed/image_wifi_summary.json
 
 - 按照片编号顺序分组
 - 每 20 张照片绑定到一个 `CHECKPOINT_PAUSE` WiFi 点位
-- 点位照片是强 WiFi 标签，进入 WiFi 指纹库
+- 点位照片保留检查点标签；仅有有效新鲜测量的指纹可用于 WiFi 定位和 RSSI 匹配检索
 
 ### Step 5: 抽取视频基底帧
 
@@ -427,7 +476,7 @@ processed/video_frames_summary.json
 
 - 默认每 1 秒抽 1 帧
 - 默认每段视频最多抽 240 帧
-- 抽帧会按路线顺序弱绑定到 WiFi 点位之间
+- 帧数上限均匀分配到整段视频；没有视频与传感器同步信息时不分配路线坐标
 - 视频帧只作为 COLMAP 视觉基底，不进入 WiFi 指纹库
 
 如果没有 `video/` 目录，代码会自动跳过，不会报错。
@@ -511,11 +560,30 @@ colmap_workspace/dense/point_filter_summary.json
 
 `final.ply` is the dense model you normally open. The pipeline prefers a valid `fused_filtered.ply`. Filtering now measures voxel occupancy on all observed points, selects the dominant density-connected component, and retains original points in a small neighborhood around it. This removes many peripheral streaks and disconnected fragments before any optional sampling. Voxels are selection masks, not replacement vertices: positions, normals and colors are not averaged or invented. The filter uses NumPy, not SciPy. The generated dense batch checks this dependency before reconstruction and stops before final promotion if filtering fails.
 
-Finalization checks the complete PLY payload, finite XYZ values, and mesh indices, stages a verified copy, and replaces `final.ply` before cleaning derived intermediates. Sampling audits compare the output with the point budget available **after geometry filtering**, so intentional noise removal is not mistaken for an underfilled sampler. Raw `fused.ply` is retained for comparison and recovery, as are unrelated PLY files. Manual finalization still permits raw fallback when a filtered source is unavailable. A failed promotion preserves source files and the previous final. This protection applies to finalization, not the deliberate output reset at the start of a full rebuild.
+Finalization checks the complete PLY payload, finite XYZ values, and mesh indices, stages a verified copy, and replaces `final.ply` before cleaning derived intermediates. Sampling audits compare the output with the point budget available **after geometry filtering**, so intentional noise removal is not mistaken for an underfilled sampler. Raw `fused.ply` is retained for comparison and recovery, as are unrelated PLY files. Repeated finalization preserves an existing valid final instead of replacing it with raw fused data after the filtered intermediate was cleaned up. New valid filtered results can still replace it; raw replacement requires `--allow-raw-replacement`. Raw fallback remains available when no valid final exists. Invalid new sources and promotion failures preserve the previous final and return failure. This protection does not apply to the deliberate output reset at the start of a full rebuild.
+
+2026-09-12 isolated metadata check (no COLMAP or PLY regeneration): 1,652 logger
+records contained 17 records with new AP measurements within the 5-second freshness
+limit. Only checkpoints 10 and 12 had usable fingerprints; they produced zero
+RSSI retrieval candidates under the current similarity thresholds. All 260 mapped
+photos and the 13 checkpoint PDR/contour positions were retained unchanged. Old
+13-fingerprint localization scores must not be reused as fresh-measurement accuracy.
 
 Meshing is disabled by default. `python main.py --colmap-meshing` explicitly enables Poisson/Delaunay inspection meshes and retains the intermediate files; `final.ply` still prefers the observed point cloud. Meshes can interpolate unobserved surfaces and are not evidence of wireless or visual observations. For mesh-oriented inspection, run `python finalize_dense_outputs.py --dense-dir colmap_workspace/dense --prefer-mesh --keep-intermediate` while the mesh artifact is retained. Outside mesh mode, `$env:KEEP_INTERMEDIATE_PLY = "1"` before running the generated batch also retains intermediates.
 
 The `complete` dense profile, also used by the default `final` reconstruction profile, now retains all points that pass geometry filtering (`--max-points 0`) and writes binary PLY in bounded-memory chunks. The `balanced` and `rtx4080` profiles uniformly sample up to 0.6/0.9 million points **after** filtering. Full-resolution output reduces sampling gaps but costs more viewer memory. Binary PLY is supported by MeshLab; it is not intended for text-editor inspection.
+
+Bounding-box statistics use a fixed buffer of at most 250,000 XYZ samples. Chunk
+views no longer retain all source coordinates in memory. The global sampling stride
+and geometry selection rules are unchanged. Quality reports now validate every
+existing final/fused/filtered PLY payload, not just its header; truncated or nonfinite
+files cannot be labeled `ok`. Full validation may take longer on large point clouds.
+
+Medium-priority isolation check on 2026-09-12: all 695 step coordinates were unchanged,
+all 260 photos were retained, and no checkpoint lost its PDR position. Six unexplained
+long step gaps yield seven route contours; two documented stationary pauses remain
+connected. Existing final/fused PLY payloads passed read-only validation. No COLMAP,
+filtering, or final-file promotion was run against the working dataset during these fixes.
 
 This is an observed-density heuristic, not a semantic room mask or a calibration fix. Weak real surfaces can be removed, and dense reflection artifacts can survive. Ambiguous large components or removal of more than half the finite source points cause an explicit failure rather than silent acceptance. WiFi/IMU still constrain the capture route and alignment; the filter never treats that route as a room boundary and adds no mirror, floor or wall patches.
 

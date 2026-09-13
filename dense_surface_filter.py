@@ -54,6 +54,25 @@ def positions(vertices):
     return np.column_stack([vertices[axis] for axis in "xyz"]).astype(np.float64)
 
 
+def statistics_sample(input_path: Path, source_count: int, max_samples: int = 250000):
+    """Copy selected XYZ rows into a bounded buffer; never retain chunk views."""
+    if source_count <= 0 or max_samples <= 0:
+        raise ValueError("Statistics counts must be positive")
+    stride = max(1, (source_count + max_samples - 1) // max_samples)
+    sample = np.empty(((source_count + stride - 1) // stride, 3), dtype=np.float64)
+    start, count, finite_count = 0, 0, 0
+    for chunk in vertex_chunks(input_path):
+        xyz = positions(chunk)
+        finite_count += int(np.isfinite(xyz).all(1).sum())
+        selected = xyz[(-start) % stride::stride]
+        sample[count:count + len(selected)] = selected
+        count += len(selected)
+        start += len(chunk)
+    if start != source_count:
+        raise ValueError("Input vertex count changed during statistics sampling")
+    return sample[:count][np.isfinite(sample[:count]).all(1)], stride, finite_count
+
+
 def grid_keys(xyz, lower, upper, cell, shape):
     good = np.isfinite(xyz).all(axis=1) & (xyz >= lower).all(axis=1) & (xyz <= upper).all(axis=1)
     keys = np.floor((xyz[good] - lower) / cell).astype(np.int64)
@@ -129,15 +148,7 @@ def filter_connected_cloud(input_path: Path, output_path: Path, summary_path: Pa
         raise ValueError("At least 100 points are needed for connected-density filtering")
 
     # Bounded, file-wide statistics only; selection always examines all points.
-    stride = max(1, int(np.ceil(source_count / 250000)))
-    samples, start, finite_count = [], 0, 0
-    for chunk in vertex_chunks(input_path):
-        xyz = positions(chunk)
-        finite_count += int(np.isfinite(xyz).all(1).sum())
-        samples.append(xyz[(-start) % stride::stride])
-        start += len(chunk)
-    sample = np.concatenate(samples)
-    sample = sample[np.isfinite(sample).all(1)]
+    sample, stride, finite_count = statistics_sample(input_path, source_count)
     if len(sample) < 100:
         raise ValueError("Too few finite statistics points")
     low, high = np.quantile(sample, [bbox_quantile, 1-bbox_quantile], axis=0)

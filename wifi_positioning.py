@@ -9,6 +9,8 @@ import statistics
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from wifi_observations import valid_fingerprint
+
 
 FILL_RSSI = -110.0
 
@@ -53,7 +55,7 @@ def parse_vector(row: Dict[str, str], ap_fields: Sequence[str]) -> Dict[str, flo
 
 
 def visible_fields(vector: Dict[str, float], threshold: float = FILL_RSSI + 0.5) -> List[str]:
-    return [field for field, value in vector.items() if value > threshold]
+    return [field for field, value in vector.items() if math.isfinite(value) and threshold < value < 0]
 
 
 def load_fingerprints(path: Path) -> Tuple[List[str], List[Dict[str, Any]]]:
@@ -63,7 +65,7 @@ def load_fingerprints(path: Path) -> Tuple[List[str], List[Dict[str, Any]]]:
     for row in rows:
         x = safe_float(row.get("pdr_x"))
         y = safe_float(row.get("pdr_y"))
-        if math.isnan(x) or math.isnan(y):
+        if not math.isfinite(x) or not math.isfinite(y) or not valid_fingerprint(row):
             continue
         vector = parse_vector(row, ap_fields)
         fingerprints.append(
@@ -115,14 +117,18 @@ def estimate_position(
     k: int = 3,
     active_fields: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
-    usable_fields = [field for field in (active_fields or visible_fields(scan_vector)) if field in ap_fields]
+    visible = set(visible_fields(scan_vector))
+    usable_fields = [field for field in (visible if active_fields is None else active_fields) if field in ap_fields and field in visible]
     if not usable_fields:
-        usable_fields = list(ap_fields)
+        return {
+            "status": "no_known_aps", "estimated_x": None, "estimated_y": None,
+            "known_ap_count": 0, "neighbors": [],
+        }
 
     neighbors: List[Dict[str, Any]] = []
     for fp in fingerprints:
         distance = rssi_distance(scan_vector, fp["vector"], ap_fields, usable_fields)
-        if math.isinf(distance):
+        if not math.isfinite(distance):
             continue
         neighbors.append(
             {
@@ -449,8 +455,14 @@ def run_wifi_positioning_pipeline(
 ) -> Dict[str, Any]:
     ap_fields, fingerprints = load_fingerprints(fingerprint_path)
     if not ap_fields or not fingerprints:
+        for filename in (
+            "wifi_localization_model.json", "wifi_localization_eval.csv",
+            "wifi_signal_grid.csv", "wifi_signal_boundary.csv",
+        ):
+            (output_dir / filename).unlink(missing_ok=True)
         summary = {
-            "status": "missing_input",
+            "status": "no_valid_fingerprints" if fingerprint_path.exists() else "missing_input",
+            "explanation": "Only fresh, timestamp-validated checkpoint fingerprints are usable; stale generated localization outputs were removed.",
             "fingerprint_path": str(fingerprint_path),
             "ap_count": len(ap_fields),
             "fingerprint_count": len(fingerprints),

@@ -10,6 +10,9 @@ import shutil
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from wifi_observations import WIFI_QUALITY_FIELDS, valid_fingerprint
+from video_frames import bind_frame_to_route
+
 
 def read_csv(path: Path) -> Tuple[List[str], List[Dict[str, str]]]:
     if not path.exists():
@@ -241,6 +244,8 @@ def build_fingerprint_rows(point_rows: Sequence[Dict[str, str]], ap_fields: Sequ
         }
         for field in ap_fields:
             output[field] = row.get(field, "")
+        for field in WIFI_QUALITY_FIELDS:
+            output[field] = row.get(field, "")
         rows.append(output)
     return rows
 
@@ -304,7 +309,8 @@ This folder is generated from `processed/image_wifi_long.csv`,
 - `images_manifest.csv`: each copied image with source file, source type, WiFi point, and PDR metadata.
 - `camera_pose_seed.csv`: approximate camera pose seed. The XY position comes from PDR,
   Z is a configurable camera height, and yaw is assigned from image slot order.
-- `wifi_fingerprint_library.csv`: one row per WiFi point, with selected AP RSSI columns.
+- `wifi_fingerprint_library.csv`: one row per checkpoint, with AP RSSI and measurement
+  validity fields. Only fresh, timestamp-validated rows are used for RF retrieval/localization.
 - `wifi_boundary_seed.csv`: convex hull of WiFi/PDR point positions, useful as a rough
   WiFi interpolation envelope rather than a route contour or final room outline.
 - `pdr_trajectory_contour.csv`: continuous IMU/PDR capture-route corridor. It is a
@@ -324,7 +330,9 @@ localization. `wifi_boundary_seed.csv` only bounds RSSI interpolation; use the
 time-ordered `pdr_trajectory_contour.csv` for route continuity.
 The WiFi positioning step turns this fingerprint library into a KNN localization
 model and an RSSI boundary/grid model. Video frames are weak visual base images;
-they are not added to the WiFi fingerprint library.
+they are not added to the WiFi fingerprint library or assigned route coordinates
+without video/sensor synchronization. Fresh RSSI can propose additional match
+pairs, but visual geometric verification is required before COLMAP receives them.
 """
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
@@ -399,8 +407,9 @@ def export_reconstruction_dataset(
             "image_rel_path": exported_rel_path,
             "source_image_path": relative_path(source, root),
             "source_type": "wifi_anchor_photo",
-            "bind_type": "exact_wifi_point",
-            "wifi_label_weight": 1.0,
+            "bind_type": "checkpoint_photo_with_fresh_wifi" if valid_fingerprint(row) else "checkpoint_photo_without_valid_wifi",
+            "wifi_label_weight": 1.0 if valid_fingerprint(row) else 0.0,
+            **{field: row.get(field, "") for field in [*WIFI_QUALITY_FIELDS, *ap_fields]},
             "session": row.get("session", ""),
             "point_index": row.get("point_index", ""),
             "global_point_index": row.get("global_point_index", ""),
@@ -423,7 +432,7 @@ def export_reconstruction_dataset(
             "trajectory_contour_id": row.get("trajectory_contour_id", ""),
             "trajectory_contour_distance_m": row.get("trajectory_contour_distance_m", ""),
             "trajectory_distance_m": row.get("trajectory_distance_m", ""),
-            "trajectory_position_source": "checkpoint_timestamp_interpolation",
+            "trajectory_position_source": "checkpoint_nearest_log_timestamp",
         }
         manifest_rows.append({**common, **pose_seed})
         pose_rows.append(
@@ -431,7 +440,7 @@ def export_reconstruction_dataset(
                 "image_file": export_name,
                 "image_rel_path": exported_rel_path,
                 "source_type": "wifi_anchor_photo",
-                "bind_type": "exact_wifi_point",
+                "bind_type": common["bind_type"],
                 "session": row.get("session", ""),
                 "global_point_index": row.get("global_point_index", ""),
                 "image_slot": row.get("image_slot", ""),
@@ -446,6 +455,8 @@ def export_reconstruction_dataset(
     for row in video_rows:
         if not row.get("frame_path"):
             continue
+        if row.get("trajectory_position_source") != "synchronized_video_sensor_timestamp":
+            row = {**row, **bind_frame_to_route([], 0, 0)}
         source = resolve_source_image(root, row.get("frame_path", ""))
         export_name = exported_video_frame_name(row)
         exported_rel_path = str(Path("images") / export_name)
@@ -464,7 +475,7 @@ def export_reconstruction_dataset(
             "source_image_path": relative_path(source, root),
             "source_type": row.get("source_type", "video_base_frame"),
             "bind_type": row.get("bind_type", "video_base_frame"),
-            "wifi_label_weight": row.get("wifi_label_weight", "0.15"),
+            "wifi_label_weight": 0.0,
             "session": "",
             "point_index": "",
             "global_point_index": "",
@@ -480,6 +491,7 @@ def export_reconstruction_dataset(
             "video_frame_index": row.get("video_frame_index", ""),
             "video_sequence_index": row.get("video_sequence_index", ""),
             "video_time_s": row.get("video_time_s", ""),
+            "video_time_source": row.get("video_time_source", "unavailable"),
             "nearest_global_point_index": row.get("nearest_global_point_index", ""),
             "left_global_point_index": row.get("left_global_point_index", ""),
             "right_global_point_index": row.get("right_global_point_index", ""),
@@ -487,7 +499,7 @@ def export_reconstruction_dataset(
             "trajectory_contour_id": row.get("trajectory_contour_id", ""),
             "trajectory_contour_distance_m": row.get("trajectory_contour_distance_m", ""),
             "trajectory_distance_m": row.get("trajectory_distance_m", ""),
-            "trajectory_position_source": row.get("trajectory_position_source", "checkpoint_order_interpolation"),
+            "trajectory_position_source": row.get("trajectory_position_source", "unavailable"),
         }
         manifest_rows.append({**common, **pose_seed})
         pose_rows.append(
@@ -517,6 +529,8 @@ def export_reconstruction_dataset(
         "source_type",
         "bind_type",
         "wifi_label_weight",
+        *WIFI_QUALITY_FIELDS,
+        *ap_fields,
         "session",
         "point_index",
         "global_point_index",
@@ -532,6 +546,7 @@ def export_reconstruction_dataset(
         "video_frame_index",
         "video_sequence_index",
         "video_time_s",
+        "video_time_source",
         "nearest_global_point_index",
         "left_global_point_index",
         "right_global_point_index",
@@ -578,6 +593,7 @@ def export_reconstruction_dataset(
         "wifi_elapsed_ts",
         "wifi_gap_ms",
         "mapping_status",
+        *WIFI_QUALITY_FIELDS,
         *ap_fields,
     ]
     boundary_fields = [

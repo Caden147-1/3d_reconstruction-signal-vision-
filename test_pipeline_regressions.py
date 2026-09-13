@@ -26,7 +26,7 @@ from video_frames import VIDEO_FRAME_FIELDS, bind_frame_to_route, write_csv
 
 
 class PipelineRegressionTests(unittest.TestCase):
-    def test_video_manifest_keeps_contour_coordinates(self) -> None:
+    def test_video_manifest_does_not_invent_contour_coordinates(self) -> None:
         points = [
             {
                 "global_point_index": "1",
@@ -46,15 +46,16 @@ class PipelineRegressionTests(unittest.TestCase):
             },
         ]
         binding = bind_frame_to_route(points, frame_index_zero_based=1, frame_count=3)
-        self.assertEqual(binding["trajectory_contour_id"], "route_001")
-        self.assertEqual(binding["trajectory_position_source"], "checkpoint_order_interpolation")
+        self.assertEqual(binding["trajectory_contour_id"], "")
+        self.assertEqual(binding["trajectory_position_source"], "unavailable")
+        self.assertEqual(binding["pdr_bind_source"], "video_sensor_sync_unavailable")
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "video.csv"
             write_csv(path, VIDEO_FRAME_FIELDS, [binding])
             with path.open(newline="", encoding="utf-8") as handle:
                 row = next(csv.DictReader(handle))
-        self.assertEqual(row["trajectory_contour_id"], "route_001")
-        self.assertEqual(row["trajectory_contour_distance_m"], "5.000000")
+        self.assertEqual(row["trajectory_contour_id"], "")
+        self.assertEqual(row["trajectory_contour_distance_m"], "")
 
     def test_mixed_sources_use_two_camera_groups(self) -> None:
         rows = build_workspace_manifest(
@@ -88,6 +89,7 @@ class PipelineRegressionTests(unittest.TestCase):
                 workspace_dir=workspace,
                 colmap_exe=root / "missing-colmap.exe",
                 visual_only=True,
+                matcher="exhaustive",
                 run_image_similarity=False,
                 run_meshing=False,
                 use_gpu=False,

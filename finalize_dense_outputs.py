@@ -46,6 +46,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Promote a Poisson/Delaunay mesh instead of the observed filtered point cloud.",
     )
+    parser.add_argument(
+        "--allow-raw-replacement",
+        action="store_true",
+        help="Explicitly allow raw fused.ply to replace an already valid final.ply.",
+    )
     return parser.parse_args()
 
 
@@ -69,7 +74,7 @@ def read_ply_elements(path: Path) -> dict[str, int]:
     return elements
 
 
-def choose_source(dense_dir: Path, prefer_mesh: bool = False, rejected: Optional[list[dict[str, str]]] = None) -> Optional[tuple[str, Path]]:
+def choose_source(dense_dir: Path, prefer_mesh: bool = False, rejected: Optional[list[dict[str, str]]] = None, allow_raw_replacement: bool = False) -> Optional[tuple[str, Path]]:
     priority = MESH_SOURCE_PRIORITY if prefer_mesh else OBSERVED_SOURCE_PRIORITY
     for kind, name in priority:
         path = dense_dir / name
@@ -89,6 +94,17 @@ def choose_source(dense_dir: Path, prefer_mesh: bool = False, rejected: Optional
                 if rejected is not None:
                     rejected.append({"source": str(path), "reason": str(exc)})
                 continue
+            if kind == "raw_point_cloud" and not allow_raw_replacement:
+                final_path = dense_dir / FINAL_NAME
+                if final_path.is_file():
+                    try:
+                        validate_ply(final_path)
+                    except (OSError, ValueError):
+                        pass
+                    else:
+                        # Cleanup removes the filtered source, but retains raw fused.ply.
+                        # Its presence on a later invocation is not a new filter result.
+                        return "existing_final", final_path
             return kind, path
     return None
 
@@ -134,7 +150,10 @@ def main() -> int:
     dense_dir.mkdir(parents=True, exist_ok=True)
     final_path = dense_dir / FINAL_NAME
     rejected: list[dict[str, str]] = []
-    selected = choose_source(dense_dir, prefer_mesh=args.prefer_mesh, rejected=rejected)
+    selected = choose_source(
+        dense_dir, prefer_mesh=args.prefer_mesh, rejected=rejected,
+        allow_raw_replacement=getattr(args, "allow_raw_replacement", False),
+    )
     if selected is None:
         payload = {
             "status": "missing_source",
@@ -173,7 +192,7 @@ def main() -> int:
         finally:
             staged.unlink(missing_ok=True)
 
-    deleted = [] if args.keep_intermediate else cleanup_intermediate_files(dense_dir, final_path)
+    deleted = [] if args.keep_intermediate or source_kind == "existing_final" else cleanup_intermediate_files(dense_dir, final_path)
     payload = {
         "status": "ok",
         "output": str(final_path),
@@ -189,7 +208,9 @@ def main() -> int:
         "face_count": elements.get("face"),
         "explanation": (
             "final.ply defaults to the filtered observed point cloud; use --prefer-mesh "
-            "only when a Poisson/Delaunay visualization mesh is explicitly desired."
+            "only when a Poisson/Delaunay visualization mesh is explicitly desired. "
+            "An existing valid final is preserved instead of replacing it with raw fused.ply "
+            "unless --allow-raw-replacement is explicitly supplied."
         ),
     }
     write_summary(args.summary, payload)

@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from wifi_observations import MAX_WIFI_AGE_MS, MISSING_RSSI, WIFI_QUALITY_FIELDS, measurement_gap_ms
+
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
@@ -157,6 +159,14 @@ def relative_path(path: Path, root: Path) -> str:
         return str(path)
 
 
+def nearest_fresh_fingerprint(
+    rows: Sequence[Dict[str, Any]], target_elapsed_ts: int,
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    best = min(rows, key=lambda row: measurement_gap_ms(row, target_elapsed_ts), default=None)
+    gap = float("inf") if best is None else measurement_gap_ms(best, target_elapsed_ts)
+    return (best, str(int(gap))) if gap <= MAX_WIFI_AGE_MS else (None, "")
+
+
 def mapping_status(feature_row: Optional[Dict[str, Any]], missing_slots: int) -> str:
     parts: List[str] = []
     if feature_row is None:
@@ -191,6 +201,7 @@ def build_image_wifi_tables(
         for field in feature_fields
         if field not in {"session", "scan_index", "elapsed_ts", "epoch_ts"}
     ]
+    copied_feature_fields += [field for field in WIFI_QUALITY_FIELDS if field not in copied_feature_fields]
 
     long_base_fields = [
         "session",
@@ -208,6 +219,7 @@ def build_image_wifi_tables(
         "wifi_epoch_ts",
         "wifi_gap_ms",
         "mapping_status",
+        "pdr_reference_elapsed_ts",
     ]
     point_base_fields = [
         "session",
@@ -221,6 +233,7 @@ def build_image_wifi_tables(
         "wifi_epoch_ts",
         "wifi_gap_ms",
         "mapping_status",
+        "pdr_reference_elapsed_ts",
     ]
     image_fields: List[str] = []
     for slot in range(1, images_per_point + 1):
@@ -238,7 +251,13 @@ def build_image_wifi_tables(
         if missing_slots == 0:
             complete_point_count += 1
 
-        feature_row, wifi_gap_ms = nearest_feature_row(
+        # Route interpolation and RF validity are independent. Missing WiFi must
+        # not discard the checkpoint's photos or its nearest IMU/PDR state.
+        route_row, _route_gap_ms = nearest_feature_row(
+            features_by_session.get(point.session, []),
+            point.elapsed_ts,
+        )
+        feature_row, wifi_gap_ms = nearest_fresh_fingerprint(
             features_by_session.get(point.session, []),
             point.elapsed_ts,
         )
@@ -256,10 +275,20 @@ def build_image_wifi_tables(
             "wifi_epoch_ts": "" if feature_row is None else feature_row.get("epoch_ts", ""),
             "wifi_gap_ms": wifi_gap_ms,
             "mapping_status": status,
+            "pdr_reference_elapsed_ts": "" if route_row is None else route_row.get("elapsed_ts", ""),
         }
-        if feature_row is not None:
+        if route_row is not None:
             for field in copied_feature_fields:
-                row_common[field] = feature_row.get(field, "")
+                row_common[field] = route_row.get(field, "")
+        for field in copied_feature_fields:
+            if field.startswith("ap_") or field in WIFI_QUALITY_FIELDS:
+                row_common[field] = (
+                    feature_row.get(field, "") if feature_row is not None
+                    else MISSING_RSSI if field.startswith("ap_") else ""
+                )
+        if feature_row is None:
+            row_common["wifi_observation_status"] = "no_fresh_checkpoint_observation"
+            row_common["wifi_fresh_ap_count"] = 0
 
         point_row = dict(row_common)
         for slot in range(1, images_per_point + 1):
@@ -337,6 +366,10 @@ def build_image_wifi_tables(
         "missing_image_count": missing_image_count,
         "unassigned_image_count": unassigned_image_count,
         "feature_source": str(feature_path.name),
+        "fresh_wifi_point_count": sum(row.get("wifi_observation_status") == "fresh" for row in point_rows),
+        "wifi_association_max_gap_ms": MAX_WIFI_AGE_MS,
+        "wifi_association_basis": "every_ap_measurement_timestamp_not_logger_timestamp",
+        "pdr_position_basis": "nearest_logger_timestamp_independent_of_wifi_validity",
         "outputs": {
             "long": "image_wifi_long.csv",
             "points": "image_wifi_points.csv",

@@ -345,6 +345,8 @@ def copy_metadata(reconstruction_dir: Path, workspace_dir: Path) -> List[str]:
     for name in METADATA_FILES:
         source = reconstruction_dir / name
         if not source.exists():
+            if name in {"wifi_localization_model.json", "wifi_localization_eval.csv", "wifi_signal_grid.csv", "wifi_signal_boundary.csv"}:
+                (metadata_dir / name).unlink(missing_ok=True)
             continue
         shutil.copy2(source, metadata_dir / name)
         copied.append(name)
@@ -730,6 +732,8 @@ def build_constrained_match_pairs(
                 add_pair(row_a, row_b, "video_sequence")
 
     for video_row in video_rows:
+        if video_row.get("trajectory_position_source") != "synchronized_video_sensor_timestamp":
+            continue
         candidate_points: set[int] = set()
         used_trajectory_candidates = False
         if trajectory_constraint_available and not visual_only:
@@ -893,6 +897,78 @@ def write_match_pairs(workspace_dir: Path, pairs: Sequence[Tuple[str, str]]) -> 
             handle.write(f"{image_a} {image_b}\n")
 
 
+def build_wifi_recovery_edges(
+    manifest_rows: Sequence[Dict[str, str]],
+    existing_pairs: Sequence[Tuple[str, str]],
+    enabled: bool = True,
+    neighbors_per_point: int = 2,
+    images_per_point: int = 6,
+    max_rssi_rms_db: float = 6.0,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Use fresh RF similarity only to propose visually verifiable loop candidates."""
+    from wifi_observations import MIN_WIFI_APS, finite_number, valid_fingerprint, visible_fingerprint
+
+    groups: Dict[Tuple[str, str], List[Dict[str, str]]] = {}
+    for row in manifest_rows:
+        if row.get("image_file") and row.get("global_point_index") and not is_video_frame_row(row) and valid_fingerprint(row):
+            groups.setdefault((row.get("session", ""), str(row["global_point_index"])), []).append(row)
+    representatives = {key: rows[0] for key, rows in groups.items()}
+    ranked: Dict[Tuple[str, str], List[Tuple[float, Tuple[str, str], int, float]]] = {}
+    keys = sorted(groups)
+    if enabled and neighbors_per_point > 0 and images_per_point > 0:
+        for index, key_a in enumerate(keys):
+            row_a = representatives[key_a]
+            vector_a = visible_fingerprint(row_a)
+            for key_b in keys[index + 1:]:
+                if not key_a[0] or key_a[0] != key_b[0]:
+                    continue
+                row_b = representatives[key_b]
+                start = max(finite_number(row_a["wifi_measurement_min_elapsed_ts"]), finite_number(row_b["wifi_measurement_min_elapsed_ts"]))
+                end = min(finite_number(row_a["wifi_measurement_max_elapsed_ts"]), finite_number(row_b["wifi_measurement_max_elapsed_ts"]))
+                if start <= end:
+                    continue  # Reused observations cannot establish a revisit.
+                vector_b = visible_fingerprint(row_b)
+                shared = vector_a.keys() & vector_b.keys()
+                union = vector_a.keys() | vector_b.keys()
+                overlap = len(shared) / len(union)
+                if len(shared) < MIN_WIFI_APS or overlap < 0.6:
+                    continue
+                rms = math.sqrt(sum((vector_a.get(ap, -110.0) - vector_b.get(ap, -110.0)) ** 2 for ap in union) / len(union))
+                if rms <= max_rssi_rms_db:
+                    ranked.setdefault(key_a, []).append((rms, key_b, len(shared), overlap))
+                    ranked.setdefault(key_b, []).append((rms, key_a, len(shared), overlap))
+    proposed: Dict[Tuple[Tuple[str, str], Tuple[str, str]], Tuple[float, int, float]] = {}
+    for key, neighbors in ranked.items():
+        for rms, other, shared_count, overlap in sorted(neighbors)[:neighbors_per_point]:
+            proposed[tuple(sorted((key, other)))] = (rms, shared_count, overlap)
+    existing = {tuple(sorted(pair)) for pair in existing_pairs}
+    edges: List[Dict[str, Any]] = []
+    for (key_a, key_b), (rms, shared_count, overlap) in sorted(proposed.items()):
+        left = select_evenly_spaced(sorted(groups[key_a], key=lambda row: safe_int(row.get("image_slot"))), images_per_point)
+        right = select_evenly_spaced(sorted(groups[key_b], key=lambda row: safe_int(row.get("image_slot"))), images_per_point)
+        for row_a in left:
+            for row_b in right:
+                pair = tuple(sorted((row_a["image_file"], row_b["image_file"])))
+                if pair in existing or pair[0] == pair[1]:
+                    continue
+                existing.add(pair)
+                edges.append({
+                    "image_a": pair[0], "image_b": pair[1], "reason": "wifi_fingerprint_recovery",
+                    "edge_weight_basis": "fresh_rssi_retrieval_only_requires_geometry",
+                    "wifi_rssi_rms_db": round(rms, 6), "wifi_shared_ap_count": shared_count,
+                    "wifi_ap_overlap": round(overlap, 6),
+                })
+    summary = {
+        "status": "disabled" if not enabled else "insufficient_fresh_fingerprints" if len(groups) < 2 else "evaluated",
+        "valid_checkpoint_count": len(groups), "candidate_checkpoint_pair_count": len(proposed),
+        "candidate_image_pair_count": len(edges), "max_rssi_rms_db": max_rssi_rms_db,
+        "min_shared_aps": MIN_WIFI_APS, "min_ap_overlap": 0.6,
+        "neighbors_per_point": neighbors_per_point, "images_per_point": images_per_point,
+        "explanation": "Fresh RSSI proposes additional pairs only; P1 geometry must verify them. RSSI does not set poses, room boundaries, or point-cloud crop limits.",
+    }
+    return edges, summary
+
+
 def write_named_match_pairs(workspace_dir: Path, filename: str, pairs: Sequence[Tuple[str, str]]) -> None:
     with (workspace_dir / filename).open("w", encoding="utf-8") as handle:
         for image_a, image_b in pairs:
@@ -938,7 +1014,7 @@ def select_visually_supported_match_pairs(
         pair_status = "not_evaluated" if similarity is None else str(similarity.get("pair_status", "not_evaluated"))
         selected_pair = True
         selection_reason = "p1_unavailable_kept"
-        if edge.get("reason") == "visual_recovery":
+        if edge.get("reason") in {"visual_recovery", "wifi_fingerprint_recovery"}:
             selected_pair = p1_available and pair_status == "ok" and decision == "geometry_supported"
             selection_reason = "p1_recovery_geometry_supported" if selected_pair else "p1_recovery_unverified_rejected"
             if not selected_pair:
@@ -981,7 +1057,8 @@ def select_visually_supported_match_pairs(
         "unreviewed_pair_count": unreviewed_count,
         "fallback_used": False,
         "selected_p2_contour_pair_count": sum(row["selected"] for row in selection_rows if row["reason"] in P2_CONTOUR_REASONS),
-        "selected_visual_recovery_pair_count": selection_reason_counts.get("p1_recovery_geometry_supported", 0),
+        "selected_visual_recovery_pair_count": sum(row["selected"] for row in selection_rows if row["reason"] == "visual_recovery"),
+        "selected_wifi_recovery_pair_count": sum(row["selected"] for row in selection_rows if row["reason"] == "wifi_fingerprint_recovery"),
         "selection_reason_counts": dict(sorted(selection_reason_counts.items())),
         "rejected_visual_decision_counts": dict(sorted(rejected_decision_counts.items())),
         "explanation": (
@@ -1032,6 +1109,9 @@ def write_match_graph_edges(workspace_dir: Path, edge_rows: Sequence[Dict[str, A
             "slot_gap",
             "video_sequence_gap",
             "edge_weight_basis",
+            "wifi_rssi_rms_db",
+            "wifi_shared_ap_count",
+            "wifi_ap_overlap",
             "source_type_a",
             "source_type_b",
             "global_point_index_a",
@@ -1199,9 +1279,6 @@ def remove_stale_image_similarity_outputs(workspace_dir: Path) -> List[str]:
     return removed
 
 
-MASK_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
-
-
 def resolve_optional_path(root: Path, path: Optional[Path]) -> Optional[Path]:
     if path is None:
         return None
@@ -1209,21 +1286,7 @@ def resolve_optional_path(root: Path, path: Optional[Path]) -> Optional[Path]:
 
 
 def mask_candidates(mask_dir: Path, image_name: str) -> List[Path]:
-    rel = Path(image_name)
-    candidates = [mask_dir / rel]
-    candidates.append(mask_dir / f"{image_name}.png")
-    if rel.suffix:
-        candidates.append(mask_dir / rel.with_suffix(".png"))
-    else:
-        candidates.extend(mask_dir / f"{image_name}{suffix}" for suffix in MASK_EXTENSIONS)
-    unique: List[Path] = []
-    seen: set[str] = set()
-    for candidate in candidates:
-        key = str(candidate).lower()
-        if key not in seen:
-            unique.append(candidate)
-            seen.add(key)
-    return unique
+    return [mask_dir / (image_name.replace("\\", "/") + ".png")]
 
 
 def mask_dir_summary(mask_dir: Optional[Path], image_names: Sequence[str]) -> Dict[str, Any]:
@@ -1231,23 +1294,21 @@ def mask_dir_summary(mask_dir: Optional[Path], image_names: Sequence[str]) -> Di
         return {"enabled": False, "path": "", "exists": False, "matched_image_count": 0, "missing_image_count": 0}
     matched = 0
     missing: List[str] = []
-    if mask_dir.exists():
+    if mask_dir.is_dir():
         for image_name in image_names:
-            if any(candidate.exists() for candidate in mask_candidates(mask_dir, image_name)):
+            if any(candidate.is_file() for candidate in mask_candidates(mask_dir, image_name)):
                 matched += 1
             elif len(missing) < 20:
                 missing.append(image_name)
     return {
-        "enabled": mask_dir.exists(),
+        "enabled": mask_dir.is_dir(),
         "path": str(mask_dir),
-        "exists": mask_dir.exists(),
+        "exists": mask_dir.is_dir(),
         "matched_image_count": matched,
-        "missing_image_count": max(0, len(image_names) - matched) if mask_dir.exists() else len(image_names),
+        "missing_image_count": max(0, len(image_names) - matched),
         "missing_images": missing,
         "accepted_name_patterns": [
-            "same relative path as image",
-            "image name plus .png",
-            "same stem with .png",
+            "same relative image path including original extension, followed by .png",
         ],
     }
 
@@ -1366,6 +1427,8 @@ echo [4/4] Skipping PDR alignment for visual-only reconstruction.
 echo [preflight] Checking that sparse reconstruction starts from the current input set...
 python "%ROOT%\\colmap_workspace_check.py" --workspace "%WORKSPACE%" --require-clean-database
 if errorlevel 1 exit /b %errorlevel%
+python "%ROOT%\\colmap_workspace_check.py" --workspace "%WORKSPACE%" --record-sparse-start
+if errorlevel 1 exit /b %errorlevel%
 
 if exist "%DATABASE%" (
   echo [warn] Existing database found: %DATABASE%
@@ -1397,6 +1460,8 @@ if errorlevel 1 exit /b %errorlevel%
 {after_mapper_cooldown}
 
 {alignment_block}
+python "%ROOT%\\colmap_workspace_check.py" --workspace "%WORKSPACE%" --record-sparse-complete
+if errorlevel 1 exit /b %errorlevel%
 python "%ROOT%\\reconstruction_quality.py" --workspace "%WORKSPACE%" --summary "%WORKSPACE%\\quality_report.json" --markdown "%WORKSPACE%\\QUALITY_REPORT.md"
 if errorlevel 1 echo [warn] Sparse quality report failed; reconstruction outputs are still available.
 
@@ -1591,6 +1656,8 @@ def write_automatic_batch(
 echo [preflight] Checking that automatic reconstruction starts from the current input set...
 python "%ROOT%\\colmap_workspace_check.py" --workspace "%WORKSPACE%" --require-clean-database
 if errorlevel 1 exit /b %errorlevel%
+python "%ROOT%\\colmap_workspace_check.py" --workspace "%WORKSPACE%" --record-sparse-start --runner run_colmap_automatic.bat
+if errorlevel 1 exit /b %errorlevel%
 
 echo [info] Running COLMAP automatic_reconstructor...
 "%COLMAP_EXE%" automatic_reconstructor ^
@@ -1605,6 +1672,8 @@ echo [info] Running COLMAP automatic_reconstructor...
   --dense 1
 if errorlevel 1 exit /b %errorlevel%
 
+python "%ROOT%\\colmap_workspace_check.py" --workspace "%WORKSPACE%" --record-sparse-complete
+if errorlevel 1 exit /b %errorlevel%
 echo [done] Automatic reconstruction complete.
 """
     write_text(workspace_dir / "run_colmap_automatic.bat", content)
@@ -1631,6 +1700,11 @@ if /I not "%CONFIRM%"=="YES" (
   exit /b 0
 )
 if exist "%WORKSPACE%database.db" del "%WORKSPACE%database.db"
+if exist "%WORKSPACE%database.db-wal" del "%WORKSPACE%database.db-wal"
+if exist "%WORKSPACE%database.db-shm" del "%WORKSPACE%database.db-shm"
+if exist "%WORKSPACE%database.db-journal" del "%WORKSPACE%database.db-journal"
+if exist "%WORKSPACE%sparse_run_inputs.json" del "%WORKSPACE%sparse_run_inputs.json"
+if exist "%WORKSPACE%sparse_run_provenance.json" del "%WORKSPACE%sparse_run_provenance.json"
 if exist "%WORKSPACE%sparse" rmdir /s /q "%WORKSPACE%sparse"
 if exist "%WORKSPACE%sparse_pdr_aligned" rmdir /s /q "%WORKSPACE%sparse_pdr_aligned"
 if exist "%WORKSPACE%dense" rmdir /s /q "%WORKSPACE%dense"
@@ -1677,7 +1751,7 @@ This folder is prepared from the current WiFi/IMU/photo capture.
 2. Run `run_colmap_dense.bat` to generate the dense result and reports.
 3. Open `dense/final.ply` in MeshLab for the final reconstruction view.
 
-For normal rebuilds, prefer `python run_colmap.py full` from the project root; it clears old COLMAP outputs automatically before running sparse and dense reconstruction. The generated dense script verifies that `database.db` covers the current `image_list.txt` before it can replace an existing dense result. If you run these generated `.bat` scripts directly and they report existing outputs, run `reset_colmap_outputs.bat` first; it asks you to type `YES` before deleting old outputs.
+For normal rebuilds, prefer `python run_colmap.py full` from the project root; it clears old COLMAP outputs automatically before running sparse and dense reconstruction. The sparse script records input content before feature extraction and the completed model/database identities afterward. Dense preflight requires this provenance, not just matching filenames. Old models without a run record remain viewable but are unverified for a new dense run; never certify them retroactively. If you run these generated `.bat` scripts directly and they report existing outputs, run `reset_colmap_outputs.bat` first; it asks you to type `YES` before deleting old outputs.
 
 The generated scripts favor reconstruction quality over speed. The sparse matcher is `{matcher}` and the dense profile is `{dense_profile}`.
 The load profile is `{load_profile}` with COLMAP thread cap `{num_threads}` and `{stage_cooldown_s}` seconds of cooldown between heavy stages.
@@ -1693,7 +1767,7 @@ The load profile is `{load_profile}` with COLMAP thread cap `{num_threads}` and 
 - `metadata/pdr_trajectory_contour.csv` is the time-ordered IMU/PDR route corridor used as a soft matching constraint. It is not a room boundary, mesh-completion source, or pose optimizer.
 - Video frames can inherit interpolated contour positions only as soft matching evidence; they are intentionally excluded from PDR model alignment.
 - When both sources are present, checkpoint photos and video frames use `images/anchors/` and `images/video/` so COLMAP can share intrinsics within each source group rather than across them.
-- If `--colmap-mask-dir` was provided during preprocessing and the directory exists, feature extraction and dense fusion use those masks to suppress semantic clutter or known reflective regions. Masks must follow the generated relative input names.
+- With `--colmap-mask-dir`, mask paths must append `.png` to the complete relative image name, e.g. `anchors/a.jpg.png`. A missing directory or zero correctly named masks stops preparation; partial mask coverage is reported. Unmasked images are not automatically excluded.
 - No synthetic mirror, floor, or wall completion is added to `final.ply`.
 - `dense/final.ply` defaults to the filtered observed point cloud. Meshing is disabled unless `--colmap-meshing` is requested; then inspection meshes and other intermediates are retained. Meshes may interpolate unobserved surfaces.
 - Finalization validates the complete PLY, stages a verified copy, and replaces `final.ply` before removing known intermediates. Invalid sources and failed promotions cannot trigger that cleanup. A full rebuild still deliberately resets outputs first.
@@ -1714,7 +1788,8 @@ The load profile is `{load_profile}` with COLMAP thread cap `{num_threads}` and 
 - `metadata/wifi_signal_boundary.csv`: RSSI metrics on the WiFi/PDR boundary.
 - `metadata/video_frames_manifest.csv`: optional video frames used as a weak visual base.
 - `match_pairs_route.txt`: raw P2 route-contour candidate pairs retained for inspection and ablation.
-- `match_pairs_unfiltered.txt`: combined route and visual-recovery candidates before selection.
+- `match_pairs_unfiltered.txt`: combined route, visual-recovery, and fresh-RSSI candidates before selection.
+- `wifi_recovery_summary.json`: fresh-RSSI candidate counts and geometrically verified selections; these are not measured geometry improvements.
 - `match_pairs.txt`: P1-selected pairs passed to the default constrained COLMAP matcher.
 - `match_graph_edges.csv`: diagnostic weighted edge list with pair reasons, scores, and original slot counts.
 - `image_similarity_edges.csv` / `image_similarity_summary.json`: P1 visual evidence for route and recovery candidates.
@@ -1726,6 +1801,7 @@ The load profile is `{load_profile}` with COLMAP thread cap `{num_threads}` and 
 - `QUALITY_REPORT.md` / `quality_report.json`: sparse component counts, largest registered-image count, and dense-output availability.
 - `dense/final.ply`: final dense model to open; filtered observed point cloud is preferred, with raw point-cloud and mesh fallback only when needed.
 - `dense/final_output_summary.json`: source chosen for `final.ply` and intermediate files removed during cleanup.
+- `sparse_run_provenance.json`: input and output SHA-256 identities recorded by a completed sparse run; absence means unverified, not necessarily corrupt geometry.
 
 {alignment_note}
 """
@@ -1767,6 +1843,7 @@ def prepare_colmap_workspace(
     image_similarity_orb_features: int = 1500,
     image_similarity_min_visual_score: float = 0.22,
     visual_recovery_neighbors: int = 12,
+    wifi_recovery_enabled: bool = True,
 ) -> Dict[str, Any]:
     matcher = matcher if matcher in {"constrained", "hybrid", "exhaustive", "sequential"} else "constrained"
     manifest_fields, manifest_rows = read_csv(reconstruction_dir / "images_manifest.csv")
@@ -1813,6 +1890,8 @@ def prepare_colmap_workspace(
         workspace_manifest_rows,
     )
     mask_summary = mask_dir_summary(resolved_mask_dir, image_names)
+    if resolved_mask_dir is not None and (not mask_summary["enabled"] or (image_names and not mask_summary["matched_image_count"])):
+        raise ValueError("No usable mask paths: expected a mask directory containing <relative-image-name>.png, for example anchors/a.jpg.png")
     active_mask_dir = resolved_mask_dir if mask_summary.get("enabled") else None
     write_image_list(workspace_dir, image_names)
     match_pairs, match_edge_rows, match_pair_summary = build_constrained_match_pairs(
@@ -1827,6 +1906,12 @@ def prepare_colmap_workspace(
     )
     route_pair_count = len(match_pairs)
     write_named_match_pairs(workspace_dir, "match_pairs_route.txt", match_pairs)
+    wifi_edges, wifi_recovery_summary = build_wifi_recovery_edges(
+        workspace_manifest_rows, match_pairs,
+        enabled=wifi_recovery_enabled and not visual_only and run_image_similarity,
+    )
+    match_edge_rows.extend(wifi_edges)
+    match_pairs = sorted(set(match_pairs) | {(row["image_a"], row["image_b"]) for row in wifi_edges})
     if run_image_similarity:
         try:
             image_similarity_summary = analyze_workspace_image_similarity(
@@ -1880,6 +1965,11 @@ def prepare_colmap_workspace(
         similarity_summary=image_similarity_summary,
     )
     write_match_pairs(workspace_dir, colmap_match_pairs)
+    wifi_recovery_summary.update({
+        "selected_image_pair_count": match_pair_filter_summary["selected_wifi_recovery_pair_count"],
+        "pair_list_used_by_sparse_matcher": matcher in {"constrained", "hybrid"},
+    })
+    write_json(workspace_dir / "wifi_recovery_summary.json", wifi_recovery_summary)
     match_pair_filter_summary.update({
         "matcher": matcher,
         "pair_list_used_by_sparse_matcher": matcher in {"constrained", "hybrid"},
@@ -1892,6 +1982,7 @@ def prepare_colmap_workspace(
             "pair_count": len(match_pairs),
             "route_candidate_pair_count": route_pair_count,
             "visual_recovery_candidate_pair_count": len(recovery_edges),
+            "wifi_recovery": wifi_recovery_summary,
             "weight_statistics_scope": "route_candidates_only",
             "colmap_pair_count": len(colmap_match_pairs),
             "p1_pair_filter": match_pair_filter_summary,
@@ -1899,6 +1990,8 @@ def prepare_colmap_workspace(
     )
     if recovery_edges:
         match_pair_summary["reason_counts"]["visual_recovery"] = len(recovery_edges)
+    if wifi_edges:
+        match_pair_summary["reason_counts"]["wifi_fingerprint_recovery"] = len(wifi_edges)
     image_similarity_summary["used_for_colmap_pair_selection"] = (
         match_pair_filter_summary.get("status") == "applied" and matcher in {"constrained", "hybrid"}
     )

@@ -122,7 +122,7 @@ def extract_with_ffmpeg(
         "-i",
         str(video_path),
         "-vf",
-        f"fps={fps:.6f}",
+        f"fps={fps:.12g}:start_time=0",
         "-q:v",
         "2",
     ]
@@ -142,6 +142,7 @@ def extract_with_opencv(
     output_dir: Path,
     frame_interval_s: float,
     max_frames: int,
+    frame_timestamps: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Tuple[str, str]:
     try:
         import cv2  # type: ignore[import-not-found]
@@ -152,23 +153,82 @@ def extract_with_opencv(
     if not capture.isOpened():
         return "failed", "OpenCV could not open the video."
 
-    fps = capture.get(cv2.CAP_PROP_FPS) or 30.0
-    frame_step = max(1, int(round(fps * frame_interval_s)))
+    fps = capture.get(cv2.CAP_PROP_FPS)
+    if not math.isfinite(fps) or fps <= 0:
+        capture.release()
+        return "failed", "No valid video frame rate; cannot assign sample times."
     written = 0
     frame_index = 0
+    previous_time = -1.0
     while True:
-        ok, frame = capture.read()
-        if not ok:
+        if not capture.grab():
             break
-        if frame_index % frame_step == 0:
+        timestamp = capture.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+        time_source = "opencv_decoded_timestamp"
+        if not math.isfinite(timestamp) or timestamp <= previous_time:
+            timestamp = frame_index / fps
+            time_source = "opencv_frame_index_fps_estimate"
+        previous_time = timestamp
+        if timestamp + 1e-6 >= written * frame_interval_s:
+            ok, frame = capture.retrieve()
+            if not ok:
+                capture.release()
+                return "failed", "Could not decode a selected video frame."
             written += 1
             output_path = output_dir / f"frame_{written:06d}.jpg"
-            cv2.imwrite(str(output_path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+            if not cv2.imwrite(str(output_path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 95]):
+                capture.release()
+                return "failed", "Could not write a selected video frame."
+            if frame_timestamps is not None:
+                frame_timestamps[output_path.name] = {"video_time_s": timestamp, "video_time_source": time_source}
             if max_frames > 0 and written >= max_frames:
                 break
         frame_index += 1
     capture.release()
     return ("ok", "") if written else ("failed", "No frames were written.")
+
+
+def probe_video_duration(video_path: Path, ffmpeg_exe: Optional[Path] = None) -> Optional[float]:
+    ffprobe = ffmpeg_exe.with_name("ffprobe" + ffmpeg_exe.suffix) if ffmpeg_exe else None
+    if ffprobe is None or not ffprobe.is_file():
+        found = shutil.which("ffprobe")
+        ffprobe = Path(found) if found else None
+    if ffprobe is not None:
+        try:
+            result = subprocess.run([
+                str(ffprobe), "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=duration:format=duration", "-of", "json", str(video_path),
+            ], capture_output=True, text=True, check=True)
+            payload = json.loads(result.stdout)
+            for item in [*payload.get("streams", []), payload.get("format", {})]:
+                duration = safe_float(item.get("duration"))
+                if math.isfinite(duration) and duration > 0:
+                    return duration
+        except (OSError, subprocess.SubprocessError, ValueError):
+            pass
+    try:
+        import cv2  # type: ignore[import-not-found]
+    except ImportError:
+        return None
+    capture = cv2.VideoCapture(str(video_path))
+    try:
+        fps = capture.get(cv2.CAP_PROP_FPS)
+        frames = capture.get(cv2.CAP_PROP_FRAME_COUNT)
+        if capture.isOpened() and math.isfinite(fps) and math.isfinite(frames) and fps > 0 and frames > 0:
+            return frames / fps
+    finally:
+        capture.release()
+    return None
+
+
+def full_clip_interval(duration_s: Optional[float], requested_interval_s: float, max_frames: int) -> float:
+    if not math.isfinite(requested_interval_s) or requested_interval_s <= 0:
+        raise ValueError("Video frame interval must be finite and greater than zero.")
+    if max_frames <= 0:
+        return requested_interval_s
+    if duration_s is None or not math.isfinite(duration_s) or duration_s <= 0:
+        raise ValueError("Cannot apply a whole-clip frame budget without a valid video duration.")
+    return max(requested_interval_s, duration_s / max_frames)
 
 
 def frame_original_index(frame_path: Path, fallback: int) -> int:
@@ -313,84 +373,27 @@ def load_anchor_points(processed_dir: Path) -> List[Dict[str, str]]:
     return points
 
 
-def interpolate_value(left: Dict[str, str], right: Dict[str, str], field: str, ratio: float) -> str:
-    left_value = safe_float(left.get(field))
-    right_value = safe_float(right.get(field))
-    if math.isnan(left_value) or math.isnan(right_value):
-        return ""
-    return f"{left_value + ratio * (right_value - left_value):.6f}"
-
-
 def bind_frame_to_route(
     points: Sequence[Dict[str, str]],
     frame_index_zero_based: int,
     frame_count: int,
 ) -> Dict[str, Any]:
-    if not points:
-        return {
-            "bind_type": "visual_only",
-            "wifi_label_weight": 0.0,
-            "nearest_global_point_index": "",
-            "left_global_point_index": "",
-            "right_global_point_index": "",
-            "route_ratio": "",
-            "pdr_x": "",
-            "pdr_y": "",
-            "pdr_bind_source": "no_anchor_points",
-            "trajectory_contour_id": "",
-            "trajectory_contour_distance_m": "",
-            "trajectory_distance_m": "",
-            "trajectory_position_source": "unavailable",
-        }
-
-    if len(points) == 1 or frame_count <= 1:
-        point = points[0]
-        return {
-            "bind_type": "single_anchor_interpolated",
-            "wifi_label_weight": 0.15,
-            "nearest_global_point_index": point.get("global_point_index", ""),
-            "left_global_point_index": point.get("global_point_index", ""),
-            "right_global_point_index": point.get("global_point_index", ""),
-            "route_ratio": "0.000000",
-            "pdr_x": point.get("pdr_x", ""),
-            "pdr_y": point.get("pdr_y", ""),
-            "pdr_bind_source": "single_anchor_point",
-            "trajectory_contour_id": point.get("trajectory_contour_id", ""),
-            "trajectory_contour_distance_m": point.get("trajectory_contour_distance_m", ""),
-            "trajectory_distance_m": point.get("trajectory_distance_m", ""),
-            "trajectory_position_source": "single_checkpoint_anchor",
-        }
-
-    max_frame_index = max(0, frame_count - 1)
-    bounded_frame_index = min(max(0, frame_index_zero_based), max_frame_index)
-    progress = bounded_frame_index / max(1, max_frame_index)
-    route_position = progress * (len(points) - 1)
-    left_index = min(len(points) - 1, max(0, int(math.floor(route_position))))
-    right_index = min(len(points) - 1, int(math.ceil(route_position)))
-    ratio = route_position - left_index
-    left = points[left_index]
-    right = points[right_index]
-    nearest = left if ratio <= 0.5 else right
-    left_contour_id = left.get("trajectory_contour_id", "")
-    right_contour_id = right.get("trajectory_contour_id", "")
-    shared_contour_id = left_contour_id if left_contour_id and left_contour_id == right_contour_id else ""
-
+    # A frame ordinal and a checkpoint ordinal do not establish a shared clock.
+    # Keep the public helper for callers, but never manufacture route coordinates.
     return {
-        "bind_type": "order_interpolated_video_base",
-        "wifi_label_weight": 0.15,
-        "nearest_global_point_index": nearest.get("global_point_index", ""),
-        "left_global_point_index": left.get("global_point_index", ""),
-        "right_global_point_index": right.get("global_point_index", ""),
-        "route_ratio": f"{progress:.6f}",
-        "pdr_x": interpolate_value(left, right, "pdr_x", ratio),
-        "pdr_y": interpolate_value(left, right, "pdr_y", ratio),
-        "pdr_bind_source": "route_order_interpolation",
-        "trajectory_contour_id": shared_contour_id,
-        "trajectory_contour_distance_m": interpolate_value(left, right, "trajectory_contour_distance_m", ratio)
-        if shared_contour_id
-        else "",
-        "trajectory_distance_m": interpolate_value(left, right, "trajectory_distance_m", ratio),
-        "trajectory_position_source": "checkpoint_order_interpolation",
+        "bind_type": "visual_only",
+        "wifi_label_weight": 0.0,
+        "nearest_global_point_index": "",
+        "left_global_point_index": "",
+        "right_global_point_index": "",
+        "route_ratio": "",
+        "pdr_x": "",
+        "pdr_y": "",
+        "pdr_bind_source": "video_sensor_sync_unavailable" if points else "no_anchor_points",
+        "trajectory_contour_id": "",
+        "trajectory_contour_distance_m": "",
+        "trajectory_distance_m": "",
+        "trajectory_position_source": "unavailable",
     }
 
 
@@ -403,6 +406,7 @@ def build_frame_rows(
     start_sequence_index: int,
     source_frame_count: Optional[int] = None,
     frame_metrics: Optional[Dict[str, Dict[str, Any]]] = None,
+    frame_timestamps: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     frame_count = source_frame_count or len(frames)
@@ -411,6 +415,7 @@ def build_frame_rows(
         original_index = frame_original_index(frame_path, idx + 1)
         binding = bind_frame_to_route(points, max(0, original_index - 1), frame_count)
         metrics = frame_metrics.get(frame_path.name, {})
+        timestamp = (frame_timestamps or {}).get(frame_path.name, {})
         rows.append(
             {
                 "source_type": "video_base_frame",
@@ -420,7 +425,8 @@ def build_frame_rows(
                 "frame_path": relative_path(frame_path, root),
                 "video_frame_index": original_index,
                 "video_sequence_index": start_sequence_index + idx,
-                "video_time_s": f"{(original_index - 1) * frame_interval_s:.3f}",
+                "video_time_s": f"{timestamp.get('video_time_s', (original_index - 1) * frame_interval_s):.6f}",
+                "video_time_source": timestamp.get("video_time_source", "resampled_time_grid_not_sensor_sync"),
                 "blur_score": metrics.get("blur_score", ""),
                 "visual_change": metrics.get("visual_change", ""),
                 "keyframe_filter_status": metrics.get("keyframe_filter_status", "kept"),
@@ -479,13 +485,20 @@ def run_video_frame_pipeline(
 
     for video_path in videos:
         output_dir = frames_root / safe_stem(video_path.name)
+        duration_s = probe_video_duration(video_path, ffmpeg)
+        try:
+            effective_interval_s = full_clip_interval(duration_s, frame_interval_s, max_frames)
+        except ValueError as exc:
+            video_summaries.append({"video": relative_path(video_path, root), "status": "failed", "message": str(exc)})
+            continue
         clean_output_dir(output_dir)
+        frame_timestamps: Dict[str, Dict[str, Any]] = {}
         if ffmpeg is not None:
             extract_status, message = extract_with_ffmpeg(
                 ffmpeg_exe=ffmpeg,
                 video_path=video_path,
                 output_dir=output_dir,
-                frame_interval_s=frame_interval_s,
+                frame_interval_s=effective_interval_s,
                 max_frames=max_frames,
             )
             extractor = "ffmpeg"
@@ -493,12 +506,13 @@ def run_video_frame_pipeline(
             extract_status, message = extract_with_opencv(
                 video_path=video_path,
                 output_dir=output_dir,
-                frame_interval_s=frame_interval_s,
+                frame_interval_s=effective_interval_s,
                 max_frames=max_frames,
+                frame_timestamps=frame_timestamps,
             )
             extractor = "opencv"
 
-        frames = sorted(output_dir.glob("*.jpg"), key=natural_sort_key)
+        frames = sorted(output_dir.glob("*.jpg"), key=natural_sort_key) if extract_status == "ok" else []
         selected_frames, frame_metrics, keyframe_summary = filter_keyframes(
             frames=frames,
             blur_threshold=blur_threshold,
@@ -510,10 +524,11 @@ def run_video_frame_pipeline(
             video_path=video_path,
             frames=selected_frames,
             points=points,
-            frame_interval_s=frame_interval_s,
+            frame_interval_s=effective_interval_s,
             start_sequence_index=len(rows) + 1,
             source_frame_count=len(frames),
             frame_metrics=frame_metrics,
+            frame_timestamps=frame_timestamps,
         )
         rows.extend(video_rows)
         video_summaries.append(
@@ -522,6 +537,8 @@ def run_video_frame_pipeline(
                 "extractor": extractor,
                 "status": extract_status,
                 "message": message,
+                "video_duration_s": duration_s,
+                "effective_frame_interval_s": effective_interval_s,
                 "extracted_frame_count": len(frames),
                 "frame_count": len(selected_frames),
                 "keyframe_filter": keyframe_summary,
@@ -541,6 +558,8 @@ def run_video_frame_pipeline(
         "anchor_point_count": len(points),
         "frame_interval_s": frame_interval_s,
         "max_frames_per_video": max_frames,
+        "sampling_policy": "whole_clip_uniform_budget",
+        "route_binding": "disabled_without_video_sensor_synchronization",
         "blur_threshold": blur_threshold,
         "keyframe_min_change": keyframe_min_change,
         "keyframe_min_gap": keyframe_min_gap,
@@ -561,6 +580,7 @@ VIDEO_FRAME_FIELDS = [
     "video_frame_index",
     "video_sequence_index",
     "video_time_s",
+    "video_time_source",
     "blur_score",
     "visual_change",
     "keyframe_filter_status",

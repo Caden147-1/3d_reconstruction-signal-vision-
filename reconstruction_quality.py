@@ -14,6 +14,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from colmap_workspace_check import dense_input_model, inspect_sparse_model, inspect_workspace
 from point_cloud_filter import sampling_quality_warning
+from ply_io import validate_ply
 
 
 SPARSE_ROOTS = ("sparse",)
@@ -160,23 +161,10 @@ def collect_sparse_models(
 
 
 def count_ply_element(path: Path, element_name: str) -> Optional[int]:
-    if not path.exists():
-        return None
     try:
-        with path.open("rb") as handle:
-            header = handle.read(65536).decode("ascii", errors="ignore")
-    except OSError:
+        return validate_ply(path).get(element_name, 0)
+    except (OSError, ValueError):
         return None
-    for line in header.splitlines():
-        parts = line.strip().split()
-        if len(parts) == 3 and parts[0] == "element" and parts[1] == element_name:
-            try:
-                return int(parts[2])
-            except ValueError:
-                return None
-        if line.strip() == "end_header":
-            break
-    return None
 
 
 def count_ply_vertices(path: Path) -> Optional[int]:
@@ -187,26 +175,38 @@ def count_ply_faces(path: Path) -> Optional[int]:
     return count_ply_element(path, "face")
 
 
+def inspect_dense_ply(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {"status": "missing", "elements": {}, "error": ""}
+    try:
+        elements = validate_ply(path)
+    except (OSError, ValueError) as exc:
+        return {"status": "invalid", "elements": {}, "error": str(exc)}
+    return {"status": "validated", "elements": elements, "error": ""}
+
+
 def summarize_dense(workspace_dir: Path) -> Dict[str, Any]:
     dense_dir = workspace_dir / "dense"
     final = dense_dir / "final.ply"
     fused = dense_dir / "fused.ply"
     filtered = dense_dir / "fused_filtered.ply"
     final_summary = read_json(dense_dir / "final_output_summary.json")
+    validation = {name: inspect_dense_ply(path) for name, path in (("final", final), ("fused", fused), ("filtered", filtered))}
     return {
         "final_ply": str(final),
         "final_exists": final.exists(),
-        "final_vertex_count": count_ply_vertices(final),
-        "final_face_count": count_ply_faces(final),
+        "final_vertex_count": validation["final"]["elements"].get("vertex"),
+        "final_face_count": validation["final"]["elements"].get("face", 0) if validation["final"]["status"] == "validated" else None,
+        "ply_validation": validation,
         "final_output_summary": final_summary,
         "final_source_kind": final_summary.get("source_kind"),
         "intermediate_ply_cleanup": bool(final_summary) and not bool(final_summary.get("keep_intermediate")),
         "fused_ply": str(fused),
         "fused_exists": fused.exists(),
-        "fused_vertex_count": count_ply_vertices(fused),
+        "fused_vertex_count": validation["fused"]["elements"].get("vertex"),
         "filtered_ply": str(filtered),
         "filtered_exists": filtered.exists(),
-        "filtered_vertex_count": count_ply_vertices(filtered),
+        "filtered_vertex_count": validation["filtered"]["elements"].get("vertex"),
         "point_filter_summary": read_json(dense_dir / "point_filter_summary.json"),
         "meshed_delaunay_exists": (dense_dir / "meshed-delaunay.ply").exists(),
         "meshed_poisson_exists": (dense_dir / "meshed-poisson.ply").exists(),
@@ -397,6 +397,10 @@ def relative_status(
         warnings.append(f"Could not inspect COLMAP database: {database['error']}")
     database_coverage = input_coverage.get("database", {})
     sparse_coverage = input_coverage.get("dense_input_sparse", {})
+    provenance = input_coverage.get("provenance", {})
+    provenance_status = provenance.get("status", "unverified")
+    if (database["exists"] or sparse_coverage.get("exists")) and provenance_status != "verified":
+        warnings.append(f"Sparse input provenance is {provenance_status}: {provenance.get('error', 'no recorded content identity')}")
     if sparse_coverage.get("error"):
         warnings.append(f"Dense input sparse model is invalid: {sparse_coverage['error']}")
     if sparse_coverage.get("extra_names"):
@@ -436,12 +440,18 @@ def relative_status(
     cleanup_intermediate_ply = bool(
         workspace_summary.get("cleanup_intermediate_ply") or dense.get("intermediate_ply_cleanup")
     )
-    dense_available = bool(dense["final_exists"] or dense["fused_exists"])
+    ply_validation = dense.get("ply_validation", {})
+    dense_available = any(ply_validation.get(name, {}).get("status") == "validated" for name in ("final", "fused"))
+    invalid_dense = False
+    for name, result in ply_validation.items():
+        if result["status"] == "invalid":
+            invalid_dense = True
+            warnings.append(f"Dense {name} PLY failed full payload validation: {result['error']}")
     filter_warning = sampling_quality_warning(dense.get("point_filter_summary", {}))
     if filter_warning:
         warnings.append(filter_warning)
     if not dense_available:
-        warnings.append("Dense final.ply does not exist yet.")
+        warnings.append("No fully validated final or fused dense PLY is available.")
     elif not dense["final_exists"]:
         warnings.append("Dense output exists, but final.ply has not been selected yet.")
     if (
@@ -505,11 +515,16 @@ def relative_status(
         or bool(image_directory["missing_listed_count"])
         or bool(sparse_coverage.get("error"))
         or bool(sparse_coverage.get("extra_names"))
+        or provenance_status in {"input_mismatch", "output_mismatch", "invalid_record", "incomplete_run"}
     )
     if needs_rerun:
         status = "needs_colmap_rerun"
     elif sparse["component_count"] == 0:
         status = "missing_sparse"
+    elif invalid_dense:
+        status = "dense_needs_review"
+    elif provenance_status != "verified":
+        status = "unverified_reconstruction_inputs"
     elif not dense_available:
         status = "sparse_available_dense_missing"
     elif filter_warning:
@@ -531,12 +546,18 @@ def build_next_actions(report: Dict[str, Any]) -> List[str]:
     coverage = report.get("input_coverage", {})
     database_coverage = coverage.get("database", {})
     sparse_coverage = coverage.get("dense_input_sparse", {})
+    provenance_status = coverage.get("provenance", {}).get("status", "unverified")
+    if any(item.get("status") == "invalid" for item in dense.get("ply_validation", {}).values()):
+        actions.append("Inspect the PLY validation errors; preserve inputs and regenerate only the failed dense/post-filter output from valid sources.")
+    if sparse["component_count"] and provenance_status == "unverified":
+        actions.append("The old sparse result has no run-time content record. Preserve the current PLY for viewing/post-filtering; verified dense execution requires a newly recorded sparse run, not a retroactive stamp.")
     needs_clean_sparse = (
         (database["exists"] and input_count and database["image_count"] != input_count)
         or bool(database_coverage.get("missing_names"))
         or bool(database_coverage.get("extra_names"))
         or bool(images["extra_file_count"])
         or bool(images["missing_listed_count"])
+        or provenance_status in {"input_mismatch", "output_mismatch", "invalid_record", "incomplete_run"}
     )
 
     if needs_clean_sparse:
@@ -684,6 +705,8 @@ def render_markdown(report: Dict[str, Any]) -> str:
         ("PDR-aligned sparse exists", sparse["pdr_aligned_exists"]),
         ("Dense input candidate", selected.get("label", "-")),
         ("final.ply exists", dense["final_exists"]),
+        ("final.ply payload validation", dense.get("ply_validation", {}).get("final", {}).get("status", "unverified")),
+        ("Sparse input provenance", report.get("input_coverage", {}).get("provenance", {}).get("status", "unverified")),
         ("Final vertex count", dense["final_vertex_count"]),
         ("Final face count", dense["final_face_count"]),
         ("Final source kind", dense["final_source_kind"] or "-"),

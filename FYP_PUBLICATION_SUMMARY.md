@@ -1,5 +1,13 @@
 # FYP Publication Summary
 
+> Historical draft, not a code-freeze validation report. The 2026-09-12 measurement
+> audit supersedes the strong-WiFi-label and video-route-interpolation descriptions
+> below: only fresh AP timestamps are usable, and unsynchronized video has no route
+> position. With the current 5-second policy, only checkpoints 10 and 12 have valid
+> fingerprints; these yielded no RSSI recovery candidates. Previous 13-fingerprint
+> localization scores and reconstruction snapshots are historical, not evidence
+> of the revised pipeline's accuracy or RF benefit. See README.md for current behavior.
+
 ## Project Title
 
 **Virtual Campus Tour System: Multimodal Indoor 3D Reconstruction with WiFi/IMU-Aided Positioning**

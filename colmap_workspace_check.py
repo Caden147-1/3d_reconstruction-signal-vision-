@@ -10,12 +10,140 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import sqlite3
 import struct
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence, Set
+
+
+PROVENANCE_NAME = "sparse_run_provenance.json"
+PENDING_NAME = "sparse_run_inputs.json"
+SPARSE_RUNNERS = {"run_colmap_sparse.bat", "run_colmap_automatic.bat"}
+
+
+def file_identity(path: Path) -> Dict[str, Any] | None:
+    if not path.exists():
+        return None
+    before = path.stat()
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    after = path.stat()
+    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+        raise ValueError(f"File changed during provenance inspection: {path}")
+    return {"size": after.st_size, "sha256": digest.hexdigest()}
+
+
+def contained_path(root: Path, relative: str) -> Path:
+    path = (root / relative).resolve()
+    if not path.is_relative_to(root.resolve()):
+        raise ValueError(f"Input path escapes its root: {relative}")
+    return path
+
+
+def sparse_input_identity(workspace: Path, runner: str) -> Dict[str, Any]:
+    if runner not in SPARSE_RUNNERS:
+        raise ValueError("Unrecognized sparse runner")
+    names = read_image_list(workspace / "image_list.txt")
+    if not names or len(names) != len(set(names)) or not (workspace / runner).is_file():
+        raise ValueError("Input list or sparse runner is missing or invalid")
+    files: Dict[str, Any] = {}
+    for name in sorted(names):
+        identity = file_identity(contained_path(workspace / "images", name))
+        if identity is None:
+            raise ValueError(f"Missing input image: {name}")
+        files[f"images/{name}"] = identity
+    for name in ("image_list.txt", "match_pairs.txt", "pdr_alignment_refs.txt", "metadata/images_manifest.csv", runner):
+        files[name] = file_identity(workspace / name)
+    summary_path = workspace / "colmap_workspace_summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8")) if summary_path.exists() else {}
+    mask = summary.get("colmap_mask", {})
+    mask_root = Path(mask["path"]) if mask.get("enabled") and mask.get("path") else None
+    if mask_root is not None and not mask_root.is_dir():
+        raise ValueError("Configured mask directory is missing")
+    return {
+        "runner": runner, "files": files,
+        "mask_root": str(mask_root.resolve()) if mask_root is not None else None,
+        "masks": {
+            name: file_identity(contained_path(mask_root, name + ".png"))
+            for name in sorted(names)
+        } if mask_root is not None else {},
+    }
+
+
+def sparse_output_identity(workspace: Path) -> Dict[str, Any]:
+    files = {name: file_identity(workspace / name) for name in ("database.db", "database.db-wal")}
+    for folder in ("sparse", "sparse_pdr_aligned", "sparse_pose_prior"):
+        base = workspace / folder
+        if base.is_dir():
+            for path in sorted(base.rglob("*")):
+                if path.is_file() and path.suffix in {".bin", ".txt"}:
+                    files[path.relative_to(workspace).as_posix()] = file_identity(path)
+    selected = dense_input_model(workspace)
+    return {"files": files, "dense_input": selected.relative_to(workspace).as_posix() if selected else None}
+
+
+def inspect_provenance(workspace: Path) -> Dict[str, Any]:
+    receipt = workspace / PROVENANCE_NAME
+    if (workspace / PENDING_NAME).exists():
+        return {"status": "incomplete_run", "error": "Sparse input snapshot exists without successful completion."}
+    if not receipt.is_file():
+        return {"status": "unverified", "error": "No run-time input provenance was recorded; filenames alone cannot verify old models."}
+    try:
+        recorded = json.loads(receipt.read_text(encoding="utf-8"))
+        if recorded["schema_version"] != 1 or recorded["status"] != "complete":
+            raise ValueError("Unsupported or incomplete provenance record")
+        current_inputs = sparse_input_identity(workspace, recorded["inputs"]["runner"])
+        if current_inputs != recorded["inputs"]:
+            return {"status": "input_mismatch", "error": "Image bytes, masks, matching pairs, pose references, manifest or sparse runner changed."}
+        if sparse_output_identity(workspace) != recorded["outputs"]:
+            return {"status": "output_mismatch", "error": "The sparse model or database no longer matches the recorded run."}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        return {"status": "invalid_record", "error": str(exc)}
+    return {"status": "verified", "error": "", "record": str(receipt)}
+
+
+def write_provenance(path: Path, payload: Dict[str, Any]) -> None:
+    with tempfile.NamedTemporaryFile(dir=path.parent, prefix="provenance-", suffix=".tmp", delete=False) as handle:
+        staged = Path(handle.name)
+    try:
+        staged.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        staged.replace(path)
+    finally:
+        staged.unlink(missing_ok=True)
+
+
+def begin_sparse_run(workspace: Path, runner: str = "run_colmap_sparse.bat") -> None:
+    report = inspect_workspace(workspace)
+    failures = validation_failures(report, require_clean_database=True)
+    if any((workspace / name).exists() for name in ("sparse", "sparse_pdr_aligned", "sparse_pose_prior")):
+        failures.append("Existing sparse directories must be reset before recording a new run")
+    if any((workspace / ("database.db" + suffix)).exists() for suffix in ("-wal", "-shm", "-journal")):
+        failures.append("Old SQLite sidecar files must be reset before recording a new run")
+    if failures:
+        raise ValueError("; ".join(failures))
+    inputs = sparse_input_identity(workspace, runner)
+    write_provenance(workspace / PENDING_NAME, {"schema_version": 1, "inputs": inputs})
+
+
+def complete_sparse_run(workspace: Path) -> None:
+    pending = json.loads((workspace / PENDING_NAME).read_text(encoding="utf-8"))
+    if pending["schema_version"] != 1 or sparse_input_identity(workspace, pending["inputs"]["runner"]) != pending["inputs"]:
+        raise ValueError("Sparse inputs changed during reconstruction; refusing to certify the result")
+    failures = validation_failures(inspect_workspace(workspace), require_database_coverage=True,
+                                   require_sparse_model=True, require_provenance=False)
+    if failures:
+        raise ValueError("; ".join(failures))
+    write_provenance(workspace / PROVENANCE_NAME, {
+        "schema_version": 1, "status": "complete", "inputs": pending["inputs"],
+        "outputs": sparse_output_identity(workspace),
+    })
+    (workspace / PENDING_NAME).unlink()
 
 
 def normalize_name(value: str) -> str:
@@ -292,6 +420,7 @@ def inspect_workspace(workspace: Path) -> Dict[str, Any]:
             "extra_names": sorted(sparse_names - expected)[:20],
             "source_coverage": source_coverage(expected, source_by_name, sparse_names),
         },
+        "provenance": inspect_provenance(workspace),
     }
 
 
@@ -301,6 +430,7 @@ def validation_failures(
     require_clean_database: bool = False,
     require_database_coverage: bool = False,
     require_sparse_model: bool = False,
+    require_provenance: bool = True,
 ) -> List[str]:
     failures: List[str] = []
     input_info = report["input"]
@@ -330,6 +460,8 @@ def validation_failures(
             failures.append("the dense input sparse model has fewer than two registered images")
         elif sparse.get("extra_names"):
             failures.append("the dense input sparse model contains images outside the current image list")
+        if require_provenance and report.get("provenance", {}).get("status") != "verified":
+            failures.append("sparse input provenance is not verified: " + report.get("provenance", {}).get("error", "missing run record"))
     return failures
 
 
@@ -337,6 +469,7 @@ def print_summary(report: Dict[str, Any]) -> None:
     input_info = report["input"]
     database = report["database"]
     sparse = report["dense_input_sparse"]
+    print(f"[provenance] {report.get('provenance', {}).get('status', 'unverified')}", flush=True)
     print(
         "[coverage] input: "
         f"listed={input_info['listed_count']}, files={input_info['directory_file_count']}, "
@@ -375,11 +508,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--require-database-coverage", action="store_true")
     parser.add_argument("--require-sparse-model", action="store_true")
     parser.add_argument("--json", action="store_true", help="Print the complete inspection report as JSON.")
+    action = parser.add_mutually_exclusive_group()
+    action.add_argument("--record-sparse-start", action="store_true", help="Snapshot inputs before feature extraction, requiring a clean workspace.")
+    action.add_argument("--record-sparse-complete", action="store_true", help="Record completed output provenance only if the pre-run inputs are unchanged.")
+    parser.add_argument("--runner", choices=sorted(SPARSE_RUNNERS), default="run_colmap_sparse.bat")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    if args.record_sparse_start or args.record_sparse_complete:
+        try:
+            if args.record_sparse_start:
+                begin_sparse_run(args.workspace, args.runner)
+            else:
+                complete_sparse_run(args.workspace)
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+            print(f"[error] Sparse provenance: {exc}", flush=True)
+            return 2
+        print("[provenance] " + ("inputs recorded" if args.record_sparse_start else "completed run recorded"), flush=True)
+        return 0
     report = inspect_workspace(args.workspace)
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=2))

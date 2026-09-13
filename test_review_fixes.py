@@ -256,6 +256,7 @@ class OutputTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             dense = Path(temp)
             write_ply_vertices(dense / "fused.ply", PROPERTIES, [(1, 2, 3)])
+            write_ply_vertices(dense / "fused_filtered.ply", PROPERTIES, [(1, 2, 3)])
             write_ply_vertices(dense / "final.ply", PROPERTIES, [(4, 5, 6)])
             previous = (dense / "final.ply").read_bytes()
             args = argparse.Namespace(dense_dir=dense, summary=None, keep_intermediate=False, prefer_mesh=False)
@@ -264,6 +265,42 @@ class OutputTests(unittest.TestCase):
             self.assertEqual((dense / "final.ply").read_bytes(), previous)
             self.assertTrue((dense / "fused.ply").exists())
             self.assertEqual(list(dense.glob("*.tmp")), [])
+
+    def test_repeated_finalization_preserves_filter_and_accepts_new_filtered_result(self):
+        with tempfile.TemporaryDirectory() as temp:
+            dense = Path(temp)
+            raw = dense / "fused.ply"
+            filtered = dense / "fused_filtered.ply"
+            final = dense / "final.ply"
+            write_ply_vertices(raw, PROPERTIES, [(1, 2, 3), (4, 5, 6)])
+            write_ply_vertices(filtered, PROPERTIES, [(1, 2, 3)])
+            expected = filtered.read_bytes()
+            args = argparse.Namespace(dense_dir=dense, summary=None, keep_intermediate=False, prefer_mesh=False)
+            with patch.object(finalizer, "parse_args", return_value=args), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(finalizer.main(), 0)
+                self.assertFalse(filtered.exists())
+                self.assertEqual(finalizer.main(), 0)
+                self.assertEqual(final.read_bytes(), expected)
+                write_ply_vertices(filtered, PROPERTIES, [(4, 5, 6)])
+                updated = filtered.read_bytes()
+                self.assertEqual(finalizer.main(), 0)
+                self.assertEqual(final.read_bytes(), updated)
+                args.allow_raw_replacement = True
+                self.assertEqual(finalizer.main(), 0)
+                self.assertEqual(final.read_bytes(), raw.read_bytes())
+
+    def test_invalid_filtered_cannot_downgrade_existing_final_to_valid_raw(self):
+        with tempfile.TemporaryDirectory() as temp:
+            dense = Path(temp)
+            write_ply_vertices(dense / "fused.ply", PROPERTIES, [(1, 2, 3), (4, 5, 6)])
+            write_ply_vertices(dense / "final.ply", PROPERTIES, [(1, 2, 3)])
+            (dense / "fused_filtered.ply").write_bytes(b"partial")
+            expected = (dense / "final.ply").read_bytes()
+            args = argparse.Namespace(dense_dir=dense, summary=None, keep_intermediate=False, prefer_mesh=False)
+            with patch.object(finalizer, "parse_args", return_value=args), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(finalizer.main(), 1)
+            self.assertEqual((dense / "final.ply").read_bytes(), expected)
+            self.assertTrue((dense / "fused_filtered.ply").exists())
 
     def test_no_valid_sources_causes_no_cleanup(self):
         with tempfile.TemporaryDirectory() as temp:

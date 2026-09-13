@@ -86,13 +86,24 @@ def link_status(
     stationary_tolerance_m: float,
 ) -> Tuple[bool, str, float, int]:
     distance = point_distance(previous, current)
-    gap_ms = max(0, int(current["elapsed_ts"]) - int(previous["elapsed_ts"]))
+    gap_ms = int(current["elapsed_ts"]) - int(previous["elapsed_ts"])
+    if gap_ms < 0:
+        return False, "time_order_break", distance, gap_ms
+    if gap_ms > max_gap_ms:
+        explicit_pause = (
+            previous.get("point_type") == "CHECKPOINT_PAUSE"
+            and current.get("point_type") == "RESTART"
+            and distance <= stationary_tolerance_m
+            and str(previous.get("step_index", "")) != ""
+            and previous.get("step_index") == current.get("step_index")
+        )
+        if explicit_pause:
+            return True, "documented_checkpoint_pause", distance, gap_ms
+        return False, "time_gap_break", distance, gap_ms
     if distance <= stationary_tolerance_m:
         return True, "stationary_checkpoint", distance, gap_ms
     if distance > max_link_distance_m:
         return False, "distance_break", distance, gap_ms
-    if gap_ms > max_gap_ms:
-        return True, "delayed_observed_step_link", distance, gap_ms
     return True, "observed_step_link", distance, gap_ms
 
 
@@ -146,6 +157,8 @@ def build_trajectory_contour(
     max_link_distance_m: float = 1.5,
     stationary_tolerance_m: float = 0.05,
 ) -> Dict[str, Any]:
+    if not all(math.isfinite(value) for value in (corridor_half_width_m, max_gap_s, max_link_distance_m, stationary_tolerance_m)):
+        raise ValueError("Contour thresholds must be finite")
     if corridor_half_width_m <= 0:
         raise ValueError("corridor_half_width_m must be positive")
     if max_gap_s <= 0 or max_link_distance_m <= 0 or stationary_tolerance_m < 0:
@@ -156,7 +169,7 @@ def build_trajectory_contour(
     edges: List[Dict[str, Any]] = []
     contour_count = 0
     break_counts: Dict[str, int] = {"time_gap_break": 0, "distance_break": 0}
-    delayed_link_count = 0
+    documented_pause_count = 0
     observed_length_m = 0.0
 
     for session, rows in sorted(rows_by_session.items()):
@@ -179,8 +192,8 @@ def build_trajectory_contour(
                     max_link_distance_m=max_link_distance_m,
                     stationary_tolerance_m=stationary_tolerance_m,
                 )
-                if status == "delayed_observed_step_link":
-                    delayed_link_count += 1
+                if status == "documented_checkpoint_pause":
+                    documented_pause_count += 1
             if previous is None or not connected:
                 if previous is not None:
                     break_counts[status] = break_counts.get(status, 0) + 1
@@ -285,15 +298,18 @@ def build_trajectory_contour(
         "observed_edge_count": len(edges),
         "observed_route_length_m": round(observed_length_m, 6),
         "break_counts": break_counts,
-        "delayed_observed_link_count": delayed_link_count,
+        "delayed_observed_link_count": 0,
+        "documented_checkpoint_pause_count": documented_pause_count,
         "corridor_half_width_m": corridor_half_width_m,
         "max_gap_s": max_gap_s,
         "max_link_distance_m": max_link_distance_m,
         "stationary_tolerance_m": stationary_tolerance_m,
         "explanation": (
-            "The contour follows only time-ordered IMU/PDR samples. Long sampling gaps are "
-            "recorded, but links still require consecutive observed PDR samples within the "
-            "configured distance bound. WiFi checkpoints can be attached as sparse fingerprint "
+            "The contour follows time-ordered IMU/PDR samples. Unexplained long gaps break "
+            "the contour even when endpoints are close. A CHECKPOINT_PAUSE to RESTART with "
+            "unchanged step index and position may retain continuity under the documented "
+            "stationary-capture protocol; this is not independent proof of immobility. "
+            "WiFi checkpoints can be attached as sparse fingerprint "
             "anchors; neither WiFi nor the corridor infers room walls, unwalked area, or "
             "synthetic 3D surfaces."
         ),

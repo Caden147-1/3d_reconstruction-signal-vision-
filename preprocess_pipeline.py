@@ -12,6 +12,7 @@ import json
 import math
 import statistics
 import subprocess
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -22,10 +23,16 @@ from reconstruction_export import export_reconstruction_dataset
 from trajectory_contour import build_trajectory_contour
 from video_frames import run_video_frame_pipeline
 from wifi_positioning import run_wifi_positioning_pipeline
+from wifi_observations import MAX_WIFI_AGE_MS, MIN_WIFI_APS, WIFI_QUALITY_FIELDS, finite_number
 
 
 FILL_RSSI = -110
 DEFAULT_BASE_STEP_M = 0.70
+MAX_HEADING_GAP_MS = 1000
+
+
+class HeadingUnavailableError(ValueError):
+    """A detected step has no sufficiently recent finite heading measurement."""
 
 
 PROFILE_DEFAULTS = {
@@ -400,8 +407,10 @@ def quaternion_to_yaw(vals: Sequence[float]) -> Optional[float]:
     if len(vals) < 4 or any(math.isnan(v) for v in vals[:4]):
         return None
     x, y, z, w = vals[:4]
+    if not all(math.isfinite(value) for value in (x, y, z, w)):
+        return None
     norm = math.sqrt(x * x + y * y + z * z + w * w)
-    if norm == 0:
+    if norm == 0 or not math.isfinite(norm):
         return None
     x, y, z, w = x / norm, y / norm, z / norm, w / norm
     siny_cosp = 2.0 * (w * z + x * y)
@@ -417,19 +426,23 @@ def read_heading_samples(session_dir: Path) -> List[Tuple[int, int, float]]:
         heading_samples.clear()
         for sample in read_sensor(session_dir, system_id):
             yaw = quaternion_to_yaw(sample.vals)
-            if yaw is not None:
+            if yaw is not None and math.isfinite(yaw):
                 heading_samples.append((sample.elapsed_ts, sample.epoch_ts, yaw))
         if heading_samples:
-            return heading_samples
+            return sorted(heading_samples)
     return []
 
 
-def interpolate_angle(samples: Sequence[Tuple[int, int, float]], target_elapsed_ts: int) -> float:
+def interpolate_angle(samples: Sequence[Tuple[int, int, float]], target_elapsed_ts: int, max_gap_ms: int = MAX_HEADING_GAP_MS) -> float:
     if not samples:
-        return 0.0
+        raise HeadingUnavailableError("No valid rotation-vector heading measurements")
     if target_elapsed_ts <= samples[0][0]:
+        if samples[0][0] - target_elapsed_ts > max_gap_ms or not math.isfinite(samples[0][2]):
+            raise HeadingUnavailableError("Step precedes valid heading coverage")
         return samples[0][2]
     if target_elapsed_ts >= samples[-1][0]:
+        if target_elapsed_ts - samples[-1][0] > max_gap_ms or not math.isfinite(samples[-1][2]):
+            raise HeadingUnavailableError("Step exceeds valid heading coverage")
         return samples[-1][2]
 
     lo = 0
@@ -442,8 +455,12 @@ def interpolate_angle(samples: Sequence[Tuple[int, int, float]], target_elapsed_
             hi = mid - 1
 
     right = samples[lo]
+    if right[0] == target_elapsed_ts and math.isfinite(right[2]):
+        return right[2]
     left = samples[lo - 1]
     span = right[0] - left[0]
+    if span > max_gap_ms or not all(math.isfinite(value) for value in (left[2], right[2])):
+        raise HeadingUnavailableError("Heading sampling gap crosses a detected step")
     if span <= 0:
         return left[2]
     ratio = (target_elapsed_ts - left[0]) / span
@@ -452,6 +469,8 @@ def interpolate_angle(samples: Sequence[Tuple[int, int, float]], target_elapsed_
 
 
 def wrap_angle(angle: float) -> float:
+    if not math.isfinite(angle):
+        raise ValueError("Heading angle must be finite")
     while angle <= -math.pi:
         angle += 2.0 * math.pi
     while angle > math.pi:
@@ -546,12 +565,15 @@ def build_wifi_tables(
     ap_stats_by_session: Dict[str, Dict[str, Dict[str, Any]]] = {}
     selected_by_session: Dict[str, List[str]] = {}
     session_scan_counts: Dict[str, int] = {}
+    session_measurement_counts: Dict[str, int] = {}
 
     for session_dir in session_dirs:
         session = session_dir.name
         wifi_path = session_dir / "wifiScanner.dat"
         scan_count = 0
         stats: Dict[str, Dict[str, Any]] = {}
+        seen_measurements: set[Tuple[str, int]] = set()
+        measurement_scan_count = 0
 
         for scan_index, (elapsed_ts, epoch_ts, payload) in enumerate(parse_tab_json(wifi_path), start=1):
             if not isinstance(payload, list):
@@ -559,6 +581,7 @@ def build_wifi_tables(
             scan_count += 1
             per_scan: Dict[str, float] = {}
             meta_by_mac: Dict[str, Dict[str, Any]] = {}
+            measurement_times: Dict[str, int] = {}
             for entry_index, ap in enumerate(payload):
                 if not isinstance(ap, dict) or not ap.get("mac"):
                     continue
@@ -569,6 +592,17 @@ def build_wifi_tables(
                 name = str(ap.get("name", ""))
                 freq = ap.get("freq", "")
                 elap_ts = ap.get("elap_ts", "")
+                measurement_ts = finite_number(elap_ts)
+                age_ms = elapsed_ts - measurement_ts
+                valid = math.isfinite(rssi) and FILL_RSSI < rssi < 0
+                if not valid or not math.isfinite(measurement_ts) or measurement_ts < 0:
+                    observation_status = "invalid_measurement"
+                elif not 0 <= age_ms <= MAX_WIFI_AGE_MS:
+                    observation_status = "stale_or_future"
+                elif (mac, int(measurement_ts)) in seen_measurements:
+                    observation_status = "cached_duplicate"
+                else:
+                    observation_status = "fresh"
                 long_rows.append(
                     {
                         "session": session,
@@ -580,14 +614,18 @@ def build_wifi_tables(
                         "mac": mac,
                         "ssid": name,
                         "freq": freq,
-                        "rssi": "" if math.isnan(rssi) else round(rssi, 3),
+                        "rssi": round(rssi, 3) if math.isfinite(rssi) else "",
+                        "measurement_age_ms": age_ms if math.isfinite(age_ms) else "",
+                        "observation_status": observation_status,
                     }
                 )
-                if math.isnan(rssi):
+                if observation_status != "fresh":
                     continue
+                seen_measurements.add((mac, int(measurement_ts)))
                 if mac not in per_scan or rssi > per_scan[mac]:
                     per_scan[mac] = rssi
                     meta_by_mac[mac] = {"ssid": name, "freq": freq}
+                    measurement_times[mac] = int(measurement_ts)
 
                 stat = stats.setdefault(
                     mac,
@@ -596,16 +634,17 @@ def build_wifi_tables(
                         "scan_indices": set(),
                         "names": {},
                         "freqs": {},
-                        "first_elapsed_ts": elapsed_ts,
-                        "last_elapsed_ts": elapsed_ts,
+                        "first_elapsed_ts": int(measurement_ts),
+                        "last_elapsed_ts": int(measurement_ts),
                     },
                 )
                 stat["rssis"].append(rssi)
                 stat["scan_indices"].add(scan_index)
                 stat["names"][name] = stat["names"].get(name, 0) + 1
                 stat["freqs"][freq] = stat["freqs"].get(freq, 0) + 1
-                stat["last_elapsed_ts"] = elapsed_ts
+                stat["last_elapsed_ts"] = int(measurement_ts)
 
+            measurement_scan_count += bool(per_scan)
             scan_rows.append(
                 {
                     "session": session,
@@ -614,10 +653,12 @@ def build_wifi_tables(
                     "epoch_ts": epoch_ts,
                     "rssi_by_mac": per_scan,
                     "meta_by_mac": meta_by_mac,
+                    "measurement_times": measurement_times,
                 }
             )
 
         session_scan_counts[session] = scan_count
+        session_measurement_counts[session] = measurement_scan_count
         ap_stats_by_session[session] = {}
         selected_by_session[session] = []
         for mac, stat in stats.items():
@@ -625,7 +666,7 @@ def build_wifi_tables(
             scan_indices = stat["scan_indices"]
             mean_rssi = sum(rssis) / len(rssis)
             std_rssi = pstdev(rssis)
-            detection_rate = len(scan_indices) / scan_count if scan_count else 0.0
+            detection_rate = len(scan_indices) / measurement_scan_count if measurement_scan_count else 0.0
             top_name = most_common_key(stat["names"])
             top_freq = most_common_key(stat["freqs"])
             row = {
@@ -635,7 +676,7 @@ def build_wifi_tables(
                 "freq": top_freq,
                 "scan_count": len(scan_indices),
                 "entry_count": len(rssis),
-                "total_scans": scan_count,
+                "total_scans": measurement_scan_count,
                 "detection_rate": detection_rate,
                 "mean_rssi": mean_rssi,
                 "median_rssi": median(rssis),
@@ -701,6 +742,8 @@ def build_wifi_tables(
             "ssid",
             "freq",
             "rssi",
+            "measurement_age_ms",
+            "observation_status",
         ],
         long_rows,
     )
@@ -734,7 +777,7 @@ def build_wifi_tables(
         ),
     )
 
-    wide_fieldnames = ["session", "scan_index", "elapsed_ts", "epoch_ts"] + [
+    wide_fieldnames = ["session", "scan_index", "elapsed_ts", "epoch_ts", *WIFI_QUALITY_FIELDS] + [
         f"ap_{mac}" for mac in selected_union
     ]
     wide_rows: List[Dict[str, Any]] = []
@@ -753,6 +796,14 @@ def build_wifi_tables(
                 if mac in selected_for_session
                 else FILL_RSSI
             )
+        times = [ts for mac, ts in scan["measurement_times"].items() if mac in selected_for_session]
+        row.update({
+            "wifi_observation_status": "fresh" if len(times) >= MIN_WIFI_APS else "insufficient_fresh_aps",
+            "wifi_measurement_min_elapsed_ts": min(times) if times else "",
+            "wifi_measurement_max_elapsed_ts": max(times) if times else "",
+            "wifi_fresh_ap_count": len(times),
+            "wifi_max_age_ms": scan["elapsed_ts"] - min(times) if times else "",
+        })
         wide_rows.append(row)
 
     write_csv(output_dir / "wifi_wide_selected.csv", wide_fieldnames, wide_rows)
@@ -764,8 +815,13 @@ def build_wifi_tables(
             "max_rssi_std": max_rssi_std,
             "min_scan_count": min_scan_count,
             "missing_rssi_fill": FILL_RSSI,
+            "max_measurement_age_ms": MAX_WIFI_AGE_MS,
+            "min_fresh_aps_per_fingerprint": MIN_WIFI_APS,
         },
         "session_scan_counts": session_scan_counts,
+        "session_independent_measurement_record_counts": session_measurement_counts,
+        "statistics_basis": "unique_fresh_ap_timestamps_not_repeated_logger_records",
+        "observation_status_counts": dict(Counter(row["observation_status"] for row in long_rows)),
         "selected_ap_count_by_session": {
             session: len(macs) for session, macs in selected_by_session.items()
         },
@@ -808,13 +864,22 @@ def build_pdr_tables(
         session = session_dir.name
         events = read_events(session_dir)
         segments = build_segments(events)
-        steps = compute_pdr(session_dir, segments, base_step_m, heading_offset_deg)
+        pdr_error = ""
+        try:
+            steps = compute_pdr(session_dir, segments, base_step_m, heading_offset_deg)
+        except HeadingUnavailableError as exc:
+            steps = []
+            pdr_error = str(exc)
+        pdr_available = bool(steps)
 
         summary[session] = {
             "movement_event_count": len(events),
             "segment_count": len(segments),
             "step_count": len(steps),
             "distance_m": round(sum(step.step_length_m for step in steps), 6),
+            "status": "unavailable_heading" if pdr_error else "ok" if pdr_available else "no_detected_steps",
+            "error": pdr_error,
+            "max_heading_gap_ms": MAX_HEADING_GAP_MS,
         }
 
         for event in events:
@@ -835,8 +900,8 @@ def build_pdr_tables(
                     "elapsed_ts": event.elapsed_ts,
                     "epoch_ts": event.epoch_ts,
                     "nearest_step_index": step_index,
-                    "pdr_x": round(x, 6),
-                    "pdr_y": round(y, 6),
+                    "pdr_x": round(x, 6) if pdr_available else "",
+                    "pdr_y": round(y, 6) if pdr_available else "",
                     "room_x": "",
                     "room_y": "",
                     "comment": "fill room_x/room_y if this event is a known classroom checkpoint",
@@ -850,8 +915,8 @@ def build_pdr_tables(
                     "step_index": step_index,
                     "elapsed_ts": event.elapsed_ts,
                     "epoch_ts": event.epoch_ts,
-                    "pdr_x": round(x, 6),
-                    "pdr_y": round(y, 6),
+                    "pdr_x": round(x, 6) if pdr_available else "",
+                    "pdr_y": round(y, 6) if pdr_available else "",
                     "step_length_m": "",
                     "heading_deg": "",
                 }
@@ -1191,10 +1256,12 @@ def interpolate_pdr_state(points: Sequence[Dict[str, Any]], target_elapsed_ts: i
         else:
             hi = mid - 1
     right = points[lo]
-    left = points[lo - 1]
+    left = right if right["elapsed_ts"] == target_elapsed_ts else points[lo - 1]
     span = right["elapsed_ts"] - left["elapsed_ts"]
     ratio = 0.0 if span <= 0 else (target_elapsed_ts - left["elapsed_ts"]) / span
     contour_id, contour_distance, route_distance, contour_status = trajectory_state(left, right, ratio)
+    if left.get("trajectory_contour_id") and right.get("trajectory_contour_id") and left["trajectory_contour_id"] != right["trajectory_contour_id"]:
+        return {**empty, "status": "contour_break", "gap_ms": str(span), "trajectory_status": contour_status}
     return {
         "pdr_x": left["pdr_x"] + ratio * (right["pdr_x"] - left["pdr_x"]),
         "pdr_y": left["pdr_y"] + ratio * (right["pdr_y"] - left["pdr_y"]),
@@ -1394,6 +1461,7 @@ def prepare_colmap_workspace_from_args(
         constrained_video_anchor_point_window=constrained_video_anchor_point_window,
         constrained_video_anchor_limit=constrained_video_anchor_limit,
         run_image_similarity=not effective_args.skip_image_similarity,
+        wifi_recovery_enabled=not effective_args.skip_wifi_recovery,
         image_similarity_max_pairs=image_similarity_max_pairs,
         image_similarity_max_image_size=image_similarity_max_image_size,
         image_similarity_orb_features=image_similarity_orb_features,
@@ -1513,6 +1581,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--constrained-video-anchor-point-window", type=int)
     parser.add_argument("--constrained-video-anchor-limit", type=int)
     parser.add_argument("--skip-image-similarity", action="store_true", help="Disable P1 selection and visual recovery; retain route/order candidates.")
+    parser.add_argument("--skip-wifi-recovery", action="store_true", help="Disable fresh-RSSI candidate retrieval for an ablation; retain the IMU/PDR route and visual recovery.")
     parser.add_argument("--visual-recovery-neighbors", type=int, default=12, help="Appearance-retrieved candidates per image outside route/slot windows; require geometric verification. Use 0 to disable.")
     parser.add_argument("--image-similarity-max-pairs", type=int, help="Analyze all constrained pairs by default when profile value is 0; set a positive cap for a faster sample.")
     parser.add_argument("--image-similarity-max-image-size", type=int, help="Resize longest image side before ORB similarity analysis.")
@@ -1734,6 +1803,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             constrained_video_anchor_point_window=constrained_video_anchor_point_window,
             constrained_video_anchor_limit=constrained_video_anchor_limit,
             run_image_similarity=not args.skip_image_similarity,
+            wifi_recovery_enabled=not args.skip_wifi_recovery,
             image_similarity_max_pairs=image_similarity_max_pairs,
             image_similarity_max_image_size=image_similarity_max_image_size,
             image_similarity_orb_features=image_similarity_orb_features,
