@@ -8,14 +8,17 @@ import json
 import os
 import re
 import shutil
-import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
 
-from colmap_workspace_check import inspect_workspace, print_summary as print_workspace_coverage, validation_failures
+from colmap_workspace_check import inspect_workspace, print_summary as print_workspace_coverage, validation_failures, PENDING_NAME
+from workspace_lock import WorkspaceBusyError, locked_workspace
+from process_control import managed_process
+from pipeline_output import stream_command
+from workspace_inputs import RECONSTRUCTION_OUTPUTS
 
 
 SCRIPT_BY_MODE = {
@@ -26,6 +29,7 @@ SCRIPT_BY_MODE = {
     "gui": "open_colmap_gui.bat",
     "reset": "reset_colmap_outputs.bat",
 }
+STAGE_MODES = ("resume", "filter", "completion", "report")
 
 
 CLEAN_REBUILD_MODES = {"sparse", "full", "automatic"}
@@ -35,23 +39,7 @@ DEFAULT_RUNTIME_FIRST_UPDATE_SECONDS = 60.0
 DEFAULT_RUNTIME_TARGET_ERROR_SECONDS = 30.0 * 60.0
 
 STALE_COLMAP_OUTPUTS = (
-    "database.db",
-    "database.db-wal",
-    "database.db-shm",
-    "database.db-journal",
-    "sparse_run_inputs.json",
-    "sparse_run_provenance.json",
-    "sparse",
-    "sparse_pdr_aligned",
-    "sparse_pose_prior",
-    "dense",
-    "stereo",
-    "final.ply",
-    "final_output_summary.json",
-    "meshed-poisson.ply",
-    "meshed-delaunay.ply",
-    "fused_filtered.ply",
-    "point_filter_summary.json",
+    *RECONSTRUCTION_OUTPUTS,
     "quality_report.json",
     "QUALITY_REPORT.md",
 )
@@ -60,8 +48,15 @@ ROOT_REPORT_OUTPUTS = ("quality_report.json", "QUALITY_REPORT.md")
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=SCRIPT_BY_MODE, nargs="?", default="sparse")
+    parser.add_argument("mode", choices=(*SCRIPT_BY_MODE, *STAGE_MODES, "boundary"), nargs="?", default="sparse")
     parser.add_argument("--workspace", type=Path, default=Path("colmap_workspace"))
+    parser.add_argument("--log-level", choices=("compact", "verbose"), default="compact",
+                        help="Console output for COLMAP stages; full logs are always saved under workspace/logs.")
+    parser.add_argument("--dry-run", action="store_true", help="Validate and show a resume/filter/completion/report plan without running stages.")
+    parser.add_argument("--max-clips", type=int, help="Completion clip budget; defaults to the workspace setting.")
+    parser.add_argument("--budget-hours", type=float, help="Completion runtime budget in hours.")
+    parser.add_argument("--with-videoscene", action="store_true",
+                        help="Resume observed reconstruction and then run gated VideoScene completion.")
     parser.set_defaults(runtime_estimate=True, upfront_estimate=True)
     parser.add_argument(
         "--yes",
@@ -90,13 +85,13 @@ def parse_args() -> argparse.Namespace:
         "--runtime-estimate-first-update-seconds",
         type=float,
         default=DEFAULT_RUNTIME_FIRST_UPDATE_SECONDS,
-        help="Maximum seconds to wait before printing a coarse live PatchMatch estimate.",
+        help="Verbose mode: maximum wait before printing a coarse live PatchMatch estimate.",
     )
     parser.add_argument(
         "--runtime-estimate-target-error-minutes",
         type=float,
         default=DEFAULT_RUNTIME_TARGET_ERROR_SECONDS / 60.0,
-        help="Target estimate error window in minutes before the first live report.",
+        help="Verbose mode: target estimate error window before the first live report.",
     )
     parser.add_argument(
         "--upfront-estimate",
@@ -162,7 +157,8 @@ def allow_stale_colmap_outputs() -> bool:
 
 
 def existing_colmap_outputs(workspace: Path) -> list[str]:
-    return [name for name in STALE_COLMAP_OUTPUTS if (workspace / name).exists()]
+    return [name for name in STALE_COLMAP_OUTPUTS
+            if (workspace / name).exists() or (workspace / name).is_symlink()]
 
 
 def validate_sparse_runner_provenance(script: Path) -> int:
@@ -173,11 +169,15 @@ def validate_sparse_runner_provenance(script: Path) -> int:
         print(f"[error] Cannot inspect sparse runner: {exc}")
         return 2
     actions = ("--record-sparse-start", "--record-sparse-complete")
-    if all(any(line.startswith("python ") and "colmap_workspace_check.py" in line and action in line
-               for line in commands) for action in actions):
+    if not all(any(line.startswith("python ") and "colmap_workspace_check.py" in line and action in line
+                   for line in commands) for action in actions):
+        print(f"[error] {script.name} predates run-time sparse provenance recording.")
+    elif script.name == "run_colmap_sparse.bat" and not any(
+            line.startswith("python ") and "pdr_alignment.py" in line for line in commands):
+        print("[error] Sparse runner predates the PDR reliability gate.")
+    else:
         return 0
-    print(f"[error] {script.name} predates run-time sparse provenance recording.")
-    print("[info] Regenerate workspace scripts with the current preprocessing code before rebuilding. Existing outputs were not cleared.")
+    print("[info] Prepare a new workspace or confirm a full rebuild in main.py to regenerate scripts. Existing outputs were not cleared.")
     return 2
 
 
@@ -198,13 +198,14 @@ def validate_dense_input_coverage(workspace: Path) -> int:
     return 2
 
 
+@locked_workspace("workspace")
 def reset_existing_colmap_outputs(
     workspace: Path,
     *,
     respect_allow_stale: bool = True,
     report_dir: Optional[Path] = None,
 ) -> int:
-    report_dir = report_dir or workspace.parent
+    report_dir = report_dir or (workspace.parent if workspace.resolve() == Path(__file__).resolve().parent / "colmap_workspace" else workspace)
     existing = existing_colmap_outputs(workspace)
     root_reports = [report_dir / name for name in ROOT_REPORT_OUTPUTS if (report_dir / name).exists()]
     if not existing and not root_reports:
@@ -215,21 +216,24 @@ def reset_existing_colmap_outputs(
         print("[warn] Keeping existing COLMAP outputs because ALLOW_STALE_COLMAP_OUTPUTS=1.")
         return 0
 
+    targets = [(workspace / name, workspace.resolve()) for name in existing if name != PENDING_NAME]
+    existing_targets = {path.resolve() for path, _ in targets}
+    targets.extend((path, report_dir.resolve()) for path in root_reports if path.resolve() not in existing_targets)
+    # Keep the interruption guard until every old output has been removed.
+    if PENDING_NAME in existing:
+        targets.append((workspace / PENDING_NAME, workspace.resolve()))
+    for path, parent in targets:
+        if path.is_symlink() or path.resolve() != parent / path.name:
+            print(f"[error] Refusing redirected cleanup target: {path}")
+            return 2
     printable = existing + [str(path) for path in root_reports]
     print("[info] Removing old COLMAP outputs: " + ", ".join(printable))
-    for name in existing:
-        path = workspace / name
+    for path, _ in targets:
         try:
             if path.is_dir():
                 shutil.rmtree(path)
             else:
                 path.unlink()
-        except OSError as exc:
-            print(f"[error] Failed to remove {path}: {exc}")
-            return 2
-    for path in root_reports:
-        try:
-            path.unlink()
         except OSError as exc:
             print(f"[error] Failed to remove {path}: {exc}")
             return 2
@@ -718,8 +722,22 @@ def require_script(workspace: Path, mode: str) -> Path:
     return script
 
 
-def call_batch(script: Path, workspace: Path) -> int:
-    return subprocess.call(["cmd", "/c", "call", str(script)], cwd=str(workspace))
+def batch_environment() -> dict[str, str]:
+    env = os.environ.copy()
+    # Generated scripts invoke python; keep them on the launcher's interpreter.
+    env["PATH"] = str(Path(sys.executable).parent) + os.pathsep + env.get("PATH", "")
+    # Python children now write through a pipe, so publish stage messages promptly.
+    env["PYTHONUNBUFFERED"] = "1"
+    return env
+
+
+def call_batch(script: Path, workspace: Path, *, log_level: str = "compact") -> int:
+    command = ["cmd", "/c", "call", str(script)]
+    if script.name == SCRIPT_BY_MODE["gui"]:
+        with managed_process(command, cwd=str(workspace), env=batch_environment()) as process:
+            return process.wait()
+    return stream_command(command, workspace=workspace, env=batch_environment(),
+                          verbose=log_level == "verbose", estimate=False, label=script.stem)
 
 
 def call_batch_with_runtime_estimate(
@@ -731,9 +749,13 @@ def call_batch_with_runtime_estimate(
     first_update_seconds: float,
     target_error_seconds: float,
     full_start: Optional[float],
+    log_level: str = "compact",
 ) -> int:
-    if not runtime_estimate:
-        return call_batch(script, workspace)
+    command = ["cmd", "/c", "call", str(script)]
+    if log_level == "compact" or not runtime_estimate:
+        return stream_command(command, workspace=workspace, env=batch_environment(),
+                              verbose=log_level == "verbose", estimate=runtime_estimate,
+                              sample_views=sample_views, label=script.stem)
 
     upfront_estimate = build_upfront_runtime_estimate(workspace)
     estimator = PatchMatchRuntimeEstimator(
@@ -744,23 +766,8 @@ def call_batch_with_runtime_estimate(
         full_start=full_start,
         tail_factor=post_patch_tail_factor(script),
     )
-    process = subprocess.Popen(
-        ["cmd", "/c", "call", str(script)],
-        cwd=str(workspace),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        errors="replace",
-        bufsize=1,
-    )
-    assert process.stdout is not None
-    try:
-        for line in process.stdout:
-            print(line, end="")
-            estimator.observe(line)
-    finally:
-        estimator.close()
-    return process.wait()
+    return stream_command(command, workspace=workspace, env=batch_environment(),
+                          verbose=True, estimator=estimator, label=script.stem)
 
 
 def run_full_pipeline(
@@ -770,12 +777,15 @@ def run_full_pipeline(
     sample_views: int,
     first_update_seconds: float,
     target_error_seconds: float,
+    log_level: str = "compact",
 ) -> int:
     sparse_script = require_script(workspace, "sparse")
     dense_script = require_script(workspace, "dense")
     full_start = time.monotonic()
 
-    if runtime_estimate:
+    if runtime_estimate and log_level == "compact":
+        print("[estimate] PatchMatch ETA uses completed views and covers the current pass only.")
+    elif runtime_estimate:
         timebox_text = (
             f" or after {format_duration(first_update_seconds)}"
             if first_update_seconds > 0
@@ -788,10 +798,9 @@ def run_full_pipeline(
         )
 
     print("[info] running COLMAP sparse step...")
-    sparse_result = call_batch(sparse_script, workspace)
+    sparse_result = call_batch(sparse_script, workspace, log_level=log_level)
     if sparse_result != 0:
         return sparse_result
-    print(f"[timing] Sparse step elapsed: {format_duration(time.monotonic() - full_start)}")
 
     coverage_result = validate_dense_input_coverage(workspace)
     if coverage_result != 0:
@@ -806,12 +815,53 @@ def run_full_pipeline(
         first_update_seconds=first_update_seconds,
         target_error_seconds=target_error_seconds,
         full_start=full_start,
+        log_level=log_level,
     )
     if dense_result == 0:
         print(f"[timing] Full COLMAP elapsed: {format_duration(time.monotonic() - full_start)}")
     return dense_result
 
 
+def validate_execution_inputs(workspace: Path, mode: str) -> int:
+    summary = read_json(workspace / "colmap_workspace_summary.json")
+    if mode in ("full", "dense") and summary.get("scene_completion") == "videoscene":
+        if not summary.get("run_point_cloud_filter"):
+            print("[error] VideoScene requires filtering. Existing results were not reset.")
+            return 2
+        from videoscene_runner import environment_preflight
+        repo = Path(__file__).resolve().parent / "VideoScene"
+        if not environment_preflight(repo):
+            return 2
+    executable = summary.get("colmap_exe")
+    if not executable or not Path(executable).is_file():
+        print("[error] COLMAP executable is missing; existing results were not reset.")
+        return 2
+    if mode in ("full", "dense"):
+        script = require_script(workspace, "dense")
+        lines = script.read_text(encoding="utf-8").splitlines()
+        if not all(any(line.startswith("python ") and "dense_cache.py" in line and
+                       f' {action} --workspace ' in line for line in lines)
+                   for action in ("prepare", "complete")):
+            print("[error] Dense runner predates cache validation. Regenerate workspace scripts after the active run finishes.")
+            return 2
+        if summary.get("scene_completion") == "videoscene":
+            stages = {}
+            for name in ("point_cloud_filter.py", "finalize_dense_outputs.py", "videoscene_completion.py", "reconstruction_quality.py"):
+                stages[name] = [index for index, line in enumerate(lines) if line.startswith("python ") and name in line]
+            if any(len(indices) != 1 for indices in stages.values()):
+                print("[error] Dense runner does not contain the configured VideoScene pipeline exactly once. Regenerate workspace scripts before reconstruction.")
+                return 2
+            order = [indices[0] for indices in stages.values()]
+            completion_index = stages["videoscene_completion.py"][0]
+            following = next((line.strip().lower() for line in lines[completion_index+1:] if line.strip()), "")
+            if (order != sorted(order) or "--prepare-only" in lines[completion_index] or
+                    following != 'if not "%errorlevel%"=="0" exit /b %errorlevel%'):
+                print("[error] Dense runner must execute VideoScene after the filtered final, before quality reporting, and propagate completion failures.")
+                return 2
+    return 0
+
+
+@locked_workspace("workspace")
 def run_colmap_script(
     workspace: Path,
     mode: str,
@@ -821,8 +871,33 @@ def run_colmap_script(
     first_update_seconds: float = DEFAULT_RUNTIME_FIRST_UPDATE_SECONDS,
     target_error_seconds: float = DEFAULT_RUNTIME_TARGET_ERROR_SECONDS,
     report_dir: Optional[Path] = None,
+    dry_run: bool = False,
+    max_clips: Optional[int] = None,
+    budget_hours: Optional[float] = None,
+    log_level: str = "compact",
 ) -> int:
-    report_dir = report_dir or workspace.parent
+    if log_level not in {"compact", "verbose"}:
+        raise ValueError("Unknown console log level")
+    if mode == "boundary":
+        if max_clips is not None or budget_hours is not None:
+            print("[error] Completion budgets do not apply to boundary estimation.")
+            return 2
+        if dry_run:
+            print("[boundary] Estimate fuzzy WiFi extent and visual wall candidates from the authenticated final; write workspace/wifi_boundary outputs.")
+            return 0
+        from wifi_boundary import main as estimate_wifi_boundary
+        return estimate_wifi_boundary(["--workspace", str(workspace)])
+    report_dir = report_dir or (workspace.parent if workspace.resolve() == Path(__file__).resolve().parent / "colmap_workspace" else workspace)
+    if mode in STAGE_MODES:
+        from reconstruction_stages import run_stage
+        try:
+            return run_stage(workspace, mode, dry_run=dry_run, max_clips=max_clips, budget_hours=budget_hours)
+        except (OSError, ValueError, KeyError, RuntimeError) as exc:
+            print(f"[stages error] {exc}", flush=True)
+            return 2
+    if dry_run or max_clips is not None or budget_hours is not None:
+        print("[error] --dry-run/--max-clips/--budget-hours apply to resume/filter/completion/report modes only.")
+        return 2
     if mode == "reset":
         return reset_existing_colmap_outputs(workspace, respect_allow_stale=False, report_dir=report_dir)
 
@@ -836,6 +911,9 @@ def run_colmap_script(
         sparse_script = require_script(workspace, "sparse" if mode == "full" else mode)
         if validate_sparse_runner_provenance(sparse_script):
             return 2
+    if validate_execution_inputs(workspace, mode):
+        return 2
+    if mode in CLEAN_REBUILD_MODES:
         reset_result = reset_existing_colmap_outputs(workspace, report_dir=report_dir)
         if reset_result != 0:
             return reset_result
@@ -847,6 +925,7 @@ def run_colmap_script(
             sample_views=sample_views,
             first_update_seconds=first_update_seconds,
             target_error_seconds=target_error_seconds,
+            log_level=log_level,
         )
 
     if mode == "dense":
@@ -861,14 +940,34 @@ def run_colmap_script(
             first_update_seconds=first_update_seconds,
             target_error_seconds=target_error_seconds,
             full_start=None,
+            log_level=log_level,
         )
-    return call_batch(script, workspace)
+    return call_batch(script, workspace, log_level=log_level)
 
 
 def main() -> int:
+    try:
+        return run_cli()
+    except WorkspaceBusyError as exc:
+        print(f"[error] {exc}", flush=True)
+        return 2
+
+
+def run_cli() -> int:
     args = parse_args()
     root = Path(__file__).resolve().parent
     workspace = args.workspace if args.workspace.is_absolute() else root / args.workspace
+    if args.with_videoscene:
+        if args.mode != 'resume':
+            print('[error] --with-videoscene requires resume mode.')
+            return 2
+        from reconstruction_stages import run_stage
+        try:
+            return run_stage(workspace, 'resume', dry_run=args.dry_run,
+                             max_clips=args.max_clips, budget_hours=args.budget_hours, with_videoscene=True)
+        except (OSError, ValueError, KeyError, RuntimeError) as exc:
+            print(f'[stages error] {exc}', flush=True)
+            return 2
     if args.mode == "full":
         require_script(workspace, "sparse")
         require_script(workspace, "dense")
@@ -886,7 +985,11 @@ def main() -> int:
         sample_views=args.runtime_estimate_sample_views,
         first_update_seconds=args.runtime_estimate_first_update_seconds,
         target_error_seconds=max(0.0, args.runtime_estimate_target_error_minutes * 60.0),
-        report_dir=root,
+        report_dir=root if workspace.resolve() == root / "colmap_workspace" else workspace,
+        dry_run=args.dry_run,
+        max_clips=args.max_clips,
+        budget_hours=args.budget_hours,
+        log_level=args.log_level,
     )
 
 

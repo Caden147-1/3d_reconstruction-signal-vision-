@@ -8,11 +8,15 @@ also have visual support. It does not remove pairs from COLMAP by itself.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import csv
 import json
 import math
+import os
 import statistics
+import threading
 from dataclasses import dataclass
+from heapq import nsmallest
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -37,6 +41,8 @@ IMAGE_SIMILARITY_FIELDS = [
     "visual_overlap_score",
     "visual_decision",
     "notes",
+    "recovery_target",
+    "wifi_retrieval_score",
 ]
 
 
@@ -52,6 +58,8 @@ class SimilarityConfig:
     geometry_min_inlier_ratio: float = 0.22
     feature_min_matches: int = 8
     recovery_neighbors: int = 12
+    wifi_recovery_enabled: bool = True
+    feature_workers: int = 0
 
 
 @dataclass
@@ -126,11 +134,38 @@ def summarize_numbers(values: Sequence[float]) -> Dict[str, Any]:
 def select_rows(rows: Sequence[Dict[str, str]], max_pairs: int) -> List[Dict[str, str]]:
     if max_pairs <= 0 or len(rows) <= max_pairs:
         return list(rows)
-    return sorted(
+    ranked = sorted(
         rows,
         key=lambda row: safe_float(row.get("edge_weight"), 0.0),
         reverse=True,
-    )[:max_pairs]
+    )
+    # Reserve a quarter of a bounded verification budget for RF proposals.
+    # The remaining slots still compete on priority, and geometry is unchanged.
+    wifi = [row for row in ranked if row.get("reason") == "wifi_fingerprint_recovery"]
+    reserved = []
+    checkpoint_uses, image_uses = {}, {}
+    def checkpoint_keys(row):
+        return [row.get("wifi_checkpoint_" + side) or "image:" + row.get("image_" + side, "") for side in ("a", "b")]
+    # Share the reserved budget across stops before repeating already covered
+    # stops. Within that coverage level, prefer underused photos and RF score.
+    for _ in range(min(len(wifi), max(1, max_pairs // 4))):
+        def priority(row):
+            uses = [checkpoint_uses.get(key, 0) for key in checkpoint_keys(row)]
+            images = [image_uses.get(row.get("image_" + side, ""), 0) for side in ("a", "b")]
+            weight = safe_float(row.get("edge_weight"), 0.0)
+            return (sum(use > 0 for use in uses), max(uses), sum(uses),
+                    sum(use > 0 for use in images), sum(images),
+                    -weight if math.isfinite(weight) else 0.0, row.get("image_a", ""), row.get("image_b", ""))
+        chosen = min(wifi, key=priority)
+        wifi.remove(chosen)
+        reserved.append(chosen)
+        for key in checkpoint_keys(chosen):
+            checkpoint_uses[key] = checkpoint_uses.get(key, 0) + 1
+        for side in ("a", "b"):
+            name = chosen.get("image_" + side, "")
+            image_uses[name] = image_uses.get(name, 0) + 1
+    reserved_ids = {id(row) for row in reserved}
+    return reserved + [row for row in ranked if id(row) not in reserved_ids][:max_pairs - len(reserved)]
 
 
 def load_cv_modules() -> Tuple[Any, Any, Optional[str]]:
@@ -206,6 +241,67 @@ def read_image_features(
     )
 
 
+def prepare_image_features(
+    image_names: Sequence[str],
+    images_dir: Path,
+    cv2: Any,
+    config: SimilarityConfig,
+) -> Dict[str, ImageFeatures]:
+    """Read each image once with bounded concurrency and stable cache order.
+
+    OpenCV releases the GIL while reading and extracting ORB features. Each
+    worker owns its ORB object; no OpenCV thread or RNG settings are changed.
+    Pair verification remains sequential so its RANSAC seed is unaffected.
+    Set feature_workers=1 for the serial path, or 0 for automatic selection.
+    Machines with at least 16 logical CPUs use up to eight workers; others four.
+    Explicit worker counts are limited to eight concurrent image decodes.
+    """
+    if not isinstance(config.feature_workers, int) or not 0 <= config.feature_workers <= 8:
+        raise ValueError("feature_workers must be an integer from 0 to 8 (0=auto, 1=serial)")
+    names = list(dict.fromkeys(image_names))
+    if not names:
+        return {}
+    cpus = os.cpu_count() or 1
+    auto_workers = 8 if cpus >= 16 else min(4, cpus)
+    workers = min(len(names), config.feature_workers or auto_workers)
+    worker_state = threading.local()
+
+    def read_one(name: str) -> ImageFeatures:
+        if not hasattr(worker_state, "orb"):
+            worker_state.orb = cv2.ORB_create(nfeatures=max(100, config.orb_features))
+        return read_image_features(name, images_dir, cv2, worker_state.orb, config)
+
+    if workers == 1:
+        return {name: read_one(name) for name in names}
+
+    # Keep at most one pending image per worker instead of queuing the entire
+    # dataset. Refill as images finish so a slow decode cannot idle other workers.
+    features: Dict[str, ImageFeatures] = {}
+    remaining = iter(names)
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="image-features") as pool:
+        pending = {}
+        for _ in range(workers):
+            name = next(remaining)
+            pending[pool.submit(read_one, name)] = name
+        try:
+            while pending:
+                completed, _ = wait(pending, return_when=FIRST_COMPLETED)
+                # Observe every completed result before submitting more work;
+                # a failure behind a slow image must stop replenishing the pool.
+                for future in completed:
+                    name = pending.pop(future)
+                    features[name] = future.result()
+                while len(pending) < workers:
+                    name = next(remaining, None)
+                    if name is None:
+                        break
+                    pending[pool.submit(read_one, name)] = name
+        finally:
+            for future in pending:
+                future.cancel()
+    return {name: features[name] for name in names}
+
+
 def pair_hist_correlation(cv2: Any, features_a: ImageFeatures, features_b: ImageFeatures) -> Optional[float]:
     if features_a.hist is None or features_b.hist is None:
         return None
@@ -248,6 +344,9 @@ def fundamental_inliers(
     src = np.float32([features_a.keypoints[match.queryIdx].pt for match in matches]).reshape(-1, 1, 2)
     dst = np.float32([features_b.keypoints[match.trainIdx].pt for match in matches]).reshape(-1, 1, 2)
     try:
+        # Pair verification must not depend on which sensor-derived candidates
+        # happened to be evaluated before this pair in another experiment arm.
+        cv2.setRNGSeed(0)
         matrix, mask = cv2.findFundamentalMat(src, dst, cv2.FM_RANSAC, 3.0, 0.99)
     except cv2.error:
         return 0, None
@@ -328,6 +427,8 @@ def analyze_pair(
         "source_type_a": row.get("source_type_a", ""),
         "source_type_b": row.get("source_type_b", ""),
         "edge_weight": row.get("edge_weight", ""),
+        "recovery_target": row.get("recovery_target", ""),
+        "wifi_retrieval_score": row.get("wifi_retrieval_score", ""),
     }
     if features_a.status != "ok" or features_b.status != "ok":
         notes = "; ".join(
@@ -448,6 +549,7 @@ def build_summary(
             "geometry_min_inlier_ratio": config.geometry_min_inlier_ratio,
             "feature_min_matches": config.feature_min_matches,
             "recovery_neighbors": config.recovery_neighbors,
+            "feature_workers": config.feature_workers,
         },
         "explanation": (
             "Each constrained match-pair candidate is checked with perceptual hash, "
@@ -466,7 +568,7 @@ def recovery_candidates(
     cv2: Any,
     neighbors: int,
 ) -> List[Dict[str, Any]]:
-    """Retrieve bounded non-route candidates; appearance never grants admission."""
+    """Use a fixed visual top-k pool, then omit pairs already in the route graph."""
     if neighbors <= 0:
         return []
     valid = [f for f in features if f.status == "ok" and f.keypoint_count >= 15]
@@ -475,18 +577,113 @@ def recovery_candidates(
         ranked: List[Tuple[float, str]] = []
         for right in valid:
             pair = tuple(sorted((left.image_name, right.image_name)))
-            if left is right or pair in existing_pairs:
+            if left is right:
                 continue
             _distance, hash_similarity = pair_dhash(left, right)
             correlation = pair_hist_correlation(cv2, left, right)
             score = 0.5 * (hash_similarity or 0.0) + 0.5 * max(0.0, correlation or 0.0)
             ranked.append((score, right.image_name))
         for score, name in sorted(ranked, key=lambda item: (-item[0], item[1]))[:neighbors]:
-            candidates[tuple(sorted((left.image_name, name)))] = score
+            pair = tuple(sorted((left.image_name, name)))
+            if pair not in existing_pairs:
+                candidates[pair] = score
     return [
         {"image_a": a, "image_b": b, "reason": "visual_recovery", "edge_weight": score}
         for (a, b), score in sorted(candidates.items())
     ]
+
+
+def targeted_recovery_candidates(
+    features: Sequence[ImageFeatures], existing_pairs: set[Tuple[str, str]],
+    cv2: Any, neighbors: int, targets: set[str], references: set[str],
+    metadata: Optional[Dict[str, Dict[str, Any]]] = None,
+    wifi_recovery_enabled: bool = True,
+) -> List[Dict[str, Any]]:
+    """Spend new comparisons on weak/unregistered images against supported ones.
+
+    Exclude already evaluated pairs before top-k so an exhausted old top-k does
+    not starve recovery. RF similarity is a ranking cue, never a pose constraint.
+    """
+    from wifi_observations import fingerprint_similarity
+    if neighbors <= 0:
+        return []
+    metadata = metadata or {}
+    valid = {f.image_name: f for f in features if f.status == "ok" and f.keypoint_count >= 15}
+    existing = {tuple(sorted(pair)) for pair in existing_pairs}
+    reference_names = sorted((references & valid.keys()) - targets)
+    target_names = sorted(targets & valid.keys())
+    if not target_names or not reference_names:
+        return []
+
+    # A checkpoint can contain different RF observations. Cache by the evidence
+    # itself, including validity and measurement IDs, rather than its location.
+    rf_keys = {
+        name: json.dumps(
+            {field: value for field, value in metadata.get(name, {}).items()
+             if field == "session" or field.startswith(("ap_", "wifi_"))},
+            sort_keys=True,
+        )
+        for name in (*target_names, *reference_names)
+    } if wifi_recovery_enabled else {}
+    candidates = {}
+    rf_cache = {}
+    for name in target_names:
+        left = valid[name]
+        ranked = []
+        for other in reference_names:
+            pair = tuple(sorted((name, other)))
+            if pair in existing:
+                continue
+            right = valid[other]
+            _, hash_similarity = pair_dhash(left, right)
+            correlation = pair_hist_correlation(cv2, left, right)
+            visual = .5 * (hash_similarity or 0.0) + .5 * max(0.0, correlation or 0.0)
+            a, b = metadata.get(name, {}), metadata.get(other, {})
+            rf = 0.0
+            if wifi_recovery_enabled:
+                key = (rf_keys[name], rf_keys[other])
+                if key not in rf_cache:
+                    rf_cache[key] = fingerprint_similarity(a, b)["score"]
+                rf = rf_cache[key]
+            # Missing RF evidence neither excludes an image nor gives it a fake fingerprint.
+            score = visual + .25 * rf
+            same_stop = bool(a.get("session") and a.get("global_point_index") not in (None, "")
+                             and a.get("session") == b.get("session")
+                             and a.get("global_point_index") == b.get("global_point_index"))
+            ranked.append((score, other, rf, same_stop))
+        # Spend recovery on different viewpoints before more rotations at one stop.
+        # This is a retrieval priority, never a substitute for geometric checks.
+        selected = nsmallest(neighbors, ranked, key=lambda item: (item[3], -item[0], item[1]))
+        for score, other, rf, _ in selected:
+            pair = tuple(sorted((name, other)))
+            candidates[pair] = {"image_a": pair[0], "image_b": pair[1], "reason": "visual_recovery",
+                                "edge_weight": score, "recovery_target": name,
+                                "wifi_retrieval_score": rf}
+    return [candidates[key] for key in sorted(candidates)]
+
+
+def weak_geometry_targets(names: Sequence[str], rows: Sequence[Dict[str, Any]]) -> Tuple[set[str], set[str]]:
+    """Find weak vertices and small components using measured geometry only."""
+    adjacency = {name: set() for name in names}
+    for row in rows:
+        a, b = row.get("image_a"), row.get("image_b")
+        if row.get("pair_status") == "ok" and row.get("visual_decision") == "geometry_supported" and a in adjacency and b in adjacency:
+            adjacency[a].add(b)
+            adjacency[b].add(a)
+    remaining = set(adjacency)
+    components = []
+    while remaining:
+        stack = [min(remaining)]; group = set()
+        while stack:
+            name = stack.pop()
+            if name in group:
+                continue
+            group.add(name); remaining.discard(name)
+            stack.extend(adjacency[name] - group)
+        components.append(group)
+    largest = min(components, key=lambda group: (-len(group), sorted(group))) if components else set()
+    references = {name for name in largest if len(adjacency[name]) >= 2}
+    return set(names) - references, references
 
 
 def analyze_image_similarity_edges(
@@ -496,9 +693,9 @@ def analyze_image_similarity_edges(
     summary_path: Optional[Path] = None,
     config: Optional[SimilarityConfig] = None,
     recovery_image_names: Optional[Sequence[str]] = None,
+    recovery_metadata: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     config = config or SimilarityConfig()
-    selected_rows = select_rows(edge_rows, config.max_pairs)
     cv2, np, import_error = load_cv_modules()
     if cv2 is None or np is None:
         write_csv_rows(output_csv, IMAGE_SIMILARITY_FIELDS, [])
@@ -514,52 +711,49 @@ def analyze_image_similarity_edges(
             write_json(summary_path, summary)
         return summary
 
-    orb = cv2.ORB_create(nfeatures=max(100, config.orb_features))
-    feature_cache: Dict[str, ImageFeatures] = {}
-
-    def features_for(image_name: str) -> ImageFeatures:
-        cached = feature_cache.get(image_name)
-        if cached is not None:
-            return cached
-        features = read_image_features(
-            image_name=image_name,
-            images_dir=images_dir,
-            cv2=cv2,
-            orb=orb,
-            config=config,
-        )
-        feature_cache[image_name] = features
-        return features
-
-    rows: List[Dict[str, Any]] = []
-    for row in selected_rows:
-        image_a = row.get("image_a", "")
-        image_b = row.get("image_b", "")
-        rows.append(
-            analyze_pair(
-                row=row,
-                features_a=features_for(image_a),
-                features_b=features_for(image_b),
-                cv2=cv2,
-                np=np,
-                config=config,
-            )
-        )
+    selected_rows = select_rows(edge_rows, config.max_pairs)
+    feature_cache = prepare_image_features(
+        [row[key] for row in selected_rows for key in ("image_a", "image_b")],
+        images_dir, cv2, config,
+    )
+    rows = [analyze_pair(row, feature_cache[row["image_a"]], feature_cache[row["image_b"]], cv2, np, config)
+            for row in selected_rows]
 
     recovery_rows: List[Dict[str, Any]] = []
     if recovery_image_names is not None and config.recovery_neighbors > 0:
+        recovery_names = sorted(set(recovery_image_names))
+        feature_cache.update(prepare_image_features(
+            [name for name in recovery_names if name not in feature_cache],
+            images_dir, cv2, config,
+        ))
         existing_pairs = {tuple(sorted((row["image_a"], row["image_b"]))) for row in edge_rows}
         recovery_edges = recovery_candidates(
-            [features_for(name) for name in sorted(set(recovery_image_names))],
+            [feature_cache[name] for name in recovery_names],
             existing_pairs,
             cv2,
             config.recovery_neighbors,
         )
         for row in recovery_edges:
             recovery_rows.append(analyze_pair(
-                row, features_for(row["image_a"]), features_for(row["image_b"]), cv2, np, config,
+                row, feature_cache[row["image_a"]], feature_cache[row["image_b"]], cv2, np, config,
             ))
     rows.extend(recovery_rows)
+    targeted_edges = []
+    targeted_rows = []
+    weak_names = set()
+    if recovery_image_names is not None and config.recovery_neighbors > 0:
+        weak_names, references = weak_geometry_targets(recovery_image_names, rows)
+        # Include even budget-skipped inputs in the exclusion set; do not bypass max_pairs.
+        evaluated = {tuple(sorted((row["image_a"], row["image_b"]))) for row in [*edge_rows, *rows]}
+        targeted_edges = targeted_recovery_candidates(
+            list(feature_cache.values()), evaluated, cv2, config.recovery_neighbors,
+            weak_names, references, recovery_metadata, config.wifi_recovery_enabled,
+        )
+        for row in targeted_edges:
+            result = analyze_pair(row, feature_cache[row["image_a"]], feature_cache[row["image_b"]], cv2, np, config)
+            result.update(recovery_target=row["recovery_target"], wifi_retrieval_score=row["wifi_retrieval_score"])
+            targeted_rows.append(result)
+        rows.extend(targeted_rows)
     write_csv_rows(output_csv, IMAGE_SIMILARITY_FIELDS, rows)
     summary = build_summary(
         rows=rows,
@@ -571,12 +765,23 @@ def analyze_image_similarity_edges(
         {
             "images_dir": str(images_dir),
             "unique_image_count": len(feature_cache),
-            "input_pair_count": len(edge_rows) + len(recovery_rows),
+            "input_pair_count": len(edge_rows) + len(recovery_rows) + len(targeted_rows),
             "route_input_pair_count": sum(row.get("reason") != "wifi_fingerprint_recovery" for row in edge_rows),
             "route_evaluated_pair_count": sum(row.get("reason") not in {"wifi_fingerprint_recovery", "visual_recovery"} for row in rows),
             "wifi_input_pair_count": sum(row.get("reason") == "wifi_fingerprint_recovery" for row in edge_rows),
             "wifi_evaluated_pair_count": sum(row.get("reason") == "wifi_fingerprint_recovery" for row in rows),
             "max_pairs_scope": "route_and_wifi_candidates; visual recovery uses a separate per-image neighbor budget",
+            "wifi_budget_reservation_fraction": 0.25,
+            "wifi_budget_allocation": ("all_candidates" if config.max_pairs <= 0 or len(edge_rows) <= config.max_pairs
+                                       else "checkpoint_and_photo_coverage_then_RF_priority"),
+            "targeted_recovery": {
+                "target_image_count": len(weak_names),
+                "candidate_pair_count": len(targeted_rows),
+                "geometry_supported_pair_count": sum(r["visual_decision"] == "geometry_supported" for r in targeted_rows),
+                "geometry_supported_target_count": len({r["recovery_target"] for r in targeted_rows if r["visual_decision"] == "geometry_supported"}),
+                "policy": "weak_or_disconnected_images_to_supported_component; exclude_evaluated_before_top_k",
+                "budget_scope": "at_most_recovery_neighbors_per_target_additional_pairs",
+            },
             "visual_recovery": {
                 "status": "evaluated" if recovery_image_names is not None and config.recovery_neighbors > 0 else "disabled",
                 "candidate_pair_count": len(recovery_rows),
@@ -607,6 +812,9 @@ def analyze_workspace_image_similarity(
     min_visual_score: float = 0.22,
     recovery_image_names: Optional[Sequence[str]] = None,
     recovery_neighbors: int = 12,
+    recovery_metadata: Optional[Dict[str, Dict[str, Any]]] = None,
+    wifi_recovery_enabled: bool = True,
+    feature_workers: int = 0,
 ) -> Dict[str, Any]:
     if edge_rows is None:
         _fields, edge_rows = read_csv(workspace_dir / "match_graph_edges.csv")
@@ -616,6 +824,8 @@ def analyze_workspace_image_similarity(
         orb_features=orb_features,
         min_visual_score=min_visual_score,
         recovery_neighbors=recovery_neighbors,
+        wifi_recovery_enabled=wifi_recovery_enabled,
+        feature_workers=feature_workers,
     )
     return analyze_image_similarity_edges(
         images_dir=workspace_dir / "images",
@@ -624,6 +834,7 @@ def analyze_workspace_image_similarity(
         summary_path=workspace_dir / "image_similarity_summary.json",
         config=config,
         recovery_image_names=recovery_image_names,
+        recovery_metadata=recovery_metadata,
     )
 
 
@@ -637,6 +848,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-pairs", type=int, default=0, help="Analyze all pairs by default; set a positive sample cap.")
     parser.add_argument("--max-image-size", type=int, default=900)
     parser.add_argument("--orb-features", type=int, default=1500)
+    parser.add_argument("--feature-workers", type=int, choices=range(9), default=0,
+                        help="Concurrent image feature readers (0=auto, up to 8 on 16+ logical CPUs; 1=serial; maximum 8).")
     parser.add_argument("--min-visual-score", type=float, default=0.22)
     return parser.parse_args()
 
@@ -658,6 +871,7 @@ def main() -> int:
             max_pairs=args.max_pairs,
             max_image_size=args.max_image_size,
             orb_features=args.orb_features,
+            feature_workers=args.feature_workers,
             min_visual_score=args.min_visual_score,
         ),
     )

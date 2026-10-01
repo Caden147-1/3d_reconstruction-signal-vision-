@@ -13,6 +13,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
+VIDEO_FRAME_PROVENANCE_FIELDS = ["video_raw_frame_index"]
 
 
 def write_csv(path: Path, fieldnames: Sequence[str], rows: Iterable[Dict[str, Any]]) -> None:
@@ -180,7 +181,8 @@ def extract_with_opencv(
                 capture.release()
                 return "failed", "Could not write a selected video frame."
             if frame_timestamps is not None:
-                frame_timestamps[output_path.name] = {"video_time_s": timestamp, "video_time_source": time_source}
+                frame_timestamps[output_path.name] = {"video_time_s": timestamp, "video_time_source": time_source,
+                                                       "video_raw_frame_index": frame_index}
             if max_frames > 0 and written >= max_frames:
                 break
         frame_index += 1
@@ -238,6 +240,41 @@ def frame_original_index(frame_path: Path, fallback: int) -> int:
     return safe_int(matches[-1], fallback)
 
 
+def temporal_coverage(frames, frame_timestamps, interval_s, duration_s, sampled_count):
+    """Report retained sampling bins and temporal gaps, not 3D scene coverage."""
+    times, sources, bins = [], set(), set()
+    for position, frame in enumerate(frames):
+        index = frame_original_index(frame, position + 1)
+        stamp = frame_timestamps.get(frame.name, {})
+        value = safe_float(stamp.get("video_time_s", (index - 1) * interval_s))
+        if not math.isfinite(value) or value < 0:
+            continue
+        times.append(value)
+        sources.add(stamp.get("video_time_source", "resampled_time_grid_not_sensor_sync"))
+        bins.add(index)
+    times.sort()
+    known_duration = duration_s is not None and math.isfinite(duration_s) and duration_s > 0
+    within_duration = not known_duration or not times or times[-1] <= duration_s + 1e-6
+    gaps = [b-a for a, b in zip(times, times[1:])]
+    if known_duration and within_duration:
+        boundaries = [0., *times, float(duration_s)]
+        gaps = [b-a for a, b in zip(boundaries, boundaries[1:])]
+    return {
+        "sampled_bins": sampled_count,
+        "retained_bins": len(bins),
+        "retained_bin_fraction": len(bins) / max(sampled_count, 1),
+        "valid_timestamp_count": len(times),
+        "first_retained_time_s": times[0] if times else None,
+        "last_retained_time_s": times[-1] if times else None,
+        "max_gap_s": max(gaps) if gaps else None,
+        "includes_clip_edges": bool(known_duration and within_duration),
+        "start_gap_s": times[0] if times else (float(duration_s) if known_duration else None),
+        "end_gap_s": float(duration_s)-times[-1] if known_duration and within_duration and times else None,
+        "timestamp_sources": sorted(sources),
+        "interpretation": "Temporal sampling coverage only; neither 3D surface coverage nor sensor synchronization",
+    }
+
+
 def filter_keyframes(
     frames: Sequence[Path],
     blur_threshold: float,
@@ -282,8 +319,6 @@ def filter_keyframes(
 
     kept: List[Path] = []
     metrics: Dict[str, Dict[str, Any]] = {}
-    best_frame: Optional[Path] = None
-    best_blur = -1.0
     last_kept_gray = None
     last_kept_frame_pos = -10**9
     rejected_blurry = 0
@@ -299,10 +334,6 @@ def filter_keyframes(
             continue
 
         blur_score = float(cv2.Laplacian(gray, cv2.CV_64F).var()) if blur_threshold > 0 else 0.0
-        if blur_score > best_blur:
-            best_blur = blur_score
-            best_frame = frame_path
-
         if blur_threshold > 0 and blur_score < blur_threshold:
             rejected_blurry += 1
             continue
@@ -331,16 +362,6 @@ def filter_keyframes(
         last_kept_gray = gray
         last_kept_frame_pos = frame_pos
 
-    fallback_used = False
-    if not kept and best_frame is not None:
-        kept.append(best_frame)
-        metrics[best_frame.name] = {
-            "blur_score": round(best_blur, 6) if blur_threshold > 0 else "",
-            "visual_change": "",
-            "keyframe_filter_status": "fallback_best_blur",
-        }
-        fallback_used = True
-
     return kept, metrics, {
         "status": "ok",
         "input_frame_count": len(frames),
@@ -349,7 +370,7 @@ def filter_keyframes(
         "rejected_low_change_count": rejected_low_change,
         "rejected_too_close_count": rejected_too_close,
         "rejected_unreadable_count": rejected_unreadable,
-        "fallback_used": fallback_used,
+        "fallback_used": False,
         "blur_threshold": blur_threshold,
         "min_visual_change": min_visual_change,
         "min_gap": min_gap,
@@ -427,6 +448,7 @@ def build_frame_rows(
                 "video_sequence_index": start_sequence_index + idx,
                 "video_time_s": f"{timestamp.get('video_time_s', (original_index - 1) * frame_interval_s):.6f}",
                 "video_time_source": timestamp.get("video_time_source", "resampled_time_grid_not_sensor_sync"),
+                "video_raw_frame_index": timestamp.get("video_raw_frame_index", ""),
                 "blur_score": metrics.get("blur_score", ""),
                 "visual_change": metrics.get("visual_change", ""),
                 "keyframe_filter_status": metrics.get("keyframe_filter_status", "kept"),
@@ -446,6 +468,9 @@ def run_video_frame_pipeline(
     blur_threshold: float = 80.0,
     keyframe_min_change: float = 6.0,
     keyframe_min_gap: int = 2,
+    refine_window_s: float = 0.,
+    refine_budget_hours: float = 8.,
+    refine_coverage_search: bool = True,
 ) -> Dict[str, Any]:
     if frame_interval_s <= 0:
         raise ValueError("--video-frame-interval-s must be greater than zero")
@@ -478,6 +503,12 @@ def run_video_frame_pipeline(
         write_json(summary_path, summary)
         return summary
 
+    refinement = None
+    if refine_window_s > 0:
+        from video_refinement import NativeFrameRefiner
+
+        refinement = NativeFrameRefiner(processed_dir, refine_window_s, refine_budget_hours,
+                                        coverage_search=refine_coverage_search, blur_threshold=blur_threshold)
     ffmpeg = resolve_ffmpeg(root, ffmpeg_exe)
     points = load_anchor_points(processed_dir)
     rows: List[Dict[str, Any]] = []
@@ -493,7 +524,8 @@ def run_video_frame_pipeline(
             continue
         clean_output_dir(output_dir)
         frame_timestamps: Dict[str, Dict[str, Any]] = {}
-        if ffmpeg is not None:
+        # Nearby native selection needs decoded timestamps, not an ffmpeg fps-grid time.
+        if ffmpeg is not None and refinement is None:
             extract_status, message = extract_with_ffmpeg(
                 ffmpeg_exe=ffmpeg,
                 video_path=video_path,
@@ -513,6 +545,8 @@ def run_video_frame_pipeline(
             extractor = "opencv"
 
         frames = sorted(output_dir.glob("*.jpg"), key=natural_sort_key) if extract_status == "ok" else []
+        if refinement is not None:
+            frames = refinement.refine(video_path, frames, frame_timestamps, effective_interval_s)
         selected_frames, frame_metrics, keyframe_summary = filter_keyframes(
             frames=frames,
             blur_threshold=blur_threshold,
@@ -542,6 +576,8 @@ def run_video_frame_pipeline(
                 "extracted_frame_count": len(frames),
                 "frame_count": len(selected_frames),
                 "keyframe_filter": keyframe_summary,
+                "temporal_coverage": temporal_coverage(selected_frames, frame_timestamps, effective_interval_s,
+                                                         duration_s, len(frames)),
                 "output_dir": str(output_dir),
             }
         )
@@ -566,6 +602,7 @@ def run_video_frame_pipeline(
         "ffmpeg_exe": "" if ffmpeg is None else str(ffmpeg),
         "frame_manifest": str(manifest_path),
         "videos": video_summaries,
+        "refinement": refinement.summary() if refinement is not None else {"method": "off"},
     }
     write_json(summary_path, summary)
     return summary
@@ -584,6 +621,7 @@ VIDEO_FRAME_FIELDS = [
     "blur_score",
     "visual_change",
     "keyframe_filter_status",
+    *VIDEO_FRAME_PROVENANCE_FIELDS,
     "bind_type",
     "wifi_label_weight",
     "nearest_global_point_index",

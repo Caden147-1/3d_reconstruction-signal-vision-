@@ -131,7 +131,9 @@ def expand_mask(core, halo):
 def filter_connected_cloud(input_path: Path, output_path: Path, summary_path: Path | None,
                            max_points: int = 0, bbox_quantile: float = .001,
                            bbox_padding_ratio: float = .05, cell_ratio: float = .0025,
-                           core_quantile: float = .15, support_halo: int = 1):
+                           core_quantile: float = .15, support_halo: int = 1,
+                           *, spatial_support=None, spatial_penalty: float = 1.,
+                           vertex_keep=None):
     if input_path.resolve() == output_path.resolve():
         raise ValueError("Input must be preserved separately from filtered output")
     if not 0 <= bbox_quantile < .2 or not 0 <= bbox_padding_ratio <= 1:
@@ -140,6 +142,8 @@ def filter_connected_cloud(input_path: Path, output_path: Path, summary_path: Pa
         raise ValueError("Invalid connected-density settings")
     if max_points < 0:
         raise ValueError("Point budget must be nonnegative; 0 retains all supported points")
+    if not np.isfinite(spatial_penalty) or not 0 <= spatial_penalty <= 2:
+        raise ValueError('Spatial density penalty must be finite and within [0,2]')
     with input_path.open("rb") as handle:
         header = parse_ply_header(handle)
     source_count = header["vertex_count"]
@@ -163,6 +167,14 @@ def filter_connected_cloud(input_path: Path, output_path: Path, summary_path: Pa
     if int(np.prod(shape, dtype=np.float64)) > MAX_GRID_CELLS:
         raise ValueError("Density grid exceeds memory limit; increase --surface-cell-ratio")
     grid = np.zeros(tuple(shape), dtype=np.int64)
+    def eligible_vertices(chunk):
+        if vertex_keep is None:
+            return chunk
+        mask = np.asarray(vertex_keep(chunk))
+        if mask.dtype != np.bool_ or mask.shape != (len(chunk),):
+            raise ValueError('Vertex evidence must return one boolean per original vertex')
+        return chunk[mask]
+
     print(f"[filter] Counting all {source_count:,} points in the density grid...", flush=True)
     for chunk in vertex_chunks(input_path):
         _, keys = grid_keys(positions(chunk), low, high, cell, shape)
@@ -172,21 +184,32 @@ def filter_connected_cloud(input_path: Path, output_path: Path, summary_path: Pa
     # A point-weighted occupancy percentile avoids treating many empty/sparse
     # background cells as representative of the observed surface density.
     occupancies = np.sort(grid[grid > 0])
+    if not len(occupancies):
+        raise ValueError('No finite points remain inside the density bounds')
     cumulative = np.cumsum(occupancies)
     threshold = max(3, int(occupancies[np.searchsorted(cumulative, bbox_count * core_quantile)]))
-    core, component_report = connected_core(grid, threshold)
+    thresholds, spatial_report = spatial_density_thresholds(
+        grid, low, cell, threshold, spatial_support, spatial_penalty)
+    core, component_report = connected_core(grid, thresholds)
+    del thresholds
     support = expand_mask(core, support_halo)
-    supported_count = int(grid[support].sum())
+    density_supported_count = int(grid[support].sum())
+
+    def supported_chunks():
+        for chunk in vertex_chunks(input_path):
+            good, keys = grid_keys(positions(chunk), low, high, cell, shape)
+            yield eligible_vertices(chunk[good][support[tuple(keys.T)]])
+
+    # Apply observation evidence after density selection: a conflict veto must
+    # not shift density thresholds and thereby remove other supported surfaces.
+    supported_count = (sum(len(chunk) for chunk in supported_chunks()) if vertex_keep is not None
+                       else density_supported_count)
+    evidence_excluded = density_supported_count - supported_count
     retained_ratio = supported_count / finite_count if finite_count else 0
     if retained_ratio < .5:
         raise ValueError(f"Density selection retains only {retained_ratio:.1%}; inspect parameters before promotion")
     target = min(max_points, supported_count) if max_points else supported_count
     print(f"[filter] Supported {supported_count:,}/{source_count:,}; writing {target:,} observed points...", flush=True)
-
-    def supported_chunks():
-        for chunk in vertex_chunks(input_path):
-            good, keys = grid_keys(positions(chunk), low, high, cell, shape)
-            yield chunk[good][support[tuple(keys.T)]]
 
     # Random priorities produce a uniform sample *after* geometry selection.
     # Full-resolution mode streams directly without allocating a reservoir.
@@ -250,6 +273,7 @@ def filter_connected_cloud(input_path: Path, output_path: Path, summary_path: Pa
             "grid_shape": shape.tolist(), "core_quantile": core_quantile,
             "minimum_core_cell_points": threshold, "support_halo_cells": support_halo,
             "candidate_count": bbox_count, "kept_count": supported_count,
+            "pre_observation_veto_count": density_supported_count,
             **component_report,
         },
         "sampling": {
@@ -258,6 +282,8 @@ def filter_connected_cloud(input_path: Path, output_path: Path, summary_path: Pa
             "sampled_vertex_count": written, "random_seed": 0, "budget_utilization": written/target,
         },
         "quality_warning": "",
+        "spatial_prior": spatial_report,
+        "observation_excluded_vertex_count": evidence_excluded,
         "explanation": (
             "Density is measured on all original points before sampling. Keep the dominant dense "
             "26-connected component and a bounded neighborhood of observed detail. Voxels only select "
@@ -270,3 +296,43 @@ def filter_connected_cloud(input_path: Path, output_path: Path, summary_path: Pa
         summary_path.parent.mkdir(parents=True, exist_ok=True)
         summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     return summary
+
+
+def spatial_density_thresholds(grid, lower, cell, base, support, penalty):
+    """Apply a confidence-gated density penalty, without a hard boundary crop.
+
+    A field may return support alone (legacy, confidence=1), or a mapping with
+    separate support/confidence arrays. Zero confidence is exactly the visual
+    baseline. Strong connected surfaces can survive low support. These values
+    are heuristic scores, not occupancy probabilities or depth observations.
+    """
+    report = dict(status='disabled', base_threshold=int(base), penalty=penalty,
+                  tightened_core_cell_count=0, excluded_core_vertex_count=0,
+                  zero_confidence_core_cell_count=0,
+                  formula='ceil(base * (1 + penalty * confidence * (1 - support)))')
+    if support is None or penalty == 0:
+        return base, report
+    thresholds = np.full(grid.shape, base, dtype=np.float32)
+    keys = np.argwhere(grid >= base)
+    for start in range(0, len(keys), BLOCK_SIZE):
+        block = keys[start:start + BLOCK_SIZE]
+        evidence = support(lower + (block + .5) * cell)
+        if isinstance(evidence, dict):
+            values = np.asarray(evidence['support'], dtype=float)
+            confidence = np.asarray(evidence['confidence'], dtype=float)
+        else:
+            values = np.asarray(evidence, dtype=float)
+            confidence = np.ones(len(block))
+        for label, array in (('support', values), ('confidence', confidence)):
+            if (array.shape != (len(block),) or not np.isfinite(array).all()
+                    or np.any((array < 0) | (array > 1))):
+                raise ValueError(f'Spatial {label} must return one finite [0,1] value per voxel')
+        required = np.ceil(base * (1 + penalty * confidence * (1 - values)))
+        index = tuple(block.T)
+        thresholds[index] = required
+        excluded = grid[index] < required
+        report['tightened_core_cell_count'] += int(excluded.sum())
+        report['excluded_core_vertex_count'] += int(grid[index][excluded].sum())
+        report['zero_confidence_core_cell_count'] += int((confidence == 0).sum())
+    report['status'] = 'confidence_gated_density_constraint'
+    return thresholds, report

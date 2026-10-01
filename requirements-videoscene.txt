@@ -1,0 +1,11 @@
+# Install only inside VideoScene/.venv. CUDA torch/torchvision are installed separately.
+diffusers==0.32.2
+transformers==4.45.2
+accelerate==0.34.0
+safetensors==0.4.5
+numpy==1.26.4
+opencv-python==4.10.0.84
+decord==0.6.0
+imageio==2.36.1
+imageio-ffmpeg==0.5.1
+sentencepiece==0.2.0

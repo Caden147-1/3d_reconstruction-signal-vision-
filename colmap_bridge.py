@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import math
 import shutil
@@ -10,6 +11,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from image_similarity import analyze_workspace_image_similarity
+from workspace_lock import locked_workspace
+from workspace_inputs import require_fresh_workspace
 
 
 METADATA_FILES = [
@@ -28,6 +31,7 @@ METADATA_FILES = [
     "pdr_trajectory_edges.csv",
     "pdr_trajectory_contour_summary.json",
     "export_summary.json",
+    "unassigned_image_audit.csv",
 ]
 
 
@@ -108,11 +112,6 @@ DENSE_PROFILES: Dict[str, Dict[str, Any]] = {
 
 
 LOAD_PROFILES: Dict[str, Dict[str, Any]] = {
-    "low-peak": {
-        "description": "Limit supported COLMAP stages to a few threads and rest between heavy stages.",
-        "num_threads": 2,
-        "stage_cooldown_s": 20,
-    },
     "standard": {
         "description": "Moderate throttling for normal desktop use.",
         "num_threads": 4,
@@ -206,7 +205,7 @@ def safe_float(value: Any, default: float = math.nan) -> float:
 def find_colmap_exe(root: Path, colmap_dir: Optional[Path] = None, colmap_exe: Optional[Path] = None) -> Path:
     candidates: List[Path] = []
     if colmap_exe is not None:
-        candidates.append(colmap_exe if colmap_exe.is_absolute() else root / colmap_exe)
+        return (colmap_exe if colmap_exe.is_absolute() else root / colmap_exe).resolve()
     if colmap_dir is not None:
         resolved_dir = colmap_dir if colmap_dir.is_absolute() else root / colmap_dir
         candidates.extend([resolved_dir / "bin" / "colmap.exe", resolved_dir / "COLMAP.bat"])
@@ -221,11 +220,21 @@ def find_colmap_exe(root: Path, colmap_dir: Optional[Path] = None, colmap_exe: O
     for candidate in candidates:
         if candidate.exists():
             return candidate.resolve()
+    found = shutil.which("colmap")
+    if found:
+        return Path(found).resolve()
     return candidates[0].resolve() if candidates else (root / "colmap.exe").resolve()
 
 
 def workspace_image_group(row: Dict[str, str]) -> str:
     """Keep inputs with distinct capture geometry in separate camera folders."""
+    if row.get("source_type") == "visual_only_photo":
+        width, height = safe_int(row.get("image_width")), safe_int(row.get("image_height"))
+        if width > 0 and height > 0:
+            return f"visual_photos_{width}x{height}"
+        # Unknown geometry must not inherit a checkpoint camera calibration.
+        import hashlib
+        return "visual_photo_" + hashlib.sha256(row.get("image_file", "").encode()).hexdigest()[:16]
     return "video" if row.get("source_type") == "video_base_frame" else "anchors"
 
 
@@ -276,8 +285,9 @@ def camera_grouping_summary(manifest_rows: Sequence[Dict[str, str]]) -> Dict[str
         "single_camera": not use_folder_groups,
         "single_camera_per_folder": use_folder_groups,
         "explanation": (
-            "Anchor photos and video frames are kept in separate folders so COLMAP "
-            "can estimate one shared camera per capture source."
+            "Checkpoint photos, videos and extra photos are separated by source; "
+            "extra photo groups also separate decoded resolutions. Shared intrinsics "
+            "within a group assume a common camera/lens setting."
             if use_folder_groups
             else "All current inputs belong to one capture-source group."
         ),
@@ -423,14 +433,24 @@ def pair_point_gap(row_a: Dict[str, str], row_b: Dict[str, str]) -> Optional[int
     return abs(point_a - point_b)
 
 
-def pair_slot_gap(row_a: Dict[str, str], row_b: Dict[str, str]) -> Optional[int]:
+def pair_slot_gap(
+    row_a: Dict[str, str], row_b: Dict[str, str], fallback_slot_count: int = 0,
+) -> Optional[float]:
     slot_a = row_slot(row_a)
     slot_b = row_slot(row_b)
-    if slot_a < 0 or slot_b < 0:
+    if slot_a <= 0 or slot_b <= 0:
         return None
+    count_a = safe_int(row_a.get("anchor_slot_count"))
+    count_b = safe_int(row_b.get("anchor_slot_count"))
+    if count_a >= slot_a and count_b >= slot_b:
+        # Compare circular view fractions when stops have different counts.
+        # This remains a pairing heuristic, not a measured camera heading.
+        difference = abs((slot_a - 1) * count_b - (slot_b - 1) * count_a)
+        return min(difference, count_a * count_b - difference) / min(count_a, count_b)
     slot_count = max(
-        safe_int(row_a.get("anchor_slot_count")),
-        safe_int(row_b.get("anchor_slot_count")),
+        count_a,
+        count_b,
+        fallback_slot_count,
         slot_a,
         slot_b,
     )
@@ -706,12 +726,8 @@ def build_constrained_match_pairs(
         slot_count = anchor_slot_count(rows_a + rows_b)
         for row_a in rows_a:
             for row_b in rows_b:
-                slot_gap = circular_slot_distance(
-                    safe_int(row_a.get("image_slot")),
-                    safe_int(row_b.get("image_slot")),
-                    slot_count,
-                )
-                if slot_gap <= slot_window:
+                slot_gap = pair_slot_gap(row_a, row_b, slot_count)
+                if slot_gap is not None and slot_gap <= slot_window:
                     add_pair(row_a, row_b, reason)
 
     video_rows = [row for row in manifest_rows if row.get("image_file") and is_video_frame_row(row)]
@@ -897,74 +913,115 @@ def write_match_pairs(workspace_dir: Path, pairs: Sequence[Tuple[str, str]]) -> 
             handle.write(f"{image_a} {image_b}\n")
 
 
+def balanced_checkpoint_pairs(left, right, existing, budget):
+    """Spend a bounded RF pair budget across all photos at both stops.
+
+    Existing edges are excluded before allocation. Degree balancing prevents a
+    fixed representative subset from monopolizing every neighboring stop.
+    A stable hash breaks ties without equating capture-slot numbers.
+    """
+    left_names = sorted({row["image_file"] for row in left})
+    right_names = sorted({row["image_file"] for row in right})
+    candidates = {}
+    for a in left_names:
+        for b in right_names:
+            pair = tuple(sorted((a, b)))
+            if a != b and pair not in existing:
+                candidates[pair] = hashlib.blake2b(json.dumps(pair).encode("utf-8"), digest_size=8).digest()
+    degrees = dict.fromkeys(left_names + right_names, 0)
+    selected = []
+    for _ in range(min(max(0, budget), len(candidates))):
+        pair = min(candidates, key=lambda p: (
+            -(int(degrees[p[0]] == 0) + int(degrees[p[1]] == 0)),
+            max(degrees[p[0]], degrees[p[1]]), degrees[p[0]] + degrees[p[1]],
+            candidates[p], p,
+        ))
+        del candidates[pair]
+        selected.append(pair)
+        for name in pair:
+            degrees[name] += 1
+    return selected
+
+
 def build_wifi_recovery_edges(
     manifest_rows: Sequence[Dict[str, str]],
     existing_pairs: Sequence[Tuple[str, str]],
     enabled: bool = True,
-    neighbors_per_point: int = 2,
-    images_per_point: int = 6,
-    max_rssi_rms_db: float = 6.0,
+    neighbors_per_point: int = 4,
+    images_per_point: int = 8,
+    rssi_similarity_scale_db: float = 12.0,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """Use fresh RF similarity only to propose visually verifiable loop candidates."""
-    from wifi_observations import MIN_WIFI_APS, finite_number, valid_fingerprint, visible_fingerprint
+    """Rank RF stops and cover their photos with bounded geometric proposals.
+
+    images_per_point keeps its historical per-stop-pair budget (8 x 8 by
+    default), but no longer restricts which photos may participate.
+    """
+    from wifi_observations import fingerprint_confidence, fingerprint_similarity
 
     groups: Dict[Tuple[str, str], List[Dict[str, str]]] = {}
+    checkpoint_by_image = {}
     for row in manifest_rows:
-        if row.get("image_file") and row.get("global_point_index") and not is_video_frame_row(row) and valid_fingerprint(row):
-            groups.setdefault((row.get("session", ""), str(row["global_point_index"])), []).append(row)
+        if row.get("image_file") and row.get("global_point_index") and not is_video_frame_row(row) and fingerprint_confidence(row) > 0:
+            key = (row.get("session", ""), str(row["global_point_index"]))
+            if row["image_file"] in checkpoint_by_image:
+                raise ValueError("Duplicate WiFi recovery image in manifest")
+            checkpoint_by_image[row["image_file"]] = key
+            groups.setdefault(key, []).append(row)
     representatives = {key: rows[0] for key, rows in groups.items()}
-    ranked: Dict[Tuple[str, str], List[Tuple[float, Tuple[str, str], int, float]]] = {}
+    ranked = {}
     keys = sorted(groups)
     if enabled and neighbors_per_point > 0 and images_per_point > 0:
         for index, key_a in enumerate(keys):
             row_a = representatives[key_a]
-            vector_a = visible_fingerprint(row_a)
             for key_b in keys[index + 1:]:
                 if not key_a[0] or key_a[0] != key_b[0]:
                     continue
                 row_b = representatives[key_b]
-                start = max(finite_number(row_a["wifi_measurement_min_elapsed_ts"]), finite_number(row_b["wifi_measurement_min_elapsed_ts"]))
-                end = min(finite_number(row_a["wifi_measurement_max_elapsed_ts"]), finite_number(row_b["wifi_measurement_max_elapsed_ts"]))
-                if start <= end:
-                    continue  # Reused observations cannot establish a revisit.
-                vector_b = visible_fingerprint(row_b)
-                shared = vector_a.keys() & vector_b.keys()
-                union = vector_a.keys() | vector_b.keys()
-                overlap = len(shared) / len(union)
-                if len(shared) < MIN_WIFI_APS or overlap < 0.6:
+                similarity = fingerprint_similarity(row_a, row_b, rssi_similarity_scale_db)
+                if similarity["score"] <= 0:
                     continue
-                rms = math.sqrt(sum((vector_a.get(ap, -110.0) - vector_b.get(ap, -110.0)) ** 2 for ap in union) / len(union))
-                if rms <= max_rssi_rms_db:
-                    ranked.setdefault(key_a, []).append((rms, key_b, len(shared), overlap))
-                    ranked.setdefault(key_b, []).append((rms, key_a, len(shared), overlap))
-    proposed: Dict[Tuple[Tuple[str, str], Tuple[str, str]], Tuple[float, int, float]] = {}
+                score, rms = similarity["score"], similarity["rssi_rms_db"]
+                shared_count, overlap = similarity["shared_aps"], similarity["ap_overlap"]
+                ranked.setdefault(key_a, []).append((-score, key_b, rms, shared_count, overlap))
+                ranked.setdefault(key_b, []).append((-score, key_a, rms, shared_count, overlap))
+    proposed = {}
     for key, neighbors in ranked.items():
-        for rms, other, shared_count, overlap in sorted(neighbors)[:neighbors_per_point]:
-            proposed[tuple(sorted((key, other)))] = (rms, shared_count, overlap)
+        for negative_score, other, rms, shared_count, overlap in sorted(neighbors)[:neighbors_per_point]:
+            proposed[tuple(sorted((key, other)))] = (-negative_score, rms, shared_count, overlap)
     existing = {tuple(sorted(pair)) for pair in existing_pairs}
     edges: List[Dict[str, Any]] = []
-    for (key_a, key_b), (rms, shared_count, overlap) in sorted(proposed.items()):
-        left = select_evenly_spaced(sorted(groups[key_a], key=lambda row: safe_int(row.get("image_slot"))), images_per_point)
-        right = select_evenly_spaced(sorted(groups[key_b], key=lambda row: safe_int(row.get("image_slot"))), images_per_point)
-        for row_a in left:
-            for row_b in right:
-                pair = tuple(sorted((row_a["image_file"], row_b["image_file"])))
-                if pair in existing or pair[0] == pair[1]:
-                    continue
-                existing.add(pair)
-                edges.append({
+    for (key_a, key_b), (score, rms, shared_count, overlap) in sorted(proposed.items()):
+        left, right = groups[key_a], groups[key_b]
+        budget = min(images_per_point, len(left)) * min(images_per_point, len(right))
+        for pair in balanced_checkpoint_pairs(left, right, existing, budget):
+            existing.add(pair)
+            edges.append({
                     "image_a": pair[0], "image_b": pair[1], "reason": "wifi_fingerprint_recovery",
-                    "edge_weight_basis": "fresh_rssi_retrieval_only_requires_geometry",
+                    "edge_weight_basis": "confidence_weighted_wifi_retrieval_requires_geometry",
+                    "edge_weight": round(1.5 * score, 6),
+                    "wifi_retrieval_score": round(score, 6),
                     "wifi_rssi_rms_db": round(rms, 6), "wifi_shared_ap_count": shared_count,
                     "wifi_ap_overlap": round(overlap, 6),
-                })
+                    "wifi_checkpoint_a": json.dumps(checkpoint_by_image[pair[0]]),
+                    "wifi_checkpoint_b": json.dumps(checkpoint_by_image[pair[1]]),
+                    "wifi_pair_budget": budget,
+            })
+    covered = {row[key] for row in edges for key in ("image_a", "image_b")}
     summary = {
-        "status": "disabled" if not enabled else "insufficient_fresh_fingerprints" if len(groups) < 2 else "evaluated",
+        "status": "disabled" if not enabled else "insufficient_fingerprints" if len(groups) < 2 else "evaluated",
         "valid_checkpoint_count": len(groups), "candidate_checkpoint_pair_count": len(proposed),
-        "candidate_image_pair_count": len(edges), "max_rssi_rms_db": max_rssi_rms_db,
-        "min_shared_aps": MIN_WIFI_APS, "min_ap_overlap": 0.6,
+        "candidate_image_pair_count": len(edges), "rssi_similarity_scale_db": rssi_similarity_scale_db,
+        "min_shared_aps": 2, "ranking": "confidence_shared_AP_reliability_overlap_RSSI_decay",
+        "priority_multiplier": 1.5,
         "neighbors_per_point": neighbors_per_point, "images_per_point": images_per_point,
-        "explanation": "Fresh RSSI proposes additional pairs only; P1 geometry must verify them. RSSI does not set poses, room boundaries, or point-cloud crop limits.",
+        "image_selection": "balanced_all_photos_with_bounded_pair_budget",
+        "pair_budget_per_checkpoint_pair": images_per_point ** 2,
+        "candidate_photo_count": len(covered),
+        "eligible_photo_count": len({row["image_file"] for rows in groups.values() for row in rows}),
+        "photo_coverage_by_checkpoint": [
+            {"session": key[0], "checkpoint": key[1], "eligible": len(rows),
+             "covered": sum(row["image_file"] in covered for row in rows)} for key, rows in sorted(groups.items())],
+        "explanation": "Weighted per-checkpoint RSSI expands and ranks match candidates; geometric verification is required before sparse matching. Scores are retrieval priorities, not COLMAP pose weights.",
     }
     return edges, summary
 
@@ -1110,8 +1167,12 @@ def write_match_graph_edges(workspace_dir: Path, edge_rows: Sequence[Dict[str, A
             "video_sequence_gap",
             "edge_weight_basis",
             "wifi_rssi_rms_db",
+            "wifi_retrieval_score",
             "wifi_shared_ap_count",
             "wifi_ap_overlap",
+            "wifi_checkpoint_a",
+            "wifi_checkpoint_b",
+            "wifi_pair_budget",
             "source_type_a",
             "source_type_b",
             "global_point_index_a",
@@ -1161,7 +1222,17 @@ def remove_pdr_alignment_refs(workspace_dir: Path) -> None:
         refs_path.unlink()
 
 
-def batch_header(root: Path, workspace_dir: Path, colmap_exe: Path) -> str:
+def batch_lock_guard(mode: str) -> str:
+    return f'''
+python "%ROOT%\\workspace_lock.py" --workspace "%WORKSPACE%" --check-owned
+if "%errorlevel%"=="0" goto :workspace_locked
+python "%ROOT%\\run_colmap.py" {mode} --workspace "%WORKSPACE%"
+exit /b %errorlevel%
+:workspace_locked
+'''
+
+
+def batch_header(root: Path, workspace_dir: Path, colmap_exe: Path, mode: str = "gui") -> str:
     return f"""@echo off
 setlocal
 set "ROOT={windows_path(root)}"
@@ -1170,7 +1241,7 @@ set "COLMAP_EXE={windows_path(colmap_exe)}"
 set "IMAGE_PATH=%WORKSPACE%\\images"
 set "IMAGE_LIST=%WORKSPACE%\\image_list.txt"
 set "DATABASE=%WORKSPACE%\\database.db"
-
+{batch_lock_guard(mode)}
 if not exist "%COLMAP_EXE%" (
   echo [error] COLMAP not found: %COLMAP_EXE%
   exit /b 1
@@ -1206,7 +1277,7 @@ def dense_profile_config(dense_profile: str) -> Dict[str, Any]:
 
 def load_profile_config(load_profile: str) -> Dict[str, Any]:
     if load_profile not in LOAD_PROFILES:
-        return LOAD_PROFILES["low-peak"]
+        raise ValueError(f"Unknown COLMAP load profile: {load_profile}")
     return LOAD_PROFILES[load_profile]
 
 
@@ -1215,7 +1286,7 @@ def resolve_load_settings(
     colmap_num_threads: Optional[int],
     stage_cooldown_s: Optional[int],
 ) -> Tuple[str, Dict[str, Any], int, int]:
-    profile_name = load_profile if load_profile in LOAD_PROFILES else "low-peak"
+    profile_name = load_profile
     config = load_profile_config(profile_name)
     default_threads = int(config.get("num_threads") or 0)
     default_cooldown = int(config.get("stage_cooldown_s") or 0)
@@ -1250,7 +1321,7 @@ set "OPENBLAS_NUM_THREADS={num_threads}"
 set "MKL_NUM_THREADS={num_threads}"
 set "NUMEXPR_NUM_THREADS={num_threads}"
 set "OPENCV_FOR_THREADS_NUM={num_threads}"
-echo [load] Low-peak thread cap: {num_threads}
+echo [load] Explicit thread cap: {num_threads}
 """
 
 
@@ -1329,7 +1400,10 @@ def write_sparse_batch(
     max_num_matches: int,
     num_threads: int,
     stage_cooldown_s: int,
+    pdr_capture_mode: str = "auto",
 ) -> None:
+    if pdr_capture_mode not in {"auto", "stationary", "off"}:
+        raise ValueError("Unknown PDR capture mode")
     matcher_command = "sequential_matcher" if matcher == "sequential" else "exhaustive_matcher"
     single_camera_flag = "1" if single_camera else "0"
     single_camera_per_folder_flag = "1" if single_camera_per_folder else "0"
@@ -1353,7 +1427,7 @@ if not exist "%WORKSPACE%\\match_pairs.txt" (
   --FeatureMatching.use_gpu {gpu_flag} ^
   --FeatureMatching.guided_matching 1 ^
   --FeatureMatching.max_num_matches {max_num_matches}{feature_matching_threads}
-if errorlevel 1 exit /b %errorlevel%
+if not "%errorlevel%"=="0" exit /b %errorlevel%
 {after_matching_cooldown}
 """
     if matcher == "constrained":
@@ -1366,7 +1440,7 @@ echo [2b/4] Adding opt-in exhaustive visual bridge matches outside the P1/P2 pai
   --FeatureMatching.use_gpu {gpu_flag} ^
   --FeatureMatching.guided_matching 1 ^
   --FeatureMatching.max_num_matches {max_num_matches}{feature_matching_threads}
-if errorlevel 1 exit /b %errorlevel%
+if not "%errorlevel%"=="0" exit /b %errorlevel%
 {after_matching_cooldown}
 """
     else:
@@ -1376,7 +1450,7 @@ if errorlevel 1 exit /b %errorlevel%
   --FeatureMatching.use_gpu {gpu_flag} ^
   --FeatureMatching.guided_matching 1 ^
   --FeatureMatching.max_num_matches {max_num_matches}{feature_matching_threads}
-if errorlevel 1 exit /b %errorlevel%
+if not "%errorlevel%"=="0" exit /b %errorlevel%
 {after_matching_cooldown}
 """
     feature_limits = ""
@@ -1387,48 +1461,18 @@ if errorlevel 1 exit /b %errorlevel%
     mask_option = ""
     if mask_dir is not None:
         mask_option = f' ^\n  --ImageReader.mask_path "{windows_path(mask_dir)}"'
-    alignment_block = ""
-    if align_to_pdr:
-        alignment_block = """
-echo [4/4] Aligning sparse model to PDR coordinate seeds...
-if exist "%WORKSPACE%\\pdr_alignment_refs.txt" (
-  if exist "%WORKSPACE%\\sparse\\0" (
-    if not exist "%WORKSPACE%\\sparse_pdr_aligned" mkdir "%WORKSPACE%\\sparse_pdr_aligned"
-    if not exist "%WORKSPACE%\\sparse_pdr_aligned\\0" mkdir "%WORKSPACE%\\sparse_pdr_aligned\\0"
-    "%COLMAP_EXE%" model_aligner ^
-      --input_path "%WORKSPACE%\\sparse\\0" ^
-      --output_path "%WORKSPACE%\\sparse_pdr_aligned\\0" ^
-      --ref_images_path "%WORKSPACE%\\pdr_alignment_refs.txt" ^
-      --ref_is_gps 0 ^
-      --alignment_type custom ^
-      --min_common_images 3 ^
-      --alignment_max_error 10
-    if errorlevel 1 (
-      echo [warn] PDR alignment failed; dense step will use raw sparse model.
-    ) else (
-      if exist "%WORKSPACE%\\sparse_pdr_aligned\\0\\images.bin" (
-        echo [done] PDR-aligned sparse model: %WORKSPACE%\\sparse_pdr_aligned\\0
-      ) else (
-        if exist "%WORKSPACE%\\sparse_pdr_aligned\\0\\images.txt" (
-          echo [done] PDR-aligned sparse model: %WORKSPACE%\\sparse_pdr_aligned\\0
-        ) else (
-          echo [warn] PDR alignment did not write a model; dense step will use raw sparse model.
-        )
-      )
-    )
-  )
-)
+    alignment_disabled = "" if align_to_pdr else " --disabled"
+    alignment_block = f"""
+echo [4/4] Validating checkpoint reliability before PDR alignment...
+python "%ROOT%\\pdr_alignment.py" --workspace "%WORKSPACE%" --colmap-exe "%COLMAP_EXE%" --capture-mode {pdr_capture_mode}{alignment_disabled}
+if not "%errorlevel%"=="0" exit /b %errorlevel%
 """
-    else:
-        alignment_block = """
-echo [4/4] Skipping PDR alignment for visual-only reconstruction.
-"""
-    content = batch_header(root, workspace_dir, colmap_exe) + f"""{thread_env}
+    content = batch_header(root, workspace_dir, colmap_exe, "sparse") + f"""{thread_env}
 echo [preflight] Checking that sparse reconstruction starts from the current input set...
 python "%ROOT%\\colmap_workspace_check.py" --workspace "%WORKSPACE%" --require-clean-database
-if errorlevel 1 exit /b %errorlevel%
+if not "%errorlevel%"=="0" exit /b %errorlevel%
 python "%ROOT%\\colmap_workspace_check.py" --workspace "%WORKSPACE%" --record-sparse-start
-if errorlevel 1 exit /b %errorlevel%
+if not "%errorlevel%"=="0" exit /b %errorlevel%
 
 if exist "%DATABASE%" (
   echo [warn] Existing database found: %DATABASE%
@@ -1445,25 +1489,32 @@ echo [1/4] Extracting features...
   --ImageReader.single_camera {single_camera_flag} ^
   --ImageReader.single_camera_per_folder {single_camera_per_folder_flag} ^
   --FeatureExtraction.use_gpu {gpu_flag}{mask_option}{feature_limits}{feature_extraction_threads}
-if errorlevel 1 exit /b %errorlevel%
+if not "%errorlevel%"=="0" exit /b %errorlevel%
 {after_feature_cooldown}
 
 {matching_block}
 
 echo [3/4] Building sparse model...
+if not defined FYP_COLMAP_RUN_ID set "FYP_COLMAP_RUN_ID=manual_%RANDOM%_%RANDOM%"
+set "SPARSE_SNAPSHOTS=%WORKSPACE%\\sparse_snapshots\\%FYP_COLMAP_RUN_ID%"
+mkdir "%SPARSE_SNAPSHOTS%"
+if not "%errorlevel%"=="0" exit /b %errorlevel%
+echo [snapshot] Recovery candidates: %SPARSE_SNAPSHOTS%
 "%COLMAP_EXE%" mapper ^
   --database_path "%DATABASE%" ^
   --image_path "%IMAGE_PATH%" ^
   --output_path "%WORKSPACE%\\sparse" ^
-  --Mapper.multiple_models 0{mapper_threads}
-if errorlevel 1 exit /b %errorlevel%
+  --Mapper.multiple_models 0{mapper_threads} ^
+  --Mapper.snapshot_path "%SPARSE_SNAPSHOTS%" ^
+  --Mapper.snapshot_frames_freq 50
+if not "%errorlevel%"=="0" exit /b %errorlevel%
 {after_mapper_cooldown}
 
 {alignment_block}
 python "%ROOT%\\colmap_workspace_check.py" --workspace "%WORKSPACE%" --record-sparse-complete
-if errorlevel 1 exit /b %errorlevel%
-python "%ROOT%\\reconstruction_quality.py" --workspace "%WORKSPACE%" --summary "%WORKSPACE%\\quality_report.json" --markdown "%WORKSPACE%\\QUALITY_REPORT.md"
-if errorlevel 1 echo [warn] Sparse quality report failed; reconstruction outputs are still available.
+if not "%errorlevel%"=="0" exit /b %errorlevel%
+python "%ROOT%\\reconstruction_quality.py" --workspace "%WORKSPACE%" --summary "%WORKSPACE%\\quality_report.json"
+if not "%errorlevel%"=="0" echo [warn] Sparse quality report failed; reconstruction outputs are still available.
 
 echo [done] Sparse model candidates written under %WORKSPACE%\\sparse
 """
@@ -1482,7 +1533,16 @@ def write_dense_batch(
     run_point_cloud_filter: bool,
     num_threads: int,
     stage_cooldown_s: int,
+    scene_completion: str = "off",
+    videoscene_max_clips: int = 3,
+    videoscene_budget_hours: float = 4.,
 ) -> None:
+    if scene_completion not in {"off", "videoscene"}:
+        raise ValueError("Unknown scene completion method")
+    if scene_completion == "videoscene" and not run_point_cloud_filter:
+        raise ValueError("VideoScene completion requires point-cloud filtering")
+    if not 1 <= videoscene_max_clips <= 8 or not math.isfinite(videoscene_budget_hours) or not 0 < videoscene_budget_hours <= 20:
+        raise ValueError("Invalid VideoScene completion budget")
     profile = dense_profile_config(dense_profile)
     point_filter_max_points = int(profile.get("point_filter_max_points", 600000))
     cleanup_intermediate_ply = bool(profile.get("cleanup_intermediate_ply", True))
@@ -1517,17 +1577,24 @@ def write_dense_batch(
     )
     patch_match_command = colmap_command("patch_match_stereo", patch_match_args)
     fusion_command = colmap_command("stereo_fusion", fusion_args)
-    sparse_selector = """set "SPARSE_MODEL=%WORKSPACE%\\sparse\\0"
-if exist "%WORKSPACE%\\sparse_pdr_aligned\\0\\cameras.bin" set "SPARSE_MODEL=%WORKSPACE%\\sparse_pdr_aligned\\0"
-if exist "%WORKSPACE%\\sparse_pdr_aligned\\0\\cameras.txt" set "SPARSE_MODEL=%WORKSPACE%\\sparse_pdr_aligned\\0"
+    sparse_selector = """set "SPARSE_MODEL="
+for /f "usebackq delims=" %%I in (`python "%ROOT%\\colmap_workspace_check.py" --workspace "%WORKSPACE%" --print-dense-input`) do set "SPARSE_MODEL=%%I"
+if not defined SPARSE_MODEL exit /b 1
 echo [info] Dense input sparse model: %SPARSE_MODEL%
 """
     point_filter_block = ""
     filter_preflight = ""
+    # Keep the receipt until filtering replaces it: exact-source observation
+    # layers may still be useful when the dense cache is reused. The filter
+    # checks the fusion identity and reconstruction binding before reuse.
+    filter_summary_cleanup = (
+        '' if run_point_cloud_filter else
+        'if exist "%WORKSPACE%\\dense\\point_filter_summary.json" del "%WORKSPACE%\\dense\\point_filter_summary.json"\n'
+    )
     if run_point_cloud_filter:
         filter_preflight = """python -c "import numpy"
-if errorlevel 1 (
-  echo [error] Connected-density filtering requires NumPy in this Python environment.
+if not "%errorlevel%"=="0" (
+  echo [error] Point cloud filtering requires NumPy in this Python environment.
   exit /b 1
 )
 """
@@ -1537,9 +1604,10 @@ python "%ROOT%\\point_cloud_filter.py" ^
   --input "%WORKSPACE%\\dense\\fused.ply" ^
   --output "%WORKSPACE%\\dense\\fused_filtered.ply" ^
   --summary "%WORKSPACE%\\dense\\point_filter_summary.json" ^
-  --method connected-density ^
+  --method wifi-density ^
+  --workspace "%WORKSPACE%" ^
   --max-points {point_filter_max_points}
-if errorlevel 1 (
+if not "%errorlevel%"=="0" (
   echo [error] Point cloud filtering failed; stopping before final promotion. Raw fused.ply is still available.
   exit /b 1
 ) else (
@@ -1566,31 +1634,46 @@ if errorlevel 1 (
         mesh_block = f"""
 echo [5/8] Building a Delaunay mesh for robust MeshLab inspection...
 {delaunay_command}
-if errorlevel 1 echo [warn] Delaunay meshing failed; continuing with fused point cloud.
+if not "%errorlevel%"=="0" echo [warn] Delaunay meshing failed; continuing with fused point cloud.
 {after_postprocess_cooldown}
 
 echo [6/8] Building a Poisson mesh for smoother surface inspection...
 {poisson_command}
-if errorlevel 1 echo [warn] Poisson meshing failed; continuing with fused point cloud.
+if not "%errorlevel%"=="0" echo [warn] Poisson meshing failed; continuing with fused point cloud.
 {after_postprocess_cooldown}
 """
     quality_block = """
-python "%ROOT%\\reconstruction_quality.py" --workspace "%WORKSPACE%" --summary "%WORKSPACE%\\quality_report.json" --markdown "%WORKSPACE%\\QUALITY_REPORT.md"
-if errorlevel 1 echo [warn] Final quality report failed; reconstruction outputs are still available.
+python "%ROOT%\\reconstruction_quality.py" --workspace "%WORKSPACE%" --summary "%WORKSPACE%\\quality_report.json"
+if not "%errorlevel%"=="0" echo [warn] Final quality report failed; reconstruction outputs are still available.
 """
+    if align_to_pdr:
+        quality_block = """
+python "%ROOT%\\wifi_boundary.py" --workspace "%WORKSPACE%"
+if not "%errorlevel%"=="0" echo [warn] WiFi boundary hypotheses unavailable; observed reconstruction is retained.
+""" + quality_block
     keep_intermediate_default = "--keep-intermediate" if mesh_block or not cleanup_intermediate_ply else ""
+    # This runner has just produced a new fusion. Without filtering there is no
+    # filtered source to distinguish it from raw fusion retained by an older run.
+    raw_replacement = " --allow-raw-replacement" if not run_point_cloud_filter else ""
     finalize_block = f"""
 set "FINALIZE_KEEP={keep_intermediate_default}"
 if "%KEEP_INTERMEDIATE_PLY%"=="1" set "FINALIZE_KEEP=--keep-intermediate"
 echo [finalize] Validating and selecting dense\\final.ply; applying the intermediate retention setting...
 python "%ROOT%\\finalize_dense_outputs.py" ^
   --dense-dir "%WORKSPACE%\\dense" ^
-  --summary "%WORKSPACE%\\dense\\final_output_summary.json" %FINALIZE_KEEP%
-if errorlevel 1 exit /b %errorlevel%
+  --summary "%WORKSPACE%\\dense\\final_output_summary.json" %FINALIZE_KEEP%{raw_replacement}
+if not "%errorlevel%"=="0" exit /b %errorlevel%
 {after_postprocess_cooldown}
 """
-    pdr_note = "PDR-aligned sparse models are preferred when present." if align_to_pdr else "Visual sparse models are used because visual-only mode is enabled."
-    content = batch_header(root, workspace_dir, colmap_exe) + f"""{thread_env}
+    pdr_note = "Only validated PDR-aligned sparse models are selected." if align_to_pdr else "Visual sparse models are used because visual-only mode is enabled."
+    completion_block = ""
+    if scene_completion == "videoscene":
+        completion_block = f"""
+echo [VideoScene] Completing supported local holes after observed reconstruction...
+python "%ROOT%\\videoscene_completion.py" --workspace "%WORKSPACE%" --max-clips {videoscene_max_clips} --budget-hours {videoscene_budget_hours}
+if not "%errorlevel%"=="0" exit /b %errorlevel%
+"""
+    content = batch_header(root, workspace_dir, colmap_exe, "dense") + f"""{thread_env}
 {filter_preflight}{sparse_selector}if not exist "%SPARSE_MODEL%" (
   echo [error] Sparse model not found: %SPARSE_MODEL%
   echo Run run_colmap_sparse.bat first, or check which sparse model folder COLMAP created.
@@ -1598,43 +1681,72 @@ if errorlevel 1 exit /b %errorlevel%
 )
 echo [preflight] Verifying that database.db covers the current image list...
 python "%ROOT%\\colmap_workspace_check.py" --workspace "%WORKSPACE%" --require-database-coverage --require-sparse-model
-if errorlevel 1 exit /b %errorlevel%
+if not "%errorlevel%"=="0" exit /b %errorlevel%
 if not exist "%WORKSPACE%\\dense" mkdir "%WORKSPACE%\\dense"
+python "%ROOT%\\dense_cache.py" prepare --workspace "%WORKSPACE%"
+if not "%errorlevel%"=="0" exit /b %errorlevel%
 set "DENSE_POINT_CLOUD=%WORKSPACE%\\dense\\fused.ply"
 if exist "%WORKSPACE%\\dense\\meshed-poisson.ply" del "%WORKSPACE%\\dense\\meshed-poisson.ply"
 if exist "%WORKSPACE%\\dense\\meshed-delaunay.ply" del "%WORKSPACE%\\dense\\meshed-delaunay.ply"
 if exist "%WORKSPACE%\\dense\\fused_filtered.ply" del "%WORKSPACE%\\dense\\fused_filtered.ply"
-if exist "%WORKSPACE%\\dense\\point_filter_summary.json" del "%WORKSPACE%\\dense\\point_filter_summary.json"
+{filter_summary_cleanup.rstrip()}
 if exist "%WORKSPACE%\\dense\\fused.ply.vis" del "%WORKSPACE%\\dense\\fused.ply.vis"
 
+python "%ROOT%\\dense_cache.py" undistorted --workspace "%WORKSPACE%"
+if not "%errorlevel%"=="0" if not "%errorlevel%"=="1" exit /b %errorlevel%
+if "%errorlevel%"=="0" goto :undistortion_ready
 echo [1/8] Undistorting images...
 {undistorter_command}
-if errorlevel 1 exit /b %errorlevel%
+if not "%errorlevel%"=="0" exit /b %errorlevel%
+python "%ROOT%\\mvs_observations.py" --workspace "%WORKSPACE%" --apply
+if not "%errorlevel%"=="0" exit /b %errorlevel%
+python "%ROOT%\\dense_cache.py" checkpoint --workspace "%WORKSPACE%"
+if not "%errorlevel%"=="0" exit /b %errorlevel%
+:undistortion_ready
 {after_undistort_cooldown}
 
+python "%ROOT%\\dense_cache.py" matched --workspace "%WORKSPACE%"
+if not "%errorlevel%"=="0" if not "%errorlevel%"=="1" exit /b %errorlevel%
+if "%errorlevel%"=="0" goto :patchmatch_ready
 echo [2/8] Running CUDA PatchMatch stereo...
 {patch_match_command}
-if errorlevel 1 exit /b %errorlevel%
+if not "%errorlevel%"=="0" exit /b %errorlevel%
+:patchmatch_ready
+python "%ROOT%\\dense_cache.py" complete --workspace "%WORKSPACE%"
+if not "%errorlevel%"=="0" exit /b %errorlevel%
 {after_patchmatch_cooldown}
 
 echo [3/8] Fusing dense point cloud...
 {fusion_command}
-if errorlevel 1 exit /b %errorlevel%
+if not "%errorlevel%"=="0" exit /b %errorlevel%
+python "%ROOT%\\reconstruction_stages.py" record-fusion --workspace "%WORKSPACE%"
+if not "%errorlevel%"=="0" exit /b %errorlevel%
 {after_fusion_cooldown}
 
-{point_filter_block}{mesh_block}{finalize_block}{quality_block}
+{point_filter_block}{mesh_block}{finalize_block}{completion_block}{quality_block}
 if exist "%WORKSPACE%\\dense\\final.ply" echo [done] Final dense model: %WORKSPACE%\\dense\\final.ply
 """
     write_text(workspace_dir / "run_colmap_dense.bat", content)
-
-
-def write_full_batch(workspace_dir: Path) -> None:
-    content = """@echo off
+    compatibility = f'''@echo off
 setlocal
+echo [info] Resuming the verified configured reconstruction pipeline.
+python "{windows_path(root / 'run_colmap.py')}" resume --workspace "{windows_path(workspace_dir)}" %*
+exit /b %errorlevel%
+'''
+    write_text(workspace_dir / "run_colmap_dense_high.bat", compatibility)
+
+
+def write_full_batch(workspace_dir: Path, root: Optional[Path] = None) -> None:
+    root = root or Path(__file__).resolve().parent
+    content = f"""@echo off
+setlocal
+set "ROOT={windows_path(root)}"
+set "WORKSPACE={windows_path(workspace_dir)}"
+{batch_lock_guard("full")}
 call "%~dp0run_colmap_sparse.bat"
-if errorlevel 1 exit /b %errorlevel%
+if not "%errorlevel%"=="0" exit /b %errorlevel%
 call "%~dp0run_colmap_dense.bat"
-if errorlevel 1 exit /b %errorlevel%
+if not "%errorlevel%"=="0" exit /b %errorlevel%
 """
     write_text(workspace_dir / "run_colmap_full.bat", content)
 
@@ -1652,12 +1764,12 @@ def write_automatic_batch(
     single_camera_flag = "1" if single_camera else "0"
     single_camera_per_folder_flag = "1" if single_camera_per_folder else "0"
     gpu_flag = "1" if use_gpu else "0"
-    content = batch_header(root, workspace_dir, colmap_exe) + f"""
+    content = batch_header(root, workspace_dir, colmap_exe, "automatic") + f"""
 echo [preflight] Checking that automatic reconstruction starts from the current input set...
 python "%ROOT%\\colmap_workspace_check.py" --workspace "%WORKSPACE%" --require-clean-database
-if errorlevel 1 exit /b %errorlevel%
+if not "%errorlevel%"=="0" exit /b %errorlevel%
 python "%ROOT%\\colmap_workspace_check.py" --workspace "%WORKSPACE%" --record-sparse-start --runner run_colmap_automatic.bat
-if errorlevel 1 exit /b %errorlevel%
+if not "%errorlevel%"=="0" exit /b %errorlevel%
 
 echo [info] Running COLMAP automatic_reconstructor...
 "%COLMAP_EXE%" automatic_reconstructor ^
@@ -1670,10 +1782,10 @@ echo [info] Running COLMAP automatic_reconstructor...
   --use_gpu {gpu_flag} ^
   --quality {quality} ^
   --dense 1
-if errorlevel 1 exit /b %errorlevel%
+if not "%errorlevel%"=="0" exit /b %errorlevel%
 
 python "%ROOT%\\colmap_workspace_check.py" --workspace "%WORKSPACE%" --record-sparse-complete
-if errorlevel 1 exit /b %errorlevel%
+if not "%errorlevel%"=="0" exit /b %errorlevel%
 echo [done] Automatic reconstruction complete.
 """
     write_text(workspace_dir / "run_colmap_automatic.bat", content)
@@ -1691,7 +1803,7 @@ def write_reset_batch(root: Path, workspace_dir: Path) -> None:
     content = f"""@echo off
 setlocal
 set "ROOT={windows_path(root)}"
-set "WORKSPACE=%~dp0"
+set "WORKSPACE={windows_path(workspace_dir)}"
 echo This will delete database.db, sparse, PDR-aligned sparse, dense, and automatic output folders under:
 echo %WORKSPACE%
 set /p CONFIRM=Type YES to reset COLMAP outputs:
@@ -1699,115 +1811,14 @@ if /I not "%CONFIRM%"=="YES" (
   echo cancelled
   exit /b 0
 )
-if exist "%WORKSPACE%database.db" del "%WORKSPACE%database.db"
-if exist "%WORKSPACE%database.db-wal" del "%WORKSPACE%database.db-wal"
-if exist "%WORKSPACE%database.db-shm" del "%WORKSPACE%database.db-shm"
-if exist "%WORKSPACE%database.db-journal" del "%WORKSPACE%database.db-journal"
-if exist "%WORKSPACE%sparse_run_inputs.json" del "%WORKSPACE%sparse_run_inputs.json"
-if exist "%WORKSPACE%sparse_run_provenance.json" del "%WORKSPACE%sparse_run_provenance.json"
-if exist "%WORKSPACE%sparse" rmdir /s /q "%WORKSPACE%sparse"
-if exist "%WORKSPACE%sparse_pdr_aligned" rmdir /s /q "%WORKSPACE%sparse_pdr_aligned"
-if exist "%WORKSPACE%dense" rmdir /s /q "%WORKSPACE%dense"
-if exist "%WORKSPACE%stereo" rmdir /s /q "%WORKSPACE%stereo"
-if exist "%WORKSPACE%final.ply" del "%WORKSPACE%final.ply"
-if exist "%WORKSPACE%final_output_summary.json" del "%WORKSPACE%final_output_summary.json"
-if exist "%WORKSPACE%meshed-poisson.ply" del "%WORKSPACE%meshed-poisson.ply"
-if exist "%WORKSPACE%meshed-delaunay.ply" del "%WORKSPACE%meshed-delaunay.ply"
-if exist "%WORKSPACE%fused_filtered.ply" del "%WORKSPACE%fused_filtered.ply"
-if exist "%WORKSPACE%point_filter_summary.json" del "%WORKSPACE%point_filter_summary.json"
-if exist "%WORKSPACE%quality_report.json" del "%WORKSPACE%quality_report.json"
-if exist "%WORKSPACE%QUALITY_REPORT.md" del "%WORKSPACE%QUALITY_REPORT.md"
-echo [done] COLMAP outputs reset.
+python "%ROOT%\\run_colmap.py" reset --workspace "%WORKSPACE%"
+exit /b %errorlevel%
 """
     write_text(workspace_dir / "reset_colmap_outputs.bat", content)
 
 
-def write_readme(
-    workspace_dir: Path,
-    visual_only: bool,
-    matcher: str,
-    dense_profile: str,
-    load_profile: str,
-    num_threads: int,
-    stage_cooldown_s: int,
-) -> None:
-    alignment_note = (
-        "This workspace is visual-only: no `pdr_alignment_refs.txt` is generated, and sparse models are not aligned to PDR.\n"
-        if visual_only
-        else "After sparse mapping, the script tries to align the model to PDR coordinates and dense reconstruction prefers that aligned model.\n"
-    )
-    pdr_ref_line = (
-        "- `pdr_alignment_refs.txt`: disabled in visual-only mode.\n"
-        if visual_only
-        else "- `pdr_alignment_refs.txt`: image position seeds used to align sparse output.\n"
-    )
-    content = f"""# COLMAP Workspace
 
-This folder is prepared from the current WiFi/IMU/photo capture.
-
-## Start Here
-
-1. Run `run_colmap_sparse.bat` to build sparse SfM model candidates.
-2. Run `run_colmap_dense.bat` to generate the dense result and reports.
-3. Open `dense/final.ply` in MeshLab for the final reconstruction view.
-
-For normal rebuilds, prefer `python run_colmap.py full` from the project root; it clears old COLMAP outputs automatically before running sparse and dense reconstruction. The sparse script records input content before feature extraction and the completed model/database identities afterward. Dense preflight requires this provenance, not just matching filenames. Old models without a run record remain viewable but are unverified for a new dense run; never certify them retroactively. If you run these generated `.bat` scripts directly and they report existing outputs, run `reset_colmap_outputs.bat` first; it asks you to type `YES` before deleting old outputs.
-
-The generated scripts favor reconstruction quality over speed. The sparse matcher is `{matcher}` and the dense profile is `{dense_profile}`.
-The load profile is `{load_profile}` with COLMAP thread cap `{num_threads}` and `{stage_cooldown_s}` seconds of cooldown between heavy stages.
-
-## Why This Setup
-
-- P2 builds route candidates from adjacent WiFi/PDR anchors, bounded along-route distance, nearby photo slots, and video order. `match_pairs_route.txt` preserves them. Missing contour annotations only permit fallback among unannotated anchors, without removing known contour breaks.
-- P1 requires actual ORB matches for feature/near-duplicate support. Evaluated weak/no-overlap route candidates are removed; unreviewed or unreadable route candidates remain. An all-rejected graph is not restored.
-- Visual recovery retrieves up to 12 non-route neighbors per image by default; only geometry-supported candidates enter the selected list. `--visual-recovery-neighbors 0` disables recovery. `--skip-image-similarity` disables both P1 and recovery. The route evaluation cap does not apply to the separate recovery neighbor budget.
-- `match_pairs_unfiltered.txt` contains route and recovery candidates; `match_pair_filter.csv` records every decision. These are preparation counts, not verified COLMAP matches or measured gains.
-- The default `constrained` matcher imports only the selected route/recovery list. `hybrid` additionally runs exhaustive visual matching outside this gate. COLMAP performs its own matching and geometric verification.
-- Dense fusion uses a completeness-oriented profile for indoor weak-texture floor and wall regions.
-- `metadata/pdr_trajectory_contour.csv` is the time-ordered IMU/PDR route corridor used as a soft matching constraint. It is not a room boundary, mesh-completion source, or pose optimizer.
-- Video frames can inherit interpolated contour positions only as soft matching evidence; they are intentionally excluded from PDR model alignment.
-- When both sources are present, checkpoint photos and video frames use `images/anchors/` and `images/video/` so COLMAP can share intrinsics within each source group rather than across them.
-- With `--colmap-mask-dir`, mask paths must append `.png` to the complete relative image name, e.g. `anchors/a.jpg.png`. A missing directory or zero correctly named masks stops preparation; partial mask coverage is reported. Unmasked images are not automatically excluded.
-- No synthetic mirror, floor, or wall completion is added to `final.ply`.
-- `dense/final.ply` defaults to the filtered observed point cloud. Meshing is disabled unless `--colmap-meshing` is requested; then inspection meshes and other intermediates are retained. Meshes may interpolate unobserved surfaces.
-- Finalization validates the complete PLY, stages a verified copy, and replaces `final.ply` before removing known intermediates. Invalid sources and failed promotions cannot trigger that cleanup. A full rebuild still deliberately resets outputs first.
-- Dense filtering selects the dominant density-connected observed component before any sampling. The complete profile retains all supported points in binary PLY; smaller profiles use fixed-seed uniform sampling. No synthetic surfaces or trajectory-boundary crop are used.
-- Raw `fused.ply` is retained for comparison and recovery. Other known intermediate dense PLY files are removed by default after successful finalization; set `KEEP_INTERMEDIATE_PLY=1` before running the batch to retain all of them. Unrelated PLY files are not removed.
-
-## Inputs
-
-- `images/anchors/`: renamed WiFi checkpoint photos.
-- `images/video/`: optional route-video base frames.
-- `image_list.txt`: exact image list passed to COLMAP.
-- `metadata/camera_pose_seed.csv`: PDR XY plus ordered point-photo yaw seed.
-- `metadata/wifi_fingerprint_library.csv`: WiFi fingerprint table.
-- `metadata/wifi_boundary_seed.csv`: WiFi interpolation envelope from checkpoint samples, not a route contour or room boundary.
-- `metadata/pdr_trajectory_contour.csv`: ordered PDR route centerline plus a bounded coverage corridor.
-- `metadata/wifi_localization_model.json`: KNN WiFi fingerprint localizer.
-- `metadata/wifi_signal_grid.csv`: interpolated RSSI field inside the sampled area.
-- `metadata/wifi_signal_boundary.csv`: RSSI metrics on the WiFi/PDR boundary.
-- `metadata/video_frames_manifest.csv`: optional video frames used as a weak visual base.
-- `match_pairs_route.txt`: raw P2 route-contour candidate pairs retained for inspection and ablation.
-- `match_pairs_unfiltered.txt`: combined route, visual-recovery, and fresh-RSSI candidates before selection.
-- `wifi_recovery_summary.json`: fresh-RSSI candidate counts and geometrically verified selections; these are not measured geometry improvements.
-- `match_pairs.txt`: P1-selected pairs passed to the default constrained COLMAP matcher.
-- `match_graph_edges.csv`: diagnostic weighted edge list with pair reasons, scores, and original slot counts.
-- `image_similarity_edges.csv` / `image_similarity_summary.json`: P1 visual evidence for route and recovery candidates.
-- `match_pair_filter.csv` / `match_pair_filter_summary.json`: P1 keep/drop decisions and selected-pair counts.
-{pdr_ref_line}
-
-## Outputs After Running COLMAP
-
-- `QUALITY_REPORT.md` / `quality_report.json`: sparse component counts, largest registered-image count, and dense-output availability.
-- `dense/final.ply`: final dense model to open; filtered observed point cloud is preferred, with raw point-cloud and mesh fallback only when needed.
-- `dense/final_output_summary.json`: source chosen for `final.ply` and intermediate files removed during cleanup.
-- `sparse_run_provenance.json`: input and output SHA-256 identities recorded by a completed sparse run; absence means unverified, not necessarily corrupt geometry.
-
-{alignment_note}
-"""
-    write_text(workspace_dir / "README.md", content)
-
-
+@locked_workspace("workspace_dir")
 def prepare_colmap_workspace(
     root: Path,
     reconstruction_dir: Path,
@@ -1825,7 +1836,7 @@ def prepare_colmap_workspace(
     feature_max_image_size: int = 3200,
     max_num_features: int = 20000,
     max_num_matches: int = 131072,
-    load_profile: str = "low-peak",
+    load_profile: str = "max",
     colmap_num_threads: Optional[int] = None,
     stage_cooldown_s: Optional[int] = None,
     dense_profile: str = "complete",
@@ -1844,8 +1855,18 @@ def prepare_colmap_workspace(
     image_similarity_min_visual_score: float = 0.22,
     visual_recovery_neighbors: int = 12,
     wifi_recovery_enabled: bool = True,
+    scene_completion: str = "off",
+    videoscene_max_clips: int = 3,
+    videoscene_budget_hours: float = 4.,
+    pdr_capture_mode: str = "auto",
+    image_similarity_workers: int = 0,
 ) -> Dict[str, Any]:
+    if pdr_capture_mode not in {"auto", "stationary", "off"}:
+        raise ValueError("Unknown PDR capture mode")
     matcher = matcher if matcher in {"constrained", "hybrid", "exhaustive", "sequential"} else "constrained"
+    if scene_completion == "videoscene" and not run_point_cloud_filter:
+        raise ValueError("VideoScene completion requires point-cloud filtering")
+    require_fresh_workspace(workspace_dir)
     manifest_fields, manifest_rows = read_csv(reconstruction_dir / "images_manifest.csv")
     workspace_manifest_rows = build_workspace_manifest(manifest_rows)
     camera_groups = camera_grouping_summary(workspace_manifest_rows)
@@ -1894,16 +1915,23 @@ def prepare_colmap_workspace(
         raise ValueError("No usable mask paths: expected a mask directory containing <relative-image-name>.png, for example anchors/a.jpg.png")
     active_mask_dir = resolved_mask_dir if mask_summary.get("enabled") else None
     write_image_list(workspace_dir, image_names)
-    match_pairs, match_edge_rows, match_pair_summary = build_constrained_match_pairs(
-        manifest_rows=workspace_manifest_rows,
-        point_window=constrained_point_window,
-        slot_window=constrained_slot_window,
-        max_pdr_distance_m=constrained_max_pdr_distance_m,
-        video_frame_window=constrained_video_frame_window,
-        video_anchor_point_window=constrained_video_anchor_point_window,
-        video_anchor_limit=constrained_video_anchor_limit,
-        visual_only=visual_only,
-    )
+    if visual_only:
+        # Checkpoint grouping/order is sensor-derived metadata, even when PDR
+        # distances are ignored. A visual baseline must not use those pairs.
+        match_pairs, match_edge_rows = [], []
+        match_pair_summary = {"reason_counts": {}, "visual_only": True,
+                              "candidate_basis": "appearance_retrieval_only"}
+    else:
+        match_pairs, match_edge_rows, match_pair_summary = build_constrained_match_pairs(
+            manifest_rows=workspace_manifest_rows,
+            point_window=constrained_point_window,
+            slot_window=constrained_slot_window,
+            max_pdr_distance_m=constrained_max_pdr_distance_m,
+            video_frame_window=constrained_video_frame_window,
+            video_anchor_point_window=constrained_video_anchor_point_window,
+            video_anchor_limit=constrained_video_anchor_limit,
+            visual_only=False,
+        )
     route_pair_count = len(match_pairs)
     write_named_match_pairs(workspace_dir, "match_pairs_route.txt", match_pairs)
     wifi_edges, wifi_recovery_summary = build_wifi_recovery_edges(
@@ -1920,9 +1948,12 @@ def prepare_colmap_workspace(
                 max_pairs=image_similarity_max_pairs,
                 max_image_size=image_similarity_max_image_size,
                 orb_features=image_similarity_orb_features,
+                feature_workers=image_similarity_workers,
                 min_visual_score=image_similarity_min_visual_score,
                 recovery_image_names=image_names,
                 recovery_neighbors=visual_recovery_neighbors,
+                recovery_metadata={row["image_file"]: row for row in workspace_manifest_rows},
+                wifi_recovery_enabled=wifi_recovery_enabled and not visual_only,
             )
         except Exception as exc:
             image_similarity_summary = {
@@ -2018,6 +2049,7 @@ def prepare_colmap_workspace(
         matcher=matcher,
         align_to_pdr=align_to_pdr,
         feature_max_image_size=feature_max_image_size,
+        pdr_capture_mode=pdr_capture_mode,
         max_num_features=max_num_features,
         max_num_matches=max_num_matches,
         num_threads=effective_num_threads,
@@ -2035,8 +2067,11 @@ def prepare_colmap_workspace(
         run_point_cloud_filter=run_point_cloud_filter,
         num_threads=effective_num_threads,
         stage_cooldown_s=effective_stage_cooldown_s,
+        scene_completion=scene_completion,
+        videoscene_max_clips=videoscene_max_clips,
+        videoscene_budget_hours=videoscene_budget_hours,
     )
-    write_full_batch(workspace_dir)
+    write_full_batch(workspace_dir, root=root)
     write_automatic_batch(
         root=root,
         workspace_dir=workspace_dir,
@@ -2049,17 +2084,12 @@ def prepare_colmap_workspace(
     )
     write_gui_batch(root=root, workspace_dir=workspace_dir, colmap_exe=resolved_colmap_exe)
     write_reset_batch(root, workspace_dir)
-    write_readme(
-        workspace_dir,
-        visual_only=visual_only,
-        matcher=matcher,
-        dense_profile=dense_profile,
-        load_profile=load_profile,
-        num_threads=effective_num_threads,
-        stage_cooldown_s=effective_stage_cooldown_s,
-    )
 
     summary_status = "ok" if resolved_colmap_exe.exists() else "missing_colmap_exe"
+    if missing_images:
+        summary_status = "missing_source_images"
+    elif not image_names:
+        summary_status = "no_images"
     summary = {
         "status": summary_status,
         "workspace_dir": str(workspace_dir),
@@ -2084,7 +2114,25 @@ def prepare_colmap_workspace(
         "use_gpu": use_gpu,
         "matcher": matcher,
         "visual_only": visual_only,
-        "pdr_alignment_enabled": align_to_pdr,
+        "pdr_alignment_enabled": align_to_pdr and pdr_capture_mode != "off",
+        "pdr_capture_mode": pdr_capture_mode,
+        "pdr_alignment_policy": "weighted_stationary_checkpoint_consensus_and_held_out_validation",
+        "pdr_alignment_decision": "pdr_alignment_decision.json",
+        "wifi_recovery_enabled": wifi_recovery_enabled and not visual_only and run_image_similarity,
+        "visual_pairing_mode": "appearance_only" if visual_only else "appearance_plus_route",
+        "image_similarity_config": {
+            "enabled": run_image_similarity, "max_pairs": image_similarity_max_pairs,
+            "max_image_size": image_similarity_max_image_size, "orb_features": image_similarity_orb_features,
+            "feature_workers": image_similarity_workers,
+            "min_visual_score": image_similarity_min_visual_score, "recovery_neighbors": visual_recovery_neighbors,
+        },
+        "constrained_pairing_config": {
+            "point_window": constrained_point_window, "slot_window": constrained_slot_window,
+            "max_pdr_distance_m": constrained_max_pdr_distance_m,
+            "video_frame_window": constrained_video_frame_window,
+            "video_anchor_point_window": constrained_video_anchor_point_window,
+            "video_anchor_limit": constrained_video_anchor_limit,
+        },
         "feature_max_image_size": feature_max_image_size,
         "max_num_features": max_num_features,
         "max_num_matches": max_num_matches,
@@ -2103,15 +2151,19 @@ def prepare_colmap_workspace(
         "dense_profile_config": profile_config,
         "run_meshing": effective_run_meshing,
         "run_point_cloud_filter": run_point_cloud_filter,
+        "scene_completion": scene_completion,
+        "videoscene_max_clips": videoscene_max_clips,
+        "videoscene_budget_hours": videoscene_budget_hours,
         "cleanup_intermediate_ply": bool(profile_config.get("cleanup_intermediate_ply", True)) and not effective_run_meshing,
         "cleanup_runtime_override": "KEEP_INTERMEDIATE_PLY=1 retains intermediate PLY files",
         "requested_run_meshing": run_meshing,
         "sparse_model_selection": (
-            "run_colmap_dense.bat prefers sparse_pdr_aligned/0 when it exists, otherwise it uses sparse/0."
+            "Select the valid sparse component with the most registered images (then sparse points); use sparse_pdr_aligned/0 only when authenticated to that component."
         ),
         "scripts": [
             "run_colmap_sparse.bat",
             "run_colmap_dense.bat",
+            "run_colmap_dense_high.bat",
             "run_colmap_full.bat",
             "run_colmap_automatic.bat",
             "open_colmap_gui.bat",

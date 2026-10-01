@@ -2,18 +2,29 @@
 
 from __future__ import annotations
 
-import bisect
 import csv
+import hashlib
+import io
 import json
+import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from wifi_observations import MAX_WIFI_AGE_MS, MISSING_RSSI, WIFI_QUALITY_FIELDS, measurement_gap_ms
+from wifi_observations import (
+    MAX_WIFI_AGE_MS, MISSING_RSSI, WIFI_QUALITY_FIELDS, WIFI_ASSOCIATION_FIELDS,
+    finite_number, measurement_gap_ms, valid_fingerprint,
+    aggregate_checkpoint_fingerprints, fingerprint_confidence,
+)
 
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+PDR_BINDING_FIELDS = [
+    "pdr_x", "pdr_y", "pdr_interp_status", "pdr_interp_gap_ms",
+    "pdr_left_type", "pdr_right_type", "trajectory_contour_id",
+    "trajectory_contour_distance_m", "trajectory_distance_m", "trajectory_interp_status",
+]
 
 
 @dataclass
@@ -24,6 +35,7 @@ class WifiPoint:
     event: str
     elapsed_ts: int
     epoch_ts: int
+    stationary_end_elapsed_ts: Optional[int] = None
 
 
 def parse_tab_json(path: Path) -> Iterable[Tuple[int, int, Any]]:
@@ -94,12 +106,18 @@ def read_wifi_points(session_dirs: Sequence[Path], point_event: str) -> List[Wif
     global_point_index = 0
     for session_dir in session_dirs:
         point_index = 0
-        for elapsed_ts, epoch_ts, payload in parse_tab_json(session_dir / "movements.dat"):
+        events = list(parse_tab_json(session_dir / "movements.dat"))
+        for event_pos, (elapsed_ts, epoch_ts, payload) in enumerate(events):
             event = str(payload)
             if event != point_event:
                 continue
             point_index += 1
             global_point_index += 1
+            stationary_end = None
+            if event == "CHECKPOINT_PAUSE" and event_pos + 1 < len(events):
+                next_ts, _, next_event = events[event_pos + 1]
+                if next_event == "RESTART" and next_ts > elapsed_ts:
+                    stationary_end = next_ts
             points.append(
                 WifiPoint(
                     session=session_dir.name,
@@ -108,6 +126,7 @@ def read_wifi_points(session_dirs: Sequence[Path], point_event: str) -> List[Wif
                     event=event,
                     elapsed_ts=elapsed_ts,
                     epoch_ts=epoch_ts,
+                    stationary_end_elapsed_ts=stationary_end,
                 )
             )
     return points
@@ -134,22 +153,58 @@ def read_feature_rows(path: Path) -> Tuple[List[str], Dict[str, List[Dict[str, A
     return fieldnames, rows_by_session
 
 
-def nearest_feature_row(
-    rows: Sequence[Dict[str, Any]],
-    target_elapsed_ts: int,
-) -> Tuple[Optional[Dict[str, Any]], str]:
-    if not rows:
-        return None, ""
+def group_checkpoint_images(
+    images: Sequence[Path], points: Sequence[WifiPoint], images_per_point: int,
+    mapping_path: Optional[Path] = None,
+    *, mode: str = "fuzzy", tolerance: Optional[int] = None,
+) -> Tuple[List[List[Path]], List[Path], Dict[str, Any]]:
+    """Bind explicit filenames without shifting later stops when a photo is absent.
 
-    elapsed_values = [int(row["_elapsed_ts_int"]) for row in rows]
-    pos = bisect.bisect_left(elapsed_values, target_elapsed_ts)
-    candidate_indices = []
-    if pos < len(rows):
-        candidate_indices.append(pos)
-    if pos > 0:
-        candidate_indices.append(pos - 1)
-    best_idx = min(candidate_indices, key=lambda idx: abs(elapsed_values[idx] - target_elapsed_ts))
-    return rows[best_idx], str(abs(elapsed_values[best_idx] - target_elapsed_ts))
+    CSV order defines the view order within each stop; omitted images remain
+    visual-only. Sensor/photo clock synchronization is deliberately unnecessary.
+    """
+    if mode not in {"fuzzy", "fixed"} or images_per_point <= 0:
+        raise ValueError("Photo grouping requires fuzzy/fixed mode and a positive reference count")
+    if tolerance is not None and not 0 <= tolerance < images_per_point:
+        raise ValueError("Photo group tolerance must be nonnegative and smaller than the reference count")
+    if mapping_path is None and mode == "fuzzy":
+        from photo_grouping import fuzzy_checkpoint_groups
+        return fuzzy_checkpoint_groups(images, len(points), images_per_point, tolerance)
+    if mapping_path is None:
+        return ([list(images[i * images_per_point:(i + 1) * images_per_point])
+                 for i in range(len(points))], list(images[len(points) * images_per_point:]),
+                {"method": "fixed_count", "source": None})
+    data = mapping_path.read_bytes()
+    reader = csv.DictReader(io.StringIO(data.decode("utf-8-sig"), newline=""))
+    required = {"session", "point_index", "image_name"}
+    if not required.issubset(reader.fieldnames or []):
+        raise ValueError(f"Photo checkpoint map requires columns {sorted(required)}: {mapping_path}")
+    point_indices = {(point.session, point.point_index): i for i, point in enumerate(points)}
+    image_by_name = {image.name.casefold(): image for image in images}
+    if len(point_indices) != len(points) or len(image_by_name) != len(images):
+        raise ValueError("Ambiguous checkpoint keys or case-insensitive photo names")
+    groups: List[List[Path]] = [[] for _ in points]
+    used: set[str] = set()
+    for line, row in enumerate(reader, start=2):
+        try:
+            key = (row["session"].strip(), int(row["point_index"]))
+            name = row["image_name"].strip().casefold()
+            if key not in point_indices:
+                raise ValueError(f"unknown checkpoint {key}")
+            if name not in image_by_name:
+                raise ValueError(f"photo not found in capture folder: {row['image_name']!r}")
+            if name in used:
+                raise ValueError(f"photo assigned more than once: {row['image_name']!r}")
+        except (TypeError, AttributeError, ValueError) as exc:
+            raise ValueError(f"Invalid photo checkpoint map {mapping_path}, row {line}: {exc}") from exc
+        groups[point_indices[key]].append(image_by_name[name])
+        used.add(name)
+    if not used:
+        raise ValueError(f"Photo checkpoint map has no assignments: {mapping_path}")
+    return groups, [image for image in images if image.name.casefold() not in used], {
+        "method": "explicit_photo_map", "source": str(mapping_path.resolve()),
+        "sha256": hashlib.sha256(data).hexdigest(),
+    }
 
 
 def relative_path(path: Path, root: Path) -> str:
@@ -167,6 +222,26 @@ def nearest_fresh_fingerprint(
     return (best, str(int(gap))) if gap <= MAX_WIFI_AGE_MS else (None, "")
 
 
+def checkpoint_fingerprint(
+    rows: Sequence[Dict[str, Any]], point: WifiPoint,
+) -> Tuple[Optional[Dict[str, Any]], str, str]:
+    """Prefer measurements inside a documented stay at this checkpoint.
+
+    All AP measurements must fall before RESTART; a cached scan from the
+    approach or a scan after departure cannot establish a stationary binding.
+    Photo capture times are intentionally not part of this association.
+    """
+    if point.stationary_end_elapsed_ts is not None:
+        stationary = [row for row in rows if valid_fingerprint(row)
+                      and point.elapsed_ts <= finite_number(row.get("wifi_measurement_min_elapsed_ts"))
+                      and finite_number(row.get("wifi_measurement_max_elapsed_ts")) < point.stationary_end_elapsed_ts]
+        if stationary:
+            best = min(stationary, key=lambda row: measurement_gap_ms(row, point.elapsed_ts))
+            return best, str(int(measurement_gap_ms(best, point.elapsed_ts))), "documented_checkpoint_stay"
+    best, gap = nearest_fresh_fingerprint(rows, point.elapsed_ts)
+    return best, gap, "near_checkpoint_measurement" if best is not None else "unavailable"
+
+
 def mapping_status(feature_row: Optional[Dict[str, Any]], missing_slots: int) -> str:
     parts: List[str] = []
     if feature_row is None:
@@ -176,6 +251,33 @@ def mapping_status(feature_row: Optional[Dict[str, Any]], missing_slots: int) ->
     return ";".join(parts) if parts else "ok"
 
 
+def read_checkpoint_pdr(path: Path) -> Dict[Tuple[str, int, str], Dict[str, Any]]:
+    """Read event positions produced by build_pdr_tables, independent of WiFi scans."""
+    positions: Dict[Tuple[str, int, str], Dict[str, Any]] = {}
+    if not path.exists():
+        return positions
+    with path.open("r", newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            try:
+                elapsed_ts = int(row["elapsed_ts"])
+                x, y = float(row["pdr_x"]), float(row["pdr_y"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not row.get("session") or not all(math.isfinite(value) for value in (x, y)):
+                continue
+            event = row.get("source_point_type", row.get("point_type", ""))
+            positions[(row["session"], elapsed_ts, event)] = {
+                "pdr_x": x, "pdr_y": y,
+                "pdr_interp_status": "exact_checkpoint", "pdr_interp_gap_ms": 0,
+                "pdr_left_type": event, "pdr_right_type": event,
+                "trajectory_contour_id": row.get("contour_id", ""),
+                "trajectory_contour_distance_m": row.get("contour_distance_m", ""),
+                "trajectory_distance_m": row.get("trajectory_distance_m", ""),
+                "trajectory_interp_status": "exact_checkpoint" if row.get("contour_id") else "contour_unavailable",
+            }
+    return positions
+
+
 def build_image_wifi_tables(
     root: Path,
     session_dirs: Sequence[Path],
@@ -183,6 +285,9 @@ def build_image_wifi_tables(
     pic_dir: Path,
     images_per_point: int,
     point_event: str,
+    photo_checkpoint_map: Optional[Path] = None,
+    photo_grouping: str = "fuzzy",
+    photo_group_tolerance: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Create image-to-WiFi mapping tables from ordered photos and checkpoint events."""
     if images_per_point <= 0:
@@ -191,17 +296,29 @@ def build_image_wifi_tables(
     resolved_pic_dir = pic_dir if pic_dir.is_absolute() else root / pic_dir
     images = find_image_files(resolved_pic_dir)
     points = read_wifi_points(session_dirs, point_event)
+    mapping_path = root / photo_checkpoint_map if photo_checkpoint_map is not None else None
+    groups, unassigned_images, grouping = group_checkpoint_images(
+        images, points, images_per_point, mapping_path, mode=photo_grouping, tolerance=photo_group_tolerance)
+    variable_groups = grouping["method"] != "fixed_count"
+    group_sizes = [len(group) if variable_groups else images_per_point for group in groups]
 
     feature_path = output_dir / "wifi_pdr_features.csv"
     if not feature_path.exists():
         feature_path = output_dir / "wifi_wide_selected.csv"
     feature_fields, features_by_session = read_feature_rows(feature_path)
+    aggregated, aggregation_summary = aggregate_checkpoint_fingerprints(output_dir / "wifi_long.csv", points)
+    feature_fields += sorted({field for row in aggregated.values() for field in row
+                              if field.startswith("ap_") and field not in feature_fields})
     copied_feature_fields = [
         field
         for field in feature_fields
-        if field not in {"session", "scan_index", "elapsed_ts", "epoch_ts"}
+        if field not in {"session", "scan_index", "elapsed_ts", "epoch_ts", "wifi_gap_ms", *WIFI_ASSOCIATION_FIELDS}
     ]
     copied_feature_fields += [field for field in WIFI_QUALITY_FIELDS if field not in copied_feature_fields]
+    copied_feature_fields += [field for field in PDR_BINDING_FIELDS if field not in copied_feature_fields]
+    contour_path = output_dir / "pdr_trajectory_contour.csv"
+    pdr_path = contour_path if contour_path.exists() else output_dir / "pdr_path.csv"
+    checkpoint_positions = read_checkpoint_pdr(pdr_path)
 
     long_base_fields = [
         "session",
@@ -220,6 +337,10 @@ def build_image_wifi_tables(
         "wifi_gap_ms",
         "mapping_status",
         "pdr_reference_elapsed_ts",
+        "image_association_basis",
+        "image_group_size",
+        "image_grouping_method",
+        *WIFI_ASSOCIATION_FIELDS,
     ]
     point_base_fields = [
         "session",
@@ -234,34 +355,42 @@ def build_image_wifi_tables(
         "wifi_gap_ms",
         "mapping_status",
         "pdr_reference_elapsed_ts",
+        "image_association_basis",
+        "image_group_size",
+        "image_grouping_method",
+        *WIFI_ASSOCIATION_FIELDS,
     ]
     image_fields: List[str] = []
-    for slot in range(1, images_per_point + 1):
+    for slot in range(1, max(group_sizes, default=0) + 1):
         image_fields.extend([f"image_{slot}", f"image_{slot}_path", f"image_{slot}_number"])
 
     long_rows: List[Dict[str, Any]] = []
     point_rows: List[Dict[str, Any]] = []
     mapped_image_count = 0
     complete_point_count = 0
+    strict_fresh_checkpoint_count = 0
 
     for point_pos, point in enumerate(points):
-        start = point_pos * images_per_point
-        group_images = images[start : start + images_per_point]
-        missing_slots = images_per_point - len(group_images)
-        if missing_slots == 0:
+        group_images = groups[point_pos]
+        group_size = group_sizes[point_pos]
+        missing_slots = group_size - len(group_images)
+        if missing_slots == 0 and group_images:
             complete_point_count += 1
 
-        # Route interpolation and RF validity are independent. Missing WiFi must
-        # not discard the checkpoint's photos or its nearest IMU/PDR state.
-        route_row, _route_gap_ms = nearest_feature_row(
+        # Every capture event has its own PDR path row. A nearby WiFi logger
+        # timestamp can be on a different step, or absent for an entire session.
+        pdr_state = checkpoint_positions.get((point.session, point.elapsed_ts, point.event))
+        feature_row, wifi_gap_ms, wifi_basis = checkpoint_fingerprint(
             features_by_session.get(point.session, []),
-            point.elapsed_ts,
+            point,
         )
-        feature_row, wifi_gap_ms = nearest_fresh_fingerprint(
-            features_by_session.get(point.session, []),
-            point.elapsed_ts,
-        )
-        status = mapping_status(feature_row, missing_slots)
+        strict_fresh_checkpoint_count += feature_row is not None
+        aggregate = aggregated.get(point.global_point_index)
+        if aggregate is not None and fingerprint_confidence(aggregate) > 0:
+            feature_row = aggregate
+            wifi_gap_ms = str(aggregate["wifi_gap_ms"])
+            wifi_basis = aggregate["wifi_association_basis"]
+        status = mapping_status(feature_row, missing_slots or not group_images)
 
         row_common: Dict[str, Any] = {
             "session": point.session,
@@ -275,23 +404,30 @@ def build_image_wifi_tables(
             "wifi_epoch_ts": "" if feature_row is None else feature_row.get("epoch_ts", ""),
             "wifi_gap_ms": wifi_gap_ms,
             "mapping_status": status,
-            "pdr_reference_elapsed_ts": "" if route_row is None else route_row.get("elapsed_ts", ""),
+            "pdr_reference_elapsed_ts": point.elapsed_ts if pdr_state is not None else "",
+            "image_association_basis": "ordered_checkpoint_same_location",
+            "image_group_size": group_size,
+            "image_grouping_method": grouping["method"],
+            "wifi_association_basis": wifi_basis,
+            "wifi_stationary_start_elapsed_ts": point.elapsed_ts if wifi_basis in {"documented_checkpoint_stay", "aggregated_stationary"} else "",
+            "wifi_stationary_end_elapsed_ts": point.stationary_end_elapsed_ts if wifi_basis in {"documented_checkpoint_stay", "aggregated_stationary"} else "",
         }
-        if route_row is not None:
-            for field in copied_feature_fields:
-                row_common[field] = route_row.get(field, "")
         for field in copied_feature_fields:
-            if field.startswith("ap_") or field in WIFI_QUALITY_FIELDS:
-                row_common[field] = (
-                    feature_row.get(field, "") if feature_row is not None
-                    else MISSING_RSSI if field.startswith("ap_") else ""
-                )
+            row_common[field] = feature_row.get(field, "") if feature_row is not None else ""
+        for field in PDR_BINDING_FIELDS:
+            row_common[field] = pdr_state.get(field, "") if pdr_state is not None else ""
+        if pdr_state is None:
+            row_common["pdr_interp_status"] = "checkpoint_pdr_unavailable"
+            row_common["trajectory_interp_status"] = "contour_unavailable"
         if feature_row is None:
+            for field in copied_feature_fields:
+                if field.startswith("ap_"):
+                    row_common[field] = MISSING_RSSI
             row_common["wifi_observation_status"] = "no_fresh_checkpoint_observation"
             row_common["wifi_fresh_ap_count"] = 0
 
         point_row = dict(row_common)
-        for slot in range(1, images_per_point + 1):
+        for slot in range(1, group_size + 1):
             image = group_images[slot - 1] if slot <= len(group_images) else None
             point_row[f"image_{slot}"] = "" if image is None else image.name
             point_row[f"image_{slot}_path"] = "" if image is None else relative_path(image, root)
@@ -311,10 +447,9 @@ def build_image_wifi_tables(
                 mapped_image_count += 1
         point_rows.append(point_row)
 
-    expected_image_count = len(points) * images_per_point
-    unassigned_images = images[expected_image_count:]
+    expected_image_count = sum(group_sizes)
     unassigned_image_count = len(unassigned_images)
-    missing_image_count = max(0, expected_image_count - len(images))
+    missing_image_count = expected_image_count - mapped_image_count
     unassigned_rows = [
         {
             "image_name": image.name,
@@ -357,7 +492,11 @@ def build_image_wifi_tables(
         "status": status,
         "pic_dir": str(resolved_pic_dir),
         "point_event": point_event,
-        "images_per_wifi_point": images_per_point,
+        "images_per_wifi_point": None if variable_groups else images_per_point,
+        "reference_images_per_wifi_point": images_per_point,
+        "photo_grouping": grouping,
+        "group_image_counts": [len(group) for group in groups],
+        "points_without_images": sum(not group for group in groups),
         "wifi_point_count": len(points),
         "complete_point_count": complete_point_count,
         "image_count": len(images),
@@ -367,9 +506,18 @@ def build_image_wifi_tables(
         "unassigned_image_count": unassigned_image_count,
         "feature_source": str(feature_path.name),
         "fresh_wifi_point_count": sum(row.get("wifi_observation_status") == "fresh" for row in point_rows),
-        "wifi_association_max_gap_ms": MAX_WIFI_AGE_MS,
-        "wifi_association_basis": "every_ap_measurement_timestamp_not_logger_timestamp",
-        "pdr_position_basis": "nearest_logger_timestamp_independent_of_wifi_validity",
+        "usable_wifi_point_count": sum(fingerprint_confidence(row) > 0 for row in point_rows),
+        "strict_fresh_checkpoint_count": strict_fresh_checkpoint_count,
+        "wifi_aggregation": aggregation_summary,
+        "image_association_basis": "ordered_checkpoint_same_location",
+        "image_capture_time_required": False,
+        "wifi_measurement_max_age_ms": MAX_WIFI_AGE_MS,
+        "wifi_near_checkpoint_max_gap_ms": MAX_WIFI_AGE_MS,
+        "wifi_association_basis": "weighted_checkpoint_aggregation_with_strict_scan_fallback",
+        "wifi_stationary_point_count": sum(row.get("wifi_association_basis") == "documented_checkpoint_stay" for row in point_rows),
+        "pdr_position_basis": "exact_checkpoint_timestamp_independent_of_wifi_scans",
+        "pdr_source": pdr_path.name,
+        "pdr_checkpoint_count": sum(row.get("pdr_interp_status") == "exact_checkpoint" for row in point_rows),
         "outputs": {
             "long": "image_wifi_long.csv",
             "points": "image_wifi_points.csv",

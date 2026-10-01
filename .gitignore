@@ -33,6 +33,11 @@ paper_texts/
 colmap-x64-windows-cuda/
 colmap/
 
+# Local video diffusion checkout, environments, and model weights
+/FlashVSR/
+/VideoScene/
+.pipeline.lock
+
 # COLMAP reconstruction artifacts
 database.db
 sparse/
@@ -53,3 +58,4 @@ venv/
 Thumbs.db
 .vscode/
 ablation_runs/
+experiments/

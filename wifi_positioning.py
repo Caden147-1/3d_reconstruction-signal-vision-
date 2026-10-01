@@ -9,14 +9,10 @@ import statistics
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from wifi_observations import valid_fingerprint
+from wifi_observations import fingerprint_confidence
 
 
 FILL_RSSI = -110.0
-
-
-def normalize_mac(mac: str) -> str:
-    return "".join(ch for ch in mac.upper() if ch.isalnum())
 
 
 def safe_float(value: Any, default: float = math.nan) -> float:
@@ -65,7 +61,8 @@ def load_fingerprints(path: Path) -> Tuple[List[str], List[Dict[str, Any]]]:
     for row in rows:
         x = safe_float(row.get("pdr_x"))
         y = safe_float(row.get("pdr_y"))
-        if not math.isfinite(x) or not math.isfinite(y) or not valid_fingerprint(row):
+        confidence = fingerprint_confidence(row)
+        if not math.isfinite(x) or not math.isfinite(y) or confidence <= 0:
             continue
         vector = parse_vector(row, ap_fields)
         fingerprints.append(
@@ -77,6 +74,7 @@ def load_fingerprints(path: Path) -> Tuple[List[str], List[Dict[str, Any]]]:
                 "pdr_y": y,
                 "wifi_scan_index": row.get("wifi_scan_index", ""),
                 "wifi_gap_ms": row.get("wifi_gap_ms", ""),
+                "wifi_confidence": confidence,
                 "vector": vector,
             }
         )
@@ -138,10 +136,11 @@ def estimate_position(
                 "pdr_x": fp["pdr_x"],
                 "pdr_y": fp["pdr_y"],
                 "rssi_distance": distance,
+                "wifi_confidence": fp.get("wifi_confidence", 1.0),
             }
         )
 
-    neighbors.sort(key=lambda row: row["rssi_distance"])
+    neighbors.sort(key=lambda row: row["rssi_distance"] / max(row["wifi_confidence"], 1e-6))
     top = neighbors[: max(1, min(k, len(neighbors)))]
     if not top:
         return {
@@ -154,24 +153,25 @@ def estimate_position(
 
     zero_distance_neighbors = [row for row in neighbors if row["rssi_distance"] <= 1e-9]
     if zero_distance_neighbors:
-        exact_x = sum(row["pdr_x"] for row in zero_distance_neighbors) / len(zero_distance_neighbors)
-        exact_y = sum(row["pdr_y"] for row in zero_distance_neighbors) / len(zero_distance_neighbors)
+        confidence_sum = sum(row["wifi_confidence"] for row in zero_distance_neighbors)
+        exact_x = sum(row["pdr_x"] * row["wifi_confidence"] for row in zero_distance_neighbors) / confidence_sum
+        exact_y = sum(row["pdr_y"] * row["wifi_confidence"] for row in zero_distance_neighbors) / confidence_sum
         return {
             "status": "ok",
             "estimated_x": exact_x,
             "estimated_y": exact_y,
             "known_ap_count": len(usable_fields),
             "best_distance": 0.0,
-            "confidence": round(1.0 / len(zero_distance_neighbors), 6),
+            "confidence": round(max(row["wifi_confidence"] for row in zero_distance_neighbors) / len(zero_distance_neighbors), 6),
             "ambiguity_count": len(zero_distance_neighbors),
             "neighbors": top,
         }
 
-    weights = [1.0 / max(row["rssi_distance"], 1e-6) for row in top]
+    weights = [row["wifi_confidence"] / max(row["rssi_distance"], 1e-6) for row in top]
     weight_sum = sum(weights)
     x = sum(weight * row["pdr_x"] for weight, row in zip(weights, top)) / weight_sum
     y = sum(weight * row["pdr_y"] for weight, row in zip(weights, top)) / weight_sum
-    confidence = weights[0] / weight_sum if weight_sum else 0.0
+    confidence = weights[0] / weight_sum * top[0]["wifi_confidence"] if weight_sum else 0.0
     return {
         "status": "ok",
         "estimated_x": x,
@@ -182,47 +182,6 @@ def estimate_position(
         "ambiguity_count": 1,
         "neighbors": top,
     }
-
-
-def scan_payload_to_vector(payload: Any, ap_fields: Sequence[str]) -> Tuple[Dict[str, float], List[str], List[str]]:
-    vector = {field: FILL_RSSI for field in ap_fields}
-    known_fields: List[str] = []
-    unknown_macs: List[str] = []
-    if not isinstance(payload, list):
-        return vector, known_fields, unknown_macs
-
-    field_set = set(ap_fields)
-    for entry in payload:
-        if not isinstance(entry, dict):
-            continue
-        mac = normalize_mac(str(entry.get("mac", "")))
-        if not mac:
-            continue
-        field = f"ap_{mac}"
-        rssi = safe_float(entry.get("dbm", entry.get("rssi")), FILL_RSSI)
-        if field in field_set:
-            vector[field] = max(vector.get(field, FILL_RSSI), rssi)
-            if field not in known_fields:
-                known_fields.append(field)
-        else:
-            unknown_macs.append(mac)
-    return vector, known_fields, unknown_macs
-
-
-def parse_scan_json(path: Path, ap_fields: Sequence[str]) -> Tuple[Dict[str, float], List[str], List[str]]:
-    with path.open("r", encoding="utf-8") as handle:
-        payload = json.load(handle)
-    return scan_payload_to_vector(payload, ap_fields)
-
-
-def parse_scan_csv(path: Path, ap_fields: Sequence[str]) -> Tuple[Dict[str, float], List[str], List[str]]:
-    fields, rows = read_csv(path)
-    payload = []
-    for row in rows:
-        mac = row.get("mac") or row.get("bssid") or row.get("BSSID")
-        rssi = row.get("dbm") or row.get("rssi") or row.get("RSSI")
-        payload.append({"mac": mac, "dbm": rssi})
-    return scan_payload_to_vector(payload, ap_fields)
 
 
 def leave_one_out_evaluation(
@@ -291,6 +250,7 @@ def convex_hull(points: Sequence[Tuple[float, float]]) -> List[Tuple[float, floa
 
 
 def point_in_polygon(x: float, y: float, polygon: Sequence[Tuple[float, float]]) -> bool:
+    """Use a half-open horizontal ray test, independent of vertex order."""
     if len(polygon) < 3:
         return False
     inside = False
@@ -298,8 +258,10 @@ def point_in_polygon(x: float, y: float, polygon: Sequence[Tuple[float, float]])
     for i, point_i in enumerate(polygon):
         xi, yi = point_i
         xj, yj = polygon[j]
+        # A crossing edge has a nonzero vertical span. Preserve its sign:
+        # clamping a descending edge to epsilon changes the intersection.
         intersects = ((yi > y) != (yj > y)) and (
-            x < (xj - xi) * (y - yi) / max(yj - yi, 1e-12) + xi
+            x < (xj - xi) * (y - yi) / (yj - yi) + xi
         )
         if intersects:
             inside = not inside
@@ -462,7 +424,7 @@ def run_wifi_positioning_pipeline(
             (output_dir / filename).unlink(missing_ok=True)
         summary = {
             "status": "no_valid_fingerprints" if fingerprint_path.exists() else "missing_input",
-            "explanation": "Only fresh, timestamp-validated checkpoint fingerprints are usable; stale generated localization outputs were removed.",
+            "explanation": "No usable fresh or confidence-weighted checkpoint fingerprints; stale generated localization outputs were removed.",
             "fingerprint_path": str(fingerprint_path),
             "ap_count": len(ap_fields),
             "fingerprint_count": len(fingerprints),
@@ -542,6 +504,7 @@ def run_wifi_positioning_pipeline(
                 "pdr_x": fp["pdr_x"],
                 "pdr_y": fp["pdr_y"],
                 "wifi_scan_index": fp["wifi_scan_index"],
+                "wifi_confidence": fp.get("wifi_confidence", 1.0),
                 "vector": fp["vector"],
             }
             for fp in fingerprints

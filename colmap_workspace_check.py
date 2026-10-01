@@ -15,14 +15,19 @@ import json
 import math
 import sqlite3
 import struct
+import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence, Set
+from typing import Any, Callable, Dict, Iterable, List, Sequence, Set
 
 
 PROVENANCE_NAME = "sparse_run_provenance.json"
 PENDING_NAME = "sparse_run_inputs.json"
+ALIGNMENT_RECORD = "pdr_alignment_decision.json"
 SPARSE_RUNNERS = {"run_colmap_sparse.bat", "run_colmap_automatic.bat"}
+REQUIRED_MODEL_FILES = ("cameras", "images", "points3D")
+OPTIONAL_MODEL_FILES = ("frames", "rigs")
+FileIdentityReader = Callable[[Path], Dict[str, Any] | None]
 
 
 def file_identity(path: Path) -> Dict[str, Any] | None:
@@ -78,6 +83,13 @@ def sparse_input_identity(workspace: Path, runner: str) -> Dict[str, Any]:
 
 def sparse_output_identity(workspace: Path) -> Dict[str, Any]:
     files = {name: file_identity(workspace / name) for name in ("database.db", "database.db-wal")}
+    # SQLite readers may leave a zero-byte WAL without changing the database.
+    # Only an empty WAL is equivalent to no WAL; any content remains hashed.
+    if files["database.db-wal"] is not None and files["database.db-wal"]["size"] == 0:
+        files["database.db-wal"] = None
+    for name in (ALIGNMENT_RECORD, "pdr_alignment_reviewed_refs.txt"):
+        if (workspace / name).exists():
+            files[name] = file_identity(workspace / name)
     for folder in ("sparse", "sparse_pdr_aligned", "sparse_pose_prior"):
         base = workspace / folder
         if base.is_dir():
@@ -101,11 +113,20 @@ def inspect_provenance(workspace: Path) -> Dict[str, Any]:
         current_inputs = sparse_input_identity(workspace, recorded["inputs"]["runner"])
         if current_inputs != recorded["inputs"]:
             return {"status": "input_mismatch", "error": "Image bytes, masks, matching pairs, pose references, manifest or sparse runner changed."}
-        if sparse_output_identity(workspace) != recorded["outputs"]:
+        current_outputs = sparse_output_identity(workspace)
+        # The receipt authenticates all model bytes. Its selected path records
+        # the old policy; changing that policy does not invalidate unchanged SfM.
+        recorded_files = dict(recorded["outputs"]["files"])
+        wal = recorded_files.get("database.db-wal")
+        if wal is not None and wal.get("size") == 0:
+            recorded_files["database.db-wal"] = None
+        if current_outputs["files"] != recorded_files:
             return {"status": "output_mismatch", "error": "The sparse model or database no longer matches the recorded run."}
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
         return {"status": "invalid_record", "error": str(exc)}
-    return {"status": "verified", "error": "", "record": str(receipt)}
+    return {"status": "verified", "error": "", "record": str(receipt),
+            "dense_input": current_outputs["dense_input"],
+            "selection_changed": current_outputs["dense_input"] != recorded["outputs"].get("dense_input")}
 
 
 def write_provenance(path: Path, payload: Dict[str, Any]) -> None:
@@ -172,7 +193,7 @@ def read_database_names(path: Path) -> tuple[Set[str], str]:
     if not path.exists():
         return set(), ""
     try:
-        connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+        connection = open_readonly_database(path)
         try:
             rows = connection.execute("SELECT name FROM images").fetchall()
         finally:
@@ -180,6 +201,16 @@ def read_database_names(path: Path) -> tuple[Set[str], str]:
     except sqlite3.Error as exc:
         return set(), str(exc)
     return {normalize_name(str(row[0])) for row in rows}, ""
+
+
+def open_readonly_database(path: Path):
+    """Avoid touching WAL sidecars when inspecting a checkpointed database."""
+    path = Path(path).resolve()
+    wal = Path(str(path) + "-wal")
+    # Nonempty WAL data must be read through SQLite's WAL reader. With no
+    # pending pages, immutable mode avoids creating/touching empty sidecars.
+    options = "?mode=ro" if wal.exists() and wal.stat().st_size else "?mode=ro&immutable=1"
+    return sqlite3.connect(path.as_uri() + options, uri=True)
 
 
 def read_exact(handle: Any, size: int) -> bytes:
@@ -257,16 +288,81 @@ def read_text_image_names(path: Path, camera_ids: Set[int] | None = None) -> Set
     return names
 
 
-def model_has_images(model_dir: Path) -> bool:
-    return (model_dir / "images.bin").exists() or (model_dir / "images.txt").exists()
+def primary_sparse_model(workspace: Path) -> Path | None:
+    """Choose a complete component by image count, point count, then folder name."""
+    sparse = workspace / "sparse"
+    if not sparse.is_dir():
+        return None
+    selected = None
+    best_rank = (0, 0)
+    for model in sorted(sparse.iterdir(), key=lambda path: path.name):
+        if not model.is_dir():
+            continue
+        try:
+            checked = inspect_sparse_model(model)
+        except (OSError, ValueError, struct.error):
+            continue
+        rank = (len(checked["names"]), checked["point_count"])
+        # Iteration order preserves the first folder when both counts tie.
+        if rank > best_rank:
+            selected, best_rank = model, rank
+    return selected
 
 
 def dense_input_model(workspace: Path) -> Path | None:
     aligned = workspace / "sparse_pdr_aligned" / "0"
-    if (aligned / "cameras.bin").exists() or (aligned / "cameras.txt").exists():
+    if verified_aligned_model(workspace):
         return aligned
-    raw = workspace / "sparse" / "0"
-    return raw if raw.exists() else None
+    return primary_sparse_model(workspace)
+
+
+def sparse_model_identity(
+    model: Path, *, identify: FileIdentityReader = file_identity,
+) -> Dict[str, Any]:
+    """Hash required and optional model files, optionally through a read snapshot."""
+    suffix = ".bin" if (model / "cameras.bin").is_file() else ".txt"
+    identities = {}
+    for stem in (*REQUIRED_MODEL_FILES, *OPTIONAL_MODEL_FILES):
+        identity = identify(model / (stem + suffix))
+        if identity is None and stem in REQUIRED_MODEL_FILES:
+            raise ValueError(f"Incomplete sparse model: {model}")
+        if identity is not None:
+            identities[stem + suffix] = identity
+    return identities
+
+
+def verified_aligned_model(workspace: Path) -> bool:
+    """Select only authenticated alignments of the current primary component."""
+    aligned = workspace / "sparse_pdr_aligned" / "0"
+    if not aligned.is_dir():
+        return False
+    try:
+        raw = primary_sparse_model(workspace)
+        if raw is None or inspect_sparse_model(aligned)["names"] != inspect_sparse_model(raw)["names"]:
+            return False
+        identity = sparse_model_identity(aligned)
+        decision = workspace / ALIGNMENT_RECORD
+        if decision.exists():
+            receipt = json.loads(decision.read_text(encoding="utf-8"))
+            return (receipt.get("schema_version") == 1 and receipt.get("status") == "aligned"
+                    and receipt.get("aligned_model_identity") == identity
+                    and receipt.get("source_model", raw.relative_to(workspace).as_posix()) == raw.relative_to(workspace).as_posix()
+                    and receipt.get("source_model_identity") == sparse_model_identity(raw)
+                    and receipt.get("manifest_identity") == file_identity(workspace / "metadata/images_manifest.csv")
+                    and receipt.get("reviewed_refs_identity") == file_identity(workspace / "pdr_alignment_reviewed_refs.txt"))
+        # Old completed runs predate alignment receipts. Their recorded model
+        # bytes and selected path preserve the coordinate frame of existing data.
+        # A fresh/unfinished run can never use this compatibility branch.
+        if (workspace / PENDING_NAME).exists():
+            return False
+        legacy = json.loads((workspace / PROVENANCE_NAME).read_text(encoding="utf-8"))
+        outputs = legacy.get("outputs", {})
+        return (legacy.get("schema_version") == 1 and legacy.get("status") == "complete"
+                and outputs.get("dense_input") == "sparse_pdr_aligned/0"
+                and all(outputs.get("files", {}).get("sparse_pdr_aligned/0/" + name) == value
+                        for name, value in identity.items()))
+    except (OSError, ValueError, TypeError, AttributeError, struct.error):
+        return False
 
 
 # Camera layouts follow COLMAP's documented model IDs and binary format.
@@ -343,13 +439,6 @@ def inspect_sparse_model(model: Path) -> Dict[str, Any]:
     if len(names) < 2 or not point_count:
         raise ValueError("Dense reconstruction requires registered views and sparse points")
     return {"names": names, "camera_count": len(cameras), "point_count": point_count}
-
-
-def read_model_names(model_dir: Path | None) -> Set[str]:
-    if model_dir is None:
-        return set()
-    binary = model_dir / "images.bin"
-    return read_binary_image_names(binary) if binary.exists() else read_text_image_names(model_dir / "images.txt")
 
 
 def source_coverage(
@@ -511,12 +600,24 @@ def parse_args() -> argparse.Namespace:
     action = parser.add_mutually_exclusive_group()
     action.add_argument("--record-sparse-start", action="store_true", help="Snapshot inputs before feature extraction, requiring a clean workspace.")
     action.add_argument("--record-sparse-complete", action="store_true", help="Record completed output provenance only if the pre-run inputs are unchanged.")
+    action.add_argument("--print-dense-input", action="store_true", help="Print the validated sparse model selected for dense reconstruction.")
     parser.add_argument("--runner", choices=sorted(SPARSE_RUNNERS), default="run_colmap_sparse.bat")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    if args.print_dense_input:
+        selected = dense_input_model(args.workspace)
+        try:
+            if selected is None:
+                raise ValueError("No sparse model is available")
+            inspect_sparse_model(selected)
+        except (OSError, ValueError, struct.error) as exc:
+            print(f"[error] Sparse selection: {exc}", file=sys.stderr)
+            return 2
+        print(selected.resolve())
+        return 0
     if args.record_sparse_start or args.record_sparse_complete:
         try:
             if args.record_sparse_start:

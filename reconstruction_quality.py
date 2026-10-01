@@ -9,12 +9,15 @@ import json
 import math
 import sqlite3
 import struct
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
-from colmap_workspace_check import dense_input_model, inspect_sparse_model, inspect_workspace
+from colmap_workspace_check import dense_input_model, inspect_sparse_model, inspect_workspace, file_identity, contained_path, write_provenance, open_readonly_database
+from dense_cache import cache_identity, reconstruction_binding
 from point_cloud_filter import sampling_quality_warning
 from ply_io import validate_ply
+from workspace_lock import WorkspaceBusyError, workspace_lock
 
 
 SPARSE_ROOTS = ("sparse",)
@@ -34,14 +37,7 @@ def read_json(path: Path) -> Dict[str, Any]:
 
 def write_json(path: Path, obj: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        json.dump(obj, handle, ensure_ascii=False, indent=2)
-        handle.write("\n")
-
-
-def write_text(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
+    write_provenance(path, obj)
 
 
 def safe_float(value: Any, default: float = math.nan) -> float:
@@ -77,20 +73,6 @@ def read_image_list(path: Path) -> List[str]:
         return []
     with path.open("r", encoding="utf-8", errors="replace") as handle:
         return [line.strip() for line in handle if line.strip()]
-
-
-def read_uint64_prefix(path: Path) -> Optional[int]:
-    if not path.exists() or path.stat().st_size < 8:
-        return None
-    with path.open("rb") as handle:
-        data = handle.read(8)
-    return struct.unpack("<Q", data)[0]
-
-
-def sparse_model_has_files(model_dir: Path) -> bool:
-    binary = (model_dir / "cameras.bin").exists() and (model_dir / "images.bin").exists()
-    text = (model_dir / "cameras.txt").exists() and (model_dir / "images.txt").exists()
-    return binary or text
 
 
 def sparse_model_stats(model_dir: Path, root_name: str) -> Dict[str, Any]:
@@ -139,11 +121,20 @@ def collect_sparse_models(
                 aligned_models.append(stats)
 
     valid_raw = [row for row in raw_models if row["exists"]]
-    largest = max(valid_raw, key=lambda row: row.get("registered_images") or 0, default=None)
+    largest = max(valid_raw, key=lambda row: (row["registered_images"], row["sparse_points"]), default=None)
     dense_path = dense_input_model(workspace_dir)
     selected = next((row for row in [*raw_models, *aligned_models] if Path(row["path"]) == dense_path), None)
     largest_registered = (largest or {}).get("registered_images") or 0
     selected_registered = (selected or {}).get("registered_images") or 0
+    camera_support = {"status": "unavailable", "reason": "no_selected_sparse_model"}
+    if selected and selected.get("exists"):
+        from reconstruction_evaluation import Snapshot, sparse_metrics
+        snapshot = Snapshot()
+        try:
+            camera_support = sparse_metrics(Path(selected["path"]), snapshot)["camera_support"]
+            snapshot.verify_unchanged()
+        except (OSError, ValueError, KeyError, struct.error) as exc:
+            camera_support = {"status": "unavailable", "reason": str(exc)}
     return {
         "component_count": len(valid_raw),
         "models": raw_models,
@@ -152,27 +143,20 @@ def collect_sparse_models(
             round(largest_registered / input_image_count, 6) if input_image_count > 0 else None
         ),
         "aligned_models": aligned_models,
-        "pdr_aligned_exists": bool(aligned_models),
+        "pdr_aligned_exists": dense_path == workspace_dir / "sparse_pdr_aligned/0",
+        "pdr_alignment_decision": read_json(workspace_dir / "pdr_alignment_decision.json"),
         "selected_model": selected,
+        "selected_camera_support": camera_support,
         "selected_registered_image_ratio": (
             round(selected_registered / input_image_count, 6) if input_image_count > 0 else None
         ),
     }
 
 
-def count_ply_element(path: Path, element_name: str) -> Optional[int]:
-    try:
-        return validate_ply(path).get(element_name, 0)
-    except (OSError, ValueError):
-        return None
-
-
-def count_ply_vertices(path: Path) -> Optional[int]:
-    return count_ply_element(path, "vertex")
-
-
-def count_ply_faces(path: Path) -> Optional[int]:
-    return count_ply_element(path, "face")
+def alignment_decision_matches_selected(sparse: Dict[str, Any]) -> bool:
+    selected = sparse.get("selected_model") or {}
+    decision = sparse.get("pdr_alignment_decision") or {}
+    return bool(selected.get("label")) and decision.get("selected_model") == selected["label"]
 
 
 def inspect_dense_ply(path: Path) -> Dict[str, Any]:
@@ -191,7 +175,21 @@ def summarize_dense(workspace_dir: Path) -> Dict[str, Any]:
     fused = dense_dir / "fused.ply"
     filtered = dense_dir / "fused_filtered.ply"
     final_summary = read_json(dense_dir / "final_output_summary.json")
+    filter_path = Path(final_summary.get("filter_receipt") or dense_dir / "point_filter_summary.json").resolve()
+    if not filter_path.is_relative_to(dense_dir.resolve()):
+        raise ValueError("Filter receipt points outside its dense workspace")
     validation = {name: inspect_dense_ply(path) for name, path in (("final", final), ("fused", fused), ("filtered", filtered))}
+    binding_status = "missing" if not final.exists() else "legacy_unverified"
+    if final.exists() and final_summary.get("final_identity") and final_summary.get("reconstruction_binding"):
+        try:
+            binding_status = "verified" if (
+                file_identity(final) == final_summary["final_identity"] and
+                reconstruction_binding(dense_dir) == final_summary["reconstruction_binding"] and
+                cache_identity(workspace_dir) == final_summary["reconstruction_binding"].get("cache_identity") and
+                validation["final"]["elements"].get("vertex") == final_summary.get("vertex_count")
+            ) else "mismatch"
+        except (OSError, ValueError):
+            binding_status = "mismatch"
     return {
         "final_ply": str(final),
         "final_exists": final.exists(),
@@ -200,6 +198,11 @@ def summarize_dense(workspace_dir: Path) -> Dict[str, Any]:
         "ply_validation": validation,
         "final_output_summary": final_summary,
         "final_source_kind": final_summary.get("source_kind"),
+        "final_reconstruction_binding": binding_status,
+        "generated_vertex_count": final_summary.get("generated_vertex_count", 0) if binding_status == "verified" else None,
+        "observed_vertex_count": final_summary.get("observed_vertex_count", validation["final"]["elements"].get("vertex")) if binding_status == "verified" else None,
+        "scene_completion": read_json(dense_dir / "videoscene_summary.json"),
+        "scene_completion_applied": binding_status == "verified" and final_summary.get("source_kind") == "videoscene_completed_point_cloud",
         "intermediate_ply_cleanup": bool(final_summary) and not bool(final_summary.get("keep_intermediate")),
         "fused_ply": str(fused),
         "fused_exists": fused.exists(),
@@ -207,7 +210,7 @@ def summarize_dense(workspace_dir: Path) -> Dict[str, Any]:
         "filtered_ply": str(filtered),
         "filtered_exists": filtered.exists(),
         "filtered_vertex_count": validation["filtered"]["elements"].get("vertex"),
-        "point_filter_summary": read_json(dense_dir / "point_filter_summary.json"),
+        "point_filter_summary": read_json(filter_path),
         "meshed_delaunay_exists": (dense_dir / "meshed-delaunay.ply").exists(),
         "meshed_poisson_exists": (dense_dir / "meshed-poisson.ply").exists(),
     }
@@ -334,7 +337,7 @@ def database_status(workspace: Path) -> Dict[str, Any]:
     if not database.exists():
         return {"exists": False, "image_count": 0, "error": ""}
     try:
-        connection = sqlite3.connect(database)
+        connection = open_readonly_database(database)
         try:
             image_count = connection.execute("SELECT COUNT(*) FROM images").fetchone()[0]
         finally:
@@ -435,7 +438,16 @@ def relative_status(
         warnings.append("Multiple sparse components exist; more overlap or wider hybrid matching may improve coverage.")
 
     if workspace_summary.get("pdr_alignment_enabled") and not sparse.get("pdr_aligned_exists"):
-        warnings.append("PDR-aligned sparse model is missing; dense reconstruction will fall back to raw sparse/0.")
+        decision = sparse.get("pdr_alignment_decision", {})
+        decision_matches = alignment_decision_matches_selected(sparse)
+        if decision and not decision_matches:
+            warnings.append("The PDR decision belongs to another sparse component; it does not describe the currently selected visual model.")
+        elif provenance_status == "verified" and decision.get("status") == "withheld":
+            notes.append("PDR alignment was intentionally withheld by its reliability gate; raw visual coordinates are retained. Rebuilding unchanged inputs will not resolve unreliable PDR.")
+        elif provenance_status == "verified" and decision.get("status") == "failed":
+            warnings.append("PDR alignment failed validation; the verified raw sparse model is selected. Inspect pdr_alignment_decision.json for the cause.")
+        else:
+            warnings.append("No authenticated PDR-aligned model is selected; dense reconstruction uses the primary raw sparse component.")
 
     cleanup_intermediate_ply = bool(
         workspace_summary.get("cleanup_intermediate_ply") or dense.get("intermediate_ply_cleanup")
@@ -443,6 +455,11 @@ def relative_status(
     ply_validation = dense.get("ply_validation", {})
     dense_available = any(ply_validation.get(name, {}).get("status") == "validated" for name in ("final", "fused"))
     invalid_dense = False
+    if dense.get("final_reconstruction_binding") == "mismatch":
+        invalid_dense = True
+        warnings.append("Final PLY no longer matches its recorded MVS inputs/cameras or file hash; do not run completion on it.")
+    elif dense.get("final_reconstruction_binding") == "legacy_unverified":
+        notes.append("Legacy final has no authenticated dense-run binding; it remains viewable but is not eligible for automatic VideoScene promotion.")
     for name, result in ply_validation.items():
         if result["status"] == "invalid":
             invalid_dense = True
@@ -450,6 +467,20 @@ def relative_status(
     filter_warning = sampling_quality_warning(dense.get("point_filter_summary", {}))
     if filter_warning:
         warnings.append(filter_warning)
+    observation_summary = dense.get("point_filter_summary", {})
+    unknown_count = 0
+    if observation_summary.get("method") == "observation_support":
+        classification = observation_summary.get("classification", {})
+        unknown_count = int(classification.get("unknown", 0))
+        supported_count = int(classification.get("supported", 0))
+        notes.append(f"Observation assessment: {supported_count:,} supported, {unknown_count:,} unknown; internal support does not establish real-world accuracy.")
+        if unknown_count:
+            warnings.append("Unknown observation points remain in the retained geometry. Inspect the supported and unknown layers separately before judging reconstruction quality.")
+    elif observation_summary.get('method') == 'wifi_connected_density':
+        notes.append('The display cloud uses connected density with a soft WiFi extent prior. Removed points remain in raw fusion; this selection does not certify poses or wall locations.')
+        prior = observation_summary.get('wifi_boundary', {})
+        if prior.get('status') == 'unavailable':
+            warnings.append('WiFi extent was unavailable; the density baseline was used: ' + prior.get('reason', 'unknown'))
     if not dense_available:
         warnings.append("No fully validated final or fused dense PLY is available.")
     elif not dense["final_exists"]:
@@ -527,7 +558,7 @@ def relative_status(
         status = "unverified_reconstruction_inputs"
     elif not dense_available:
         status = "sparse_available_dense_missing"
-    elif filter_warning:
+    elif filter_warning or unknown_count:
         status = "dense_needs_review"
     else:
         status = "ok"
@@ -536,12 +567,18 @@ def relative_status(
 
 def build_next_actions(report: Dict[str, Any]) -> List[str]:
     actions: List[str] = []
+    if report.get('capture_timing', {}).get('status') == 'needs_review':
+        actions.append('Review the named photo pairs in capture_timing against the capture sequence. Do not automatically reassign photos from camera proximity or timestamp gaps alone.')
     database = report["database"]
     images = report["image_directory"]
     sparse = report["sparse"]
     dense = report["dense"]
     if sampling_quality_warning(dense.get("point_filter_summary", {})):
         actions.append("Inspect fused.ply and rerun only post-filtering with the corrected sampler; if fused.ply was deleted, re-fuse the retained depth maps first.")
+    observation_summary = dense.get("point_filter_summary", {})
+    if (observation_summary.get("method") == "observation_support"
+            and observation_summary.get("classification", {}).get("unknown", 0)):
+        actions.append("Compare the supported and unknown layer paths in point_filter_summary.json; unknown points are not confirmed errors. Review camera parallax and cross-checkpoint observations before changing WiFi weights or removing geometry.")
     input_count = report["input_image_count"]
     coverage = report.get("input_coverage", {})
     database_coverage = coverage.get("database", {})
@@ -565,13 +602,24 @@ def build_next_actions(report: Dict[str, Any]) -> List[str]:
     elif sparse["component_count"] == 0:
         actions.append("Run `python run_colmap.py sparse` to create a sparse model.")
     elif not sparse.get("pdr_aligned_exists") and report["workspace_summary"].get("pdr_alignment_enabled"):
-        actions.append("Rerun `python run_colmap.py sparse`; PDR alignment should now create sparse_pdr_aligned/0 first.")
+        decision = sparse.get("pdr_alignment_decision", {})
+        if decision and not alignment_decision_matches_selected(sparse):
+            actions.append("The PDR decision belongs to another sparse component. Continue with the selected visual model; reassess PDR on that component before applying alignment.")
+        elif provenance_status == "verified" and decision.get("status") == "withheld":
+            actions.append("Continue with the verified visual model. Review checkpoint consistency in pdr_alignment_decision.json before changing PDR inputs; a sparse rerun alone is not a reliability fix.")
+        elif provenance_status == "verified" and decision.get("status") == "failed":
+            actions.append("Inspect the recorded alignment failure in pdr_alignment_decision.json; dense reconstruction can continue with the verified raw sparse model.")
+        else:
+            actions.append("Inspect PDR alignment provenance and checkpoint reliability before deciding whether a rebuild is necessary.")
     expected_video = database_coverage.get("source_coverage", {}).get("video_base_frame", {})
     selected_video = sparse_coverage.get("source_coverage", {}).get("video_base_frame", {})
     if expected_video.get("expected_count", 0) and selected_video.get("present_count", 0) == 0 and not needs_clean_sparse:
         actions.append("Video frames are not registered in the selected sparse model; inspect video/anchor overlap and P1 diagnostics before judging dense completeness.")
     if sparse["component_count"] > 0 and not dense["final_exists"]:
         actions.append("Run `python run_colmap.py dense` to create `colmap_workspace/dense/final.ply`.")
+    elif (not needs_clean_sparse and provenance_status == "verified"
+          and dense.get("final_reconstruction_binding") == "mismatch"):
+        actions.append("Preserve the old final for reference and run `python run_colmap.py dense` to rebuild dense output for the currently selected model; do not reuse the mismatched final for completion.")
     return actions
 
 
@@ -606,6 +654,15 @@ def build_report(root: Path, processed_dir: Path, reconstruction_dir: Path, work
         dense=dense,
         input_image_count=input_image_count,
     )
+    camera_support = sparse.get("selected_camera_support", {})
+    from photo_grouping import workspace_capture_diagnostics
+    capture_timing = workspace_capture_diagnostics(workspace_dir)
+    if capture_timing['status'] == 'needs_review':
+        warnings.append('Photo groups contain long internal capture pauses, reversed camera times or ambiguous slot order; inspect capture_timing before trusting checkpoint assignments.')
+    if sparse.get("selected_model") and camera_support.get("status") != "available":
+        warnings.append("Per-camera sparse support could not be evaluated: " + camera_support.get("reason", "unknown"))
+    elif camera_support.get("views_with_at_most_two_occupied_cells"):
+        notes.append(f"{len(camera_support['views_with_at_most_two_occupied_cells'])} registered view(s) have linked features in at most 2 of 64 image cells; inspect local support before treating registration as reliable pose coverage.")
     report = {
         "status": status,
         "root": str(root),
@@ -613,6 +670,7 @@ def build_report(root: Path, processed_dir: Path, reconstruction_dir: Path, work
         "reconstruction_dir": str(reconstruction_dir),
         "workspace_dir": str(workspace_dir),
         "input_image_count": input_image_count,
+        "capture_timing": capture_timing,
         "processing_status": processing_summary.get("status", "available" if processing_summary else "missing"),
         "export_status": export_summary.get("status", "missing"),
         "workspace_status": workspace_summary.get("status", "missing"),
@@ -633,160 +691,157 @@ def build_report(root: Path, processed_dir: Path, reconstruction_dir: Path, work
     return report
 
 
-def yes_no(value: bool) -> str:
-    return "yes" if value else "no"
+def quality_source_binding(workspace: Path, root: Path, processed_dir: Path, reconstruction_dir: Path):
+    """Bind every report source to its current bytes, including absent artifacts.
+
+    No old quality report, file timestamp, or point count substitutes for an
+    input/output identity. The returned snapshot checks concurrent changes.
+    """
+    from reconstruction_evaluation import Snapshot, digest
+
+    snapshot = Snapshot()
+    paths = [processed_dir / "processing_summary.json", reconstruction_dir / "export_summary.json"]
+    paths.extend(workspace / name for name in (
+        "colmap_workspace_summary.json", "image_list.txt", "database.db", "database.db-wal",
+        "metadata/images_manifest.csv", "match_graph_edges.csv", "image_similarity_edges.csv",
+        "image_similarity_summary.json", "match_pair_filter.csv", "match_pair_filter_summary.json",
+        "match_pairs.txt", "pdr_alignment_refs.txt", "sparse_run_provenance.json", "sparse_run_inputs.json",
+        "pdr_alignment_decision.json", "pdr_alignment_reviewed_refs.txt",
+        "run_colmap_sparse.bat", "run_colmap_automatic.bat", "run_colmap_dense.bat",
+        "dense/final_output_summary.json", "dense/point_filter_summary.json", "dense/videoscene_summary.json",
+        "dense/mvs_cache_identity.json", "dense/final.ply", "dense/fused.ply", "dense/fused_filtered.ply",
+        "dense/meshed-poisson.ply", "dense/meshed-delaunay.ply",
+    ))
+    for folder in ("sparse", "sparse_pdr_aligned", "sparse_pose_prior", "dense/sparse"):
+        paths.extend(path for path in (workspace / folder).rglob("*") if path.is_file() and path.suffix in (".bin", ".txt"))
+    for name in read_image_list(workspace / "image_list.txt"):
+        paths.append(contained_path(workspace / "images", name))
+    paths.extend(path for path in (workspace / "images").rglob("*") if path.is_file())
+    settings = snapshot.read_json(workspace / "colmap_workspace_summary.json")
+    if settings.get("colmap_exe"):
+        executable = Path(settings["colmap_exe"])
+        paths.append(executable if executable.is_absolute() else workspace / executable)
+    mask = settings.get("colmap_mask", {})
+    if mask.get("enabled") and mask.get("path"):
+        mask_root = Path(mask["path"])
+        paths.extend(contained_path(mask_root, name + ".png") for name in read_image_list(workspace / "image_list.txt"))
+    final = snapshot.read_json(workspace / "dense/final_output_summary.json")
+    for name in ("observed_source", "generated_source", "filter_receipt"):
+        if final.get(name):
+            path = Path(final[name]).resolve()
+            if not path.is_relative_to((workspace / "dense").resolve()):
+                raise ValueError("Final report source points outside its dense workspace")
+            paths.append(path)
+    filter_path = Path(final.get("filter_receipt") or workspace / "dense/point_filter_summary.json").resolve()
+    if not filter_path.is_relative_to((workspace / "dense").resolve()):
+        raise ValueError("Filter receipt points outside its dense workspace")
+    filter_record = snapshot.read_json(filter_path)
+    if filter_record.get('method') == 'observation_support':
+        for artifact in [filter_record.get('evidence', {}), *filter_record.get('layers', {}).values()]:
+            if artifact.get('path'):
+                path = Path(artifact['path']).resolve()
+                if not path.is_relative_to((workspace / 'dense').resolve()):
+                    raise ValueError('Observation evidence points outside its dense workspace')
+                paths.append(path)
+    completion = snapshot.read_json(workspace / 'dense/videoscene_summary.json')
+    if completion.get('status') == 'hypotheses_only':
+        for key in ('generated_source', 'hypothesis_preview'):
+            if completion.get(key):
+                path = Path(completion[key]).resolve()
+                if not path.is_relative_to((workspace/'dense').resolve()):
+                    raise ValueError('Hypothesis evidence points outside its dense workspace')
+                paths.append(path)
+    for name in ("reconstruction_quality.py", "photo_grouping.py", "colmap_workspace_check.py", "dense_cache.py", "ply_io.py", "reconstruction_evaluation.py", "observation_filter.py", "mvs_observations.py"):
+        paths.append(Path(__file__).with_name(name))
+    files = {str(path.resolve()): snapshot.identity(path) for path in sorted(set(paths), key=str)}
+    binding = {"schema_version": 1, "workspace": str(workspace), "root": str(root),
+               "processed_dir": str(processed_dir), "reconstruction_dir": str(reconstruction_dir), "files": files}
+    binding["identity"] = digest(binding)
+    return binding, snapshot
 
 
-def format_value(value: Any) -> str:
-    if value is None:
-        return "-"
-    if isinstance(value, bool):
-        return yes_no(value)
-    return str(value)
+def _quality_locations(workspace, root=None, processed_dir=None, reconstruction_dir=None, output=None):
+    workspace = Path(workspace).resolve()
+    root = Path(root).resolve() if root is not None else Path(__file__).resolve().parent
+    settings = read_json(workspace / "colmap_workspace_summary.json")
+    reconstruction = Path(reconstruction_dir or settings.get("reconstruction_dir") or root / "reconstruction_dataset")
+    reconstruction = (reconstruction if reconstruction.is_absolute() else root / reconstruction).resolve()
+    exported = read_json(reconstruction / "export_summary.json")
+    processed = Path(processed_dir or exported.get("processed_dir") or root / "processed")
+    processed = (processed if processed.is_absolute() else root / processed).resolve()
+    output = Path(output).resolve() if output is not None else workspace / "quality_report.json"
+    return workspace, root, processed, reconstruction, output
 
 
-def markdown_table(rows: Iterable[Sequence[Any]]) -> str:
-    lines = ["| Metric | Value |", "| --- | --- |"]
-    for key, value in rows:
-        lines.append(f"| {key} | {format_value(value)} |")
-    return "\n".join(lines)
+def _quality_report_current(report, binding):
+    from reconstruction_evaluation import digest
+    if not report:
+        return {"status": "missing", "reason": "No quality report exists."}
+    if not report.get("result_binding") or not report.get("report_identity"):
+        return {"status": "stale", "reason": "Legacy report has no input/output identity binding."}
+    unsigned = {key: value for key, value in report.items() if key != "report_identity"}
+    if digest(unsigned) != report["report_identity"]:
+        return {"status": "stale", "reason": "Quality report content changed after its snapshot."}
+    if report["result_binding"] != binding:
+        return {"status": "stale", "reason": "Current input, configuration, model, output, or evaluation code differs from the report snapshot."}
+    return {"status": "current", "reason": "Report hashes match current inputs and outputs."}
 
 
-def render_markdown(report: Dict[str, Any]) -> str:
-    sparse = report["sparse"]
-    dense = report["dense"]
-    match_graph = report["match_graph"]
-    image_similarity = report["image_similarity"]
-    match_pair_filter = report.get("match_pair_filter", {})
-    images = report["image_directory"]
-    coverage = report.get("input_coverage", {})
-    database_coverage = coverage.get("database", {}).get("source_coverage", {})
-    sparse_coverage = coverage.get("dense_input_sparse", {}).get("source_coverage", {})
-    expected_video = database_coverage.get("video_base_frame", {})
-    selected_video = sparse_coverage.get("video_base_frame", {})
-    database_video_coverage = (
-        f"{expected_video.get('present_count', 0)}/{expected_video.get('expected_count', 0)}"
-        if expected_video
-        else "-"
-    )
-    sparse_video_coverage = (
-        f"{selected_video.get('present_count', 0)}/{selected_video.get('expected_count', 0)}"
-        if selected_video
-        else "-"
-    )
-    largest = sparse.get("largest_component") or {}
-    selected = sparse.get("selected_model") or {}
-    rows = [
-        ("Status", report["status"]),
-        ("Input images", report["input_image_count"]),
-        ("Image files in workspace/images", images["file_count"] if images["exists"] else "missing"),
-        ("Extra image files not in image_list.txt", images["extra_file_count"]),
-        ("Missing image_list.txt files", images["missing_listed_count"]),
-        ("Database images", report["database"]["image_count"] if report["database"]["exists"] else "missing"),
-        ("Video frames in database", database_video_coverage),
-        ("Video frames in selected sparse model", sparse_video_coverage),
-        ("Match graph edges", match_graph["edge_count"]),
-        ("P1 image similarity status", image_similarity.get("status", "missing")),
-        ("P1 image pairs evaluated", image_similarity.get("evaluated_pair_count", 0)),
-        ("P1 visually supported pairs", image_similarity.get("visual_supported_pair_count", 0)),
-        ("P1 near-duplicate pairs", image_similarity.get("near_duplicate_pair_count", 0)),
-        ("P1 pair selection status", match_pair_filter.get("status", "missing")),
-        ("P1 prepared pair list", f"{match_pair_filter.get('selected_pair_count', 0)}/{match_pair_filter.get('input_pair_count', 0)}"),
-        ("Pair list used by configured matcher", match_pair_filter.get("pair_list_used_by_sparse_matcher", "unreported")),
-        ("Pair gate enforced", match_pair_filter.get("pair_gate_enforced", "unreported")),
-        ("Selected P2 contour pairs", match_pair_filter.get("selected_p2_contour_pair_count", "unreported")),
-        ("Selected geometry-supported recovery pairs", match_pair_filter.get("selected_visual_recovery_pair_count", "unreported")),
-        ("P1 rejected evaluated pairs", match_pair_filter.get("rejected_pair_count", 0)),
-        ("Sparse components", sparse["component_count"]),
-        ("Largest sparse model", largest.get("label", "-")),
-        ("Largest registered images", largest.get("registered_images", 0)),
-        ("Largest sparse points", largest.get("sparse_points", 0)),
-        ("Registered image ratio", sparse["registered_image_ratio"]),
-        ("PDR-aligned sparse exists", sparse["pdr_aligned_exists"]),
-        ("Dense input candidate", selected.get("label", "-")),
-        ("final.ply exists", dense["final_exists"]),
-        ("final.ply payload validation", dense.get("ply_validation", {}).get("final", {}).get("status", "unverified")),
-        ("Sparse input provenance", report.get("input_coverage", {}).get("provenance", {}).get("status", "unverified")),
-        ("Final vertex count", dense["final_vertex_count"]),
-        ("Final face count", dense["final_face_count"]),
-        ("Final source kind", dense["final_source_kind"] or "-"),
-        ("Intermediate PLY cleanup", dense["intermediate_ply_cleanup"]),
-        ("Intermediate fused.ply kept", dense["fused_exists"]),
-        ("Intermediate fused vertex count", dense["fused_vertex_count"]),
-        ("Intermediate fused_filtered.ply kept", dense["filtered_exists"]),
-        ("Intermediate filtered vertex count", dense["filtered_vertex_count"]),
-        ("Intermediate Delaunay mesh kept", dense["meshed_delaunay_exists"]),
-        ("Intermediate Poisson mesh kept", dense["meshed_poisson_exists"]),
-        (
-            "P2 trajectory contour mode",
-            report["workspace_summary"].get("constrained_match_pairs", {}).get("trajectory_constraint_mode", "missing"),
-        ),
-        (
-            "P2 route-contour candidate edges",
-            report["workspace_summary"].get("constrained_match_pairs", {}).get("p2_contour_edge_count", "missing"),
-        ),
-        (
-            "P2 video frames with contour coordinates",
-            report["workspace_summary"].get("constrained_match_pairs", {}).get(
-                "video_frames_with_trajectory_contour", "missing"
-            ),
-        ),
-    ]
+def quality_report_status(workspace, output=None, *, root=None, processed_dir=None, reconstruction_dir=None):
+    """Read-only freshness check; a legacy unbound report is always stale."""
+    workspace, root, processed, reconstruction, output = _quality_locations(workspace, root, processed_dir, reconstruction_dir, output)
+    binding, snapshot = quality_source_binding(workspace, root, processed, reconstruction)
+    snapshot.identity(output)
+    report = read_json(output)
+    result = _quality_report_current(report, binding)
+    if not report and output.exists():
+        result = {"status": "stale", "reason": "Existing quality report is empty or invalid JSON."}
+    snapshot.verify_unchanged()
+    return {**result, "report": str(output), "current_identity": binding["identity"]}
 
-    reason_lines = ["| Reason | Count |", "| --- | --- |"]
-    for reason, count in match_graph.get("reason_counts", {}).items():
-        reason_lines.append(f"| {reason} | {count} |")
 
-    similarity_lines = ["| Decision | Count |", "| --- | --- |"]
-    for decision, count in image_similarity.get("visual_decision_counts", {}).items():
-        similarity_lines.append(f"| {decision} | {count} |")
-
-    selection_lines = ["| Selection reason | Count |", "| --- | --- |"]
-    for reason, count in match_pair_filter.get("selection_reason_counts", {}).items():
-        selection_lines.append(f"| {reason} | {count} |")
-
-    warning_lines = "\n".join(f"- {warning}" for warning in report.get("warnings", [])) or "- None"
-    note_lines = "\n".join(f"- {note}" for note in report.get("notes", [])) or "- None"
-    action_lines = "\n".join(f"- {action}" for action in report.get("next_actions", [])) or "- None"
-    return (
-        "# Reconstruction Quality Report\n\n"
-        f"{markdown_table(rows)}\n\n"
-        "## Match Pair Reasons\n\n"
-        f"{chr(10).join(reason_lines)}\n\n"
-        "## P1 Image Similarity\n\n"
-        f"{chr(10).join(similarity_lines)}\n\n"
-        "## P1 Pair Selection\n\n"
-        f"{chr(10).join(selection_lines)}\n\n"
-        "## Warnings\n\n"
-        f"{warning_lines}\n\n"
-        "## Notes\n\n"
-        f"{note_lines}\n\n"
-        "## Next Actions\n\n"
-        f"{action_lines}\n"
-    )
+def refresh_quality_report(workspace, output=None, *, root=None, processed_dir=None, reconstruction_dir=None, force=False):
+    """Refresh stale quality data atomically while the workspace is locked."""
+    from reconstruction_evaluation import digest
+    workspace, root, processed, reconstruction, output = _quality_locations(workspace, root, processed_dir, reconstruction_dir, output)
+    with workspace_lock(workspace):
+        binding, snapshot = quality_source_binding(workspace, root, processed, reconstruction)
+        snapshot.identity(output)
+        previous = read_json(output)
+        if not force and _quality_report_current(previous, binding)["status"] == "current":
+            snapshot.verify_unchanged()
+            return previous
+        report = build_report(root, processed, reconstruction, workspace)
+        snapshot.verify_unchanged()
+        report.update(generated_utc=datetime.now(timezone.utc).isoformat(), result_binding=binding)
+        report["report_identity"] = digest(report)
+        write_json(output, report)
+        return report
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     root = Path(__file__).resolve().parent
     parser.add_argument("--root", type=Path, default=root)
-    parser.add_argument("--processed", type=Path, default=Path("processed"))
-    parser.add_argument("--reconstruction", type=Path, default=Path("reconstruction_dataset"))
+    parser.add_argument("--processed", type=Path, help="Override the processed directory recorded by this workspace's dataset.")
+    parser.add_argument("--reconstruction", type=Path, help="Override the dataset directory recorded by this workspace.")
     parser.add_argument("--workspace", type=Path, default=Path("colmap_workspace"))
     parser.add_argument(
         "--summary",
         "--json-output",
         dest="summary",
         type=Path,
-        default=Path("colmap_workspace") / "quality_report.json",
+        default=None,
     )
     parser.add_argument(
         "--markdown",
         "--markdown-output",
         dest="markdown",
         type=Path,
-        default=Path("colmap_workspace") / "QUALITY_REPORT.md",
+        help=argparse.SUPPRESS,
     )
+    parser.add_argument("--check-freshness", action="store_true", help="Check report input/output hashes without writing; exit 2 if stale.")
+    parser.add_argument("--refresh-if-stale", action="store_true", help="Keep an already current report unchanged.")
     return parser.parse_args()
 
 
@@ -797,17 +852,23 @@ def resolve_path(root: Path, path: Path) -> Path:
 def main() -> int:
     args = parse_args()
     root = args.root.resolve()
-    processed_dir = resolve_path(root, args.processed).resolve()
-    reconstruction_dir = resolve_path(root, args.reconstruction).resolve()
+    processed_dir = resolve_path(root, args.processed).resolve() if args.processed else None
+    reconstruction_dir = resolve_path(root, args.reconstruction).resolve() if args.reconstruction else None
     workspace_dir = resolve_path(root, args.workspace).resolve()
-    report = build_report(root, processed_dir, reconstruction_dir, workspace_dir)
-
-    summary_output = resolve_path(root, args.summary)
-    markdown_output = resolve_path(root, args.markdown)
-    write_json(summary_output, report)
-    write_text(markdown_output, render_markdown(report))
+    summary_output = resolve_path(root, args.summary) if args.summary else workspace_dir / "quality_report.json"
+    try:
+        if args.check_freshness:
+            result = quality_report_status(workspace_dir, summary_output, root=root, processed_dir=processed_dir, reconstruction_dir=reconstruction_dir)
+            print(json.dumps(result))
+            return 0 if result["status"] == "current" else 2
+        report = refresh_quality_report(workspace_dir, summary_output, root=root, processed_dir=processed_dir,
+                                        reconstruction_dir=reconstruction_dir, force=not args.refresh_if_stale)
+    except (OSError, ValueError, KeyError, WorkspaceBusyError) as exc:
+        print(f"[quality error] {exc}")
+        return 2
     print(f"[done] wrote {summary_output}")
-    print(f"[done] wrote {markdown_output}")
+    if args.markdown:
+        print("[info] Legacy --markdown argument ignored; generated reports are JSON-only.")
     print(f"[info] status: {report['status']}")
     return 0
 

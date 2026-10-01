@@ -1,0 +1,5 @@
+# Main reconstruction environment (Python 3.10-3.12).
+# Optional VideoScene dependencies use a separate VideoScene/.venv environment.
+numpy==1.26.4
+opencv-python==4.10.0.84
+tqdm==4.66.5

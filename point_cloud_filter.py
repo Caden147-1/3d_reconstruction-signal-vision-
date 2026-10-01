@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Filter a COLMAP cloud before optional sampling; preserve raw fused.ply.
 
-The default connected-density mode keeps the dominant observed dense component
-and nearby detail. The earlier conservative filter remains available as legacy.
+The default observation-support mode uses calibrated real depth observations.
+Unknown geometry is retained; density-only methods remain explicit opt-ins.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import math
 import random
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ply_io import iter_ply_vertices, PlyRow, read_ply_vertices, row_xyz, write_ply_vertices, xyz_indices
 
@@ -326,13 +326,150 @@ def filter_point_cloud(
     return summary
 
 
+def cached_observation_layers(workspace, snapshot, binding, source_identity):
+    """Carry original observation evidence across filtering of the same fusion.
+
+    These layers describe the source, not the filtered output. In particular,
+    retaining supported evidence keeps later wall fitting independent of the
+    unknown points that may survive density selection.
+    """
+    receipt = snapshot.read_json(workspace / 'dense/point_filter_summary.json')
+    if (receipt.get('reconstruction_binding') != binding
+            or receipt.get('input_identity') != source_identity):
+        return {}
+    layers = (receipt.get('layers', {}) if receipt.get('method') == 'observation_support'
+              else receipt.get('observation_layers', {}))
+    verified = {}
+    for name in ('supported', 'conflict'):
+        layer = layers.get(name, {})
+        if not layer:
+            continue
+        path = Path(layer['path']).resolve()
+        if not path.is_relative_to((workspace / 'dense').resolve()):
+            raise ValueError('Observation evidence must be inside the dense workspace')
+        if snapshot.identity(path) is None or snapshot.identity(path) != layer.get('identity'):
+            raise ValueError(f'Observation {name} layer changed since assessment')
+        verified[name] = layer
+    return verified
+
+
+def cached_observation_veto(workspace, snapshot, binding, source_identity, *, layers=None):
+    """Reuse exact-source conflict evidence; never match by proximity or voxel.
+
+    Unknown observations remain eligible. Full scalar vertex records must agree
+    byte-for-byte with a certified conflict layer from this same fusion/model.
+    The bounded cache can be absent on a fresh reconstruction.
+    """
+    import numpy as np
+    from dense_surface_filter import vertex_chunks
+
+    if layers is None:
+        layers = cached_observation_layers(workspace, snapshot, binding, source_identity)
+    layer = layers.get('conflict', {})
+    if not layer:
+        return None, dict(status='unavailable', reason='no_matching_source_observation_evidence')
+    count = int(layer.get('vertex_count', 0))
+    if count <= 0 or count > 2000000:
+        return None, dict(status='unavailable', reason='empty_or_oversized_conflict_cache')
+    path = Path(layer['path']).resolve()
+    chunks = list(vertex_chunks(path))
+    if sum(len(chunk) for chunk in chunks) != count:
+        raise ValueError('Observation conflict count differs from receipt')
+    dtype = chunks[0].dtype.newbyteorder('<')
+
+    def records(chunk):
+        if chunk.dtype.newbyteorder('<') != dtype:
+            raise ValueError('Conflict records do not match fusion vertex properties')
+        return np.ascontiguousarray(chunk.astype(dtype, copy=False)).view(
+            np.dtype((np.void, dtype.itemsize))).reshape(-1)
+
+    keys = np.unique(np.concatenate([records(chunk) for chunk in chunks]))
+
+    def keep(chunk):
+        query = records(chunk)
+        indices = np.searchsorted(keys, query)
+        return (indices == len(keys)) | (keys[np.minimum(indices, len(keys)-1)] != query)
+
+    return keep, dict(status='applied', layer=layer, source_identity=source_identity,
+                      matching='exact_full_vertex_record',
+                      interpretation='Veto previously observed conflicts; unknown points remain eligible.')
+
+
+def filter_wifi_density(args):
+    """Apply the Git baseline density filter with authenticated, soft RF support."""
+    from colmap_workspace_check import file_identity, write_provenance
+    from dense_surface_filter import filter_connected_cloud
+    from reconstruction_evaluation import Snapshot
+    from reconstruction_stages import verified_context
+    from wifi_boundary import density_boundary_prior
+    from workspace_lock import workspace_lock
+
+    if args.workspace is None or args.skip_density:
+        raise ValueError('wifi-density requires --workspace and does not accept --skip-density')
+    workspace = args.workspace.resolve()
+    dense = workspace / 'dense'
+    source, output = args.input.resolve(), args.output.resolve()
+    summary_path = (args.summary or output.with_suffix('.json')).resolve()
+    if len({source, output, summary_path}) != 3:
+        raise ValueError('Source, candidate and summary paths must be distinct')
+    for path in (output, summary_path):
+        if (path in {dense/'final.ply', dense/'fused.ply'}
+                or any(path.is_relative_to(dense/folder) for folder in ('images', 'sparse', 'stereo'))):
+            raise ValueError('Write a separate candidate; preserve final, fusion and calibrated inputs')
+    with workspace_lock(workspace):
+        binding = verified_context(workspace)
+        snapshot = Snapshot()
+        source_identity = snapshot.identity(source)
+        fusion = snapshot.read_json(source.parent / 'fusion_provenance.json')
+        if (source_identity is None or fusion.get('reconstruction_binding') != binding
+                or fusion.get('output_identity') != source_identity):
+            raise ValueError('WiFi density filtering requires an authenticated fusion source')
+        settings = snapshot.read_json(workspace/'colmap_workspace_summary.json')
+        if settings.get('visual_only'):
+            field, prior = None, dict(status='disabled', reason='visual_only_workspace')
+        else:
+            field, prior = density_boundary_prior(
+                workspace, snapshot, mode=args.wifi_prior_mode, seed=args.wifi_permutation_seed)
+        observation_layers = cached_observation_layers(workspace, snapshot, binding, source_identity)
+        if args.no_observation_veto:
+            vertex_keep, observation_veto = None, dict(status='disabled', reason='explicit_ablation')
+        else:
+            vertex_keep, observation_veto = cached_observation_veto(
+                workspace, snapshot, binding, source_identity, layers=observation_layers)
+        code_names = ('point_cloud_filter.py', 'dense_surface_filter.py', 'wifi_boundary.py',
+                      'wifi_observations.py', 'reconstruction_diagnostics.py', 'mvs_observations.py')
+        codes = {name: snapshot.identity(Path(__file__).with_name(name)) for name in code_names}
+        report = filter_connected_cloud(
+            source, output, None, max_points=args.max_points,
+            bbox_quantile=args.bbox_quantile, bbox_padding_ratio=args.bbox_padding_ratio,
+            cell_ratio=args.surface_cell_ratio, core_quantile=args.core_quantile,
+            support_halo=args.support_halo, spatial_support=field, spatial_penalty=args.wifi_density_weight,
+            vertex_keep=vertex_keep)
+        snapshot.verify_unchanged()
+        if verified_context(workspace) != binding:
+            raise ValueError('Reconstruction changed; density candidate is not certified for promotion')
+        report.update(method='wifi_connected_density', input_identity=source_identity,
+                      output_identity=file_identity(output), reconstruction_binding=binding,
+                      wifi_boundary=prior, observation_conflict_veto=observation_veto,
+                      observation_layers=observation_layers, code_identity=codes,
+                      inputs={str(p): identity for p, (identity, _) in snapshot.files.items()})
+        write_provenance(summary_path, report)
+    return report
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--summary", type=Path)
-    parser.add_argument("--method", choices=("connected-density", "legacy"), default="connected-density")
-    parser.add_argument("--max-points", type=int, help="Uniform point budget; 0 keeps all supported observations (default connected: 0, legacy: 750000).")
+    parser.add_argument("--method", choices=("wifi-density", "observation-support", "connected-density", "legacy"), default="wifi-density")
+    parser.add_argument("--workspace", type=Path, help="Authenticated COLMAP workspace, required for wifi-density or observation-support.")
+    parser.add_argument("--wifi-density-weight", type=float, default=1., help="Confidence-gated density penalty (0-2); 0 disables RF. Add --no-observation-veto for the plain density baseline.")
+    parser.add_argument("--no-observation-veto", action="store_true", help="Disable reuse of exact-source observation conflicts for a controlled ablation.")
+    parser.add_argument("--wifi-prior-mode", choices=("radio", "positions-only", "permuted"), default="radio", help="Radio prior or an ablation control; controls keep capture positions and per-stop quality fixed.")
+    parser.add_argument("--wifi-permutation-seed", type=int, default=0, help="Reproducible within-session fingerprint shuffle for --wifi-prior-mode permuted.")
+    parser.add_argument("--observation-max-views", type=int, default=24, help="Per-block observation evaluation budget; unevaluated evidence remains unknown.")
+    parser.add_argument("--max-points", type=int, help="Export point budget; 0 retains all selected original points (default: 0, legacy: 750000).")
     parser.add_argument("--surface-cell-ratio", type=float, default=0.0025, help="Grid cell width relative to the robust scene diagonal.")
     parser.add_argument("--core-quantile", type=float, default=0.15, help="Point-weighted occupancy quantile for the dense core.")
     parser.add_argument("--support-halo", type=int, default=1, help="Observed-detail neighborhood around the core, in voxel cells (0-3).")
@@ -348,7 +485,34 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     if args.max_points is None:
-        args.max_points = 0 if args.method == "connected-density" else 750000
+        args.max_points = 750000 if args.method == "legacy" else 0
+    if args.method == 'wifi-density':
+        summary = filter_wifi_density(args)
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        return 0
+    if args.method == "observation-support":
+        if args.workspace is None or args.skip_density:
+            raise ValueError("observation-support requires --workspace and does not accept --skip-density")
+        from dense_cache import CACHE_RECORD, read_record
+        from colmap_workspace_check import file_identity
+        from observation_filter import filter_observed_cloud
+        from reconstruction_stages import verified_context
+        from workspace_lock import workspace_lock
+        workspace = args.workspace.resolve()
+        with workspace_lock(workspace):
+            binding = verified_context(workspace)
+            dense = workspace / "dense"
+            fusion = read_record(args.input.resolve().parent / 'fusion_provenance.json')
+            if (fusion.get('reconstruction_binding') != binding or
+                    fusion.get('output_identity') != file_identity(args.input)):
+                raise ValueError('Observation filtering requires an authenticated fusion source; use run_colmap.py filter to re-fuse verified maps if necessary')
+            record = read_record(dense / CACHE_RECORD)
+            summary = filter_observed_cloud(
+                args.input, args.output, args.summary or args.output.with_suffix('.json'), dense,
+                max_points=args.max_points, policy={'max_views': args.observation_max_views},
+                expected=record['outputs']['files'], binding=binding)
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        return 0
     if args.method == "connected-density":
         if args.skip_density:
             raise ValueError("--skip-density requires --method legacy")
