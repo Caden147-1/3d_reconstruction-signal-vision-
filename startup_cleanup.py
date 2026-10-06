@@ -30,6 +30,14 @@ def read_json(path):
         return {}
 
 
+def format_bytes(value):
+    """Keep small cleanups visible instead of rounding them to 0.00 GiB."""
+    for unit in ('B', 'KiB', 'MiB', 'GiB', 'TiB'):
+        if abs(value) < 1024 or unit == 'TiB':
+            return f'{value:,.0f} B' if unit == 'B' else f'{value:,.2f} {unit}'
+        value /= 1024
+
+
 def files_in(root, folder):
     """Validate every descendant before any recursive deletion is permitted."""
     pending, files = [checked_path(root, folder)], []
@@ -138,6 +146,8 @@ def cleanup_project(root, *, protected=(), apply=True):
     protected += [root/name for name in ('.git', '.venv', 'VideoScene', 'video', 'pic', 'colmap-x64-windows-cuda')]
     before = shutil.disk_usage(root).free
     result = {'timestamp_utc': datetime.now(timezone.utc).isoformat(), 'status': 'planned',
+              'scope': 'historical_caches_only',
+              'note': 'Selected run outputs are reset separately and are not counted in this report. Result archives are retained.',
               'removed_logical_bytes': 0, 'removed_files': 0, 'removed': [], 'protected': list(map(str, protected))}
     targets, skipped = cleanup_plan(root, protected)
     result.update(targets=targets, skipped=skipped, candidate_logical_bytes=sum(t['logical_bytes'] for t in targets))
@@ -164,9 +174,15 @@ def cleanup_project(root, *, protected=(), apply=True):
             result.update(status='deferred' if not result['removed'] else 'partial', error=str(exc))
     result['free_bytes_after'] = shutil.disk_usage(root).free
     result['observed_free_bytes_increase'] = result['free_bytes_after']-before
-    print(f"[cleanup] {'Removed' if apply else 'Eligible'} "
-          f"{(result['removed_logical_bytes'] if apply else result['candidate_logical_bytes'])/1024**3:.2f} GiB logical cache data; "
-          f"free space={result['free_bytes_after']/1024**3:.2f} GiB; status={result['status']}.", flush=True)
+    if not targets:
+        print('[cleanup] Historical caches: no eligible files found.', flush=True)
+    else:
+        size = result['removed_logical_bytes'] if apply else result['candidate_logical_bytes']
+        count = result['removed_files'] if apply else sum(item['files'] for item in targets)
+        print(f"[cleanup] Historical caches: {'removed' if apply else 'eligible'} {count:,} files "
+              f"({format_bytes(size)} logical size); status={result['status']}.", flush=True)
+    print(f"[cleanup] This pass excludes selected run outputs and saved results. "
+          f"Disk free space: {format_bytes(result['free_bytes_after'])}.", flush=True)
     if result.get('error'):
         print(f"[cleanup] {result['error']}", flush=True)
     if apply:

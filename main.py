@@ -92,12 +92,15 @@ def output_paths(args):
 
 def reset_stopped_outputs(args):
     """Delete only the three selected output trees, retaining their lock inodes."""
+    from startup_cleanup import format_bytes
+
     root = args.root.resolve()
     paths = output_paths(args)
     with ExitStack() as stack:
         for path in sorted(paths):
             stack.enter_context(workspace_lock(path))
         targets = []
+        measurements = []
         for folder in paths:
             # A custom nonempty directory needs evidence that it is generated output.
             children = [p for p in folder.iterdir() if p.name not in KEEP]
@@ -111,8 +114,12 @@ def reset_stopped_outputs(args):
             legacy_name = folder.name in {prefix + suffix for suffix in LEGACY_OUTPUT_SUFFIXES}
             if children and not owned and not legacy_name and not any((folder / m).is_file() for m in markers):
                 raise ValueError(f"Refusing to clear an unrecognized output directory: {folder}")
+            measurement = {'path': str(folder), 'files': 0, 'logical_bytes': 0}
             for child in children:
                 checked_path(root, child)
+                if child.is_file():
+                    measurement['files'] += 1
+                    measurement['logical_bytes'] += child.stat().st_size
                 # Validate every descendant before the first recursive deletion.
                 pending = [child] if child.is_dir() else []
                 while pending:
@@ -120,14 +127,20 @@ def reset_stopped_outputs(args):
                         checked_path(root, entry)
                         if entry.is_dir():
                             pending.append(entry)
+                        elif entry.is_file():
+                            measurement['files'] += 1
+                            measurement['logical_bytes'] += entry.stat().st_size
                 targets.append(child)
+            measurements.append(measurement)
         if targets:
             print("[restart] Clearing stopped-run outputs before rebuilding:", flush=True)
-            for path in paths:
-                print(f"[restart] {path}", flush=True)
+            for item in measurements:
+                print(f"[restart] {item['path']}: {item['files']:,} files, "
+                      f"{format_bytes(item['logical_bytes'])} logical size scheduled for removal.", flush=True)
         if not getattr(args, '_results_archived', False):
             from startup_cleanup import archive_results
             archive_results(root, paths[2])
+        free_before = shutil.disk_usage(root).free
         for target in targets:
             checked_path(root, target)
             if target.is_dir():
@@ -137,6 +150,25 @@ def reset_stopped_outputs(args):
         for index, folder in enumerate(paths):
             write_provenance(folder / ".main_output_owner.json",
                              {"root": str(root), "workspace": str(paths[2]), "role": index})
+        free_after = shutil.disk_usage(root).free
+        result = {
+            'status': 'completed', 'scope': 'selected_stopped_run_outputs', 'directories': measurements,
+            'removed_files': sum(item['files'] for item in measurements),
+            'removed_logical_bytes': sum(item['logical_bytes'] for item in measurements),
+            'free_bytes_before': free_before, 'free_bytes_after': free_after,
+            'observed_free_bytes_increase': free_after-free_before,
+            'note': 'Logical bytes count deleted file paths. Archived hard links retain their storage; '
+                    'other disk activity can also change the observed free-space difference.',
+        }
+        print(f"[restart] Cleared {result['removed_files']:,} files "
+              f"({format_bytes(result['removed_logical_bytes'])} logical size). "
+              f"Disk free-space change: {format_bytes(free_after-free_before)}; "
+              f"free now: {format_bytes(free_after)}. Saved result archives are retained.", flush=True)
+        try:
+            write_provenance(paths[2] / 'restart_cleanup_report.json', result)
+        except OSError as exc:
+            print(f'[restart] Could not save cleanup statistics: {exc}', flush=True)
+        return result
 
 
 def follow_active_run(workspace, *, poll_seconds=0.5):
