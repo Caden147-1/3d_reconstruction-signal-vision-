@@ -12,9 +12,17 @@ video/
 *.webm
 
 # Generated outputs
+/generated/
+# Legacy output directories from runs before the generated/ layout
+/processed_*/
+/reconstruction_dataset_*/
+/colmap_workspace_*/
 processed/
 reconstruction_dataset/
 colmap_workspace/
+processed_video_only/
+reconstruction_dataset_video_only/
+colmap_workspace_video_only/
 colmap_workspace_conservative/
 colmap_masks/
 colmap_masks_conservative/

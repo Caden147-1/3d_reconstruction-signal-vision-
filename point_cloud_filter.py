@@ -349,6 +349,12 @@ def cached_observation_layers(workspace, snapshot, binding, source_identity):
             raise ValueError('Observation evidence must be inside the dense workspace')
         if snapshot.identity(path) is None or snapshot.identity(path) != layer.get('identity'):
             raise ValueError(f'Observation {name} layer changed since assessment')
+        if name == 'conflict' and receipt.get('assessment_mode') == 'bounded_observed':
+            # Identical scalar records can occur at multiple source indices.
+            # Sampled evidence applies only to assessed indices, so a legacy
+            # record-key veto cannot safely propagate it to duplicate records.
+            # Keep this marker when layers are carried through later receipts.
+            layer = {**layer, 'requires_original_source_indices': True}
         verified[name] = layer
     return verified
 
@@ -368,6 +374,9 @@ def cached_observation_veto(workspace, snapshot, binding, source_identity, *, la
     layer = layers.get('conflict', {})
     if not layer:
         return None, dict(status='unavailable', reason='no_matching_source_observation_evidence')
+    if layer.get('requires_original_source_indices'):
+        return None, dict(status='unavailable', reason='bounded_evidence_requires_original_source_indices',
+                          interpretation='Sampled conflicts are retained as evidence; legacy record-key matching must not reject unassessed duplicate vertices.')
     count = int(layer.get('vertex_count', 0))
     if count <= 0 or count > 2000000:
         return None, dict(status='unavailable', reason='empty_or_oversized_conflict_cache')
@@ -399,8 +408,9 @@ def filter_wifi_density(args):
     """Apply the Git baseline density filter with authenticated, soft RF support."""
     from colmap_workspace_check import file_identity, write_provenance
     from dense_surface_filter import filter_connected_cloud
-    from reconstruction_evaluation import Snapshot
+    from reconstruction_metrics import Snapshot
     from reconstruction_stages import verified_context
+    from observation_filter import DensityObservationProtector
     from wifi_boundary import density_boundary_prior
     from workspace_lock import workspace_lock
 
@@ -436,15 +446,34 @@ def filter_wifi_density(args):
         else:
             vertex_keep, observation_veto = cached_observation_veto(
                 workspace, snapshot, binding, source_identity, layers=observation_layers)
-        code_names = ('point_cloud_filter.py', 'dense_surface_filter.py', 'wifi_boundary.py',
-                      'wifi_observations.py', 'reconstruction_diagnostics.py', 'mvs_observations.py')
+        code_names = ('point_cloud_filter.py', 'dense_surface_filter.py', 'observation_filter.py', 'wifi_boundary.py',
+                      'wifi_observations.py', 'video_sensor_fusion.py', 'mvs_observations.py')
         codes = {name: snapshot.identity(Path(__file__).with_name(name)) for name in code_names}
-        report = filter_connected_cloud(
-            source, output, None, max_points=args.max_points,
-            bbox_quantile=args.bbox_quantile, bbox_padding_ratio=args.bbox_padding_ratio,
-            cell_ratio=args.surface_cell_ratio, core_quantile=args.core_quantile,
-            support_halo=args.support_halo, spatial_support=field, spatial_penalty=args.wifi_density_weight,
-            vertex_keep=vertex_keep)
+        protector = None
+        protection_evidence = dict(status='disabled', reason='explicit_ablation', observations_checked=False)
+        if not getattr(args, 'no_observation_protection', False):
+            from dense_cache import CACHE_RECORD
+            receipt = snapshot.read_json(dense/CACHE_RECORD)
+            if receipt.get('status') != 'complete' or receipt.get('identity') != binding['cache_identity']:
+                raise ValueError('Observation receipt differs from the fusion reconstruction binding')
+            protector = DensityObservationProtector(
+                dense, snapshot, receipt.get('outputs', {}).get('files'), binding,
+                max_views=args.observation_max_views)
+        try:
+            report = filter_connected_cloud(
+                source, output, None, max_points=args.max_points,
+                bbox_quantile=args.bbox_quantile, bbox_padding_ratio=args.bbox_padding_ratio,
+                cell_ratio=args.surface_cell_ratio, core_quantile=args.core_quantile,
+                support_halo=args.support_halo, spatial_support=field, spatial_penalty=args.wifi_density_weight,
+                vertex_keep=vertex_keep,
+                vertex_protect=protector if protector is not None and protector.available else None,
+                observation_max_candidates=getattr(args, 'observation_max_candidates', 250000))
+            if protector is not None:
+                protection_evidence = protector.summary()
+        finally:
+            if protector is not None:
+                protector.close()
+        report['observation_protection'].update(protection_evidence)
         snapshot.verify_unchanged()
         if verified_context(workspace) != binding:
             raise ValueError('Reconstruction changed; density candidate is not certified for promotion')
@@ -462,10 +491,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--summary", type=Path)
-    parser.add_argument("--method", choices=("wifi-density", "observation-support", "connected-density", "legacy"), default="wifi-density")
+    parser.add_argument("--method", choices=("observed", "wifi-density", "observation-support", "connected-density", "legacy"), default="observed")
     parser.add_argument("--workspace", type=Path, help="Authenticated COLMAP workspace, required for wifi-density or observation-support.")
-    parser.add_argument("--wifi-density-weight", type=float, default=1., help="Confidence-gated density penalty (0-2); 0 disables RF. Add --no-observation-veto for the plain density baseline.")
+    parser.add_argument("--wifi-density-weight", type=float, default=1., help="Confidence-gated density penalty (0-2); 0 disables RF. Also disable observation veto/protection for the plain density baseline.")
     parser.add_argument("--no-observation-veto", action="store_true", help="Disable reuse of exact-source observation conflicts for a controlled ablation.")
+    parser.add_argument("--no-observation-protection", action="store_true", help="Disable multi-view protection of a bounded sample of density-rejected original points.")
+    parser.add_argument("--observation-max-candidates", type=int, default=2000000, help="Maximum original points assessed (default: 2000000), subject to the runtime budget. Observed mode retains unassessed points; legacy wifi-density samples its rejected points for rescue.")
+    parser.add_argument("--observation-budget-seconds", type=float, default=120., help="Observed mode stops starting assessment batches after this budget; unassessed geometry is retained and output streaming finishes.")
     parser.add_argument("--wifi-prior-mode", choices=("radio", "positions-only", "permuted"), default="radio", help="Radio prior or an ablation control; controls keep capture positions and per-stop quality fixed.")
     parser.add_argument("--wifi-permutation-seed", type=int, default=0, help="Reproducible within-session fingerprint shuffle for --wifi-prior-mode permuted.")
     parser.add_argument("--observation-max-views", type=int, default=24, help="Per-block observation evaluation budget; unevaluated evidence remains unknown.")
@@ -490,12 +522,12 @@ def main() -> int:
         summary = filter_wifi_density(args)
         print(json.dumps(summary, ensure_ascii=False, indent=2))
         return 0
-    if args.method == "observation-support":
+    if args.method in ("observed", "observation-support"):
         if args.workspace is None or args.skip_density:
             raise ValueError("observation-support requires --workspace and does not accept --skip-density")
         from dense_cache import CACHE_RECORD, read_record
         from colmap_workspace_check import file_identity
-        from observation_filter import filter_observed_cloud
+        from observation_filter import filter_observed_cloud, filter_bounded_observed_cloud
         from reconstruction_stages import verified_context
         from workspace_lock import workspace_lock
         workspace = args.workspace.resolve()
@@ -507,11 +539,19 @@ def main() -> int:
                     fusion.get('output_identity') != file_identity(args.input)):
                 raise ValueError('Observation filtering requires an authenticated fusion source; use run_colmap.py filter to re-fuse verified maps if necessary')
             record = read_record(dense / CACHE_RECORD)
-            summary = filter_observed_cloud(
+            function = filter_bounded_observed_cloud if args.method == 'observed' else filter_observed_cloud
+            limits = ({'max_candidates': args.observation_max_candidates,
+                       'budget_seconds': args.observation_budget_seconds} if args.method == 'observed' else {})
+            summary = function(
                 args.input, args.output, args.summary or args.output.with_suffix('.json'), dense,
                 max_points=args.max_points, policy={'max_views': args.observation_max_views},
-                expected=record['outputs']['files'], binding=binding)
-        print(json.dumps(summary, ensure_ascii=False, indent=2))
+                expected=record['outputs']['files'], binding=binding, **limits)
+        source_count = summary.get('input_vertex_count', summary.get('source_vertex_count', 0))
+        output_count = summary['output_vertex_count']
+        print(f"[filter] Retained {output_count:,}/{source_count:,} original points; "
+              f"removed {source_count-output_count:,}. Output: {args.output}", flush=True)
+        print(f"[filter] Full evidence and coverage report: "
+              f"{args.summary or args.output.with_suffix('.json')}", flush=True)
         return 0
     if args.method == "connected-density":
         if args.skip_density:

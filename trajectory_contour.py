@@ -1,8 +1,8 @@
-"""Build a continuous, uncertainty-aware contour from an ordered IMU/PDR path.
+"""Build ordered route segments from detected steps and checkpoint events.
 
-The output is a 2D route corridor for matching, alignment diagnostics, and capture
-coverage inspection. It intentionally does not infer walls, floors, or 3D mesh
-geometry from the walking path.
+Step-distance topology is independent of phone yaw. XY corridor coordinates are
+only available under an explicit phone-aligned assumption; neither route length
+nor that assumption establishes calibrated camera poses or scene surfaces.
 """
 
 from __future__ import annotations
@@ -42,6 +42,12 @@ def write_json(path: Path, payload: Dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
+PDR_ROUTE_FIELDS = (
+    "route_distance_m", "route_distance_status", "pdr_heading_policy",
+    "pdr_heading_status", "pdr_position_status",
+)
+
+
 def read_pdr_rows(path: Path) -> Dict[str, List[Dict[str, Any]]]:
     rows_by_session: Dict[str, List[Dict[str, Any]]] = {}
     with path.open("r", newline="", encoding="utf-8") as handle:
@@ -49,7 +55,9 @@ def read_pdr_rows(path: Path) -> Dict[str, List[Dict[str, Any]]]:
             x = safe_float(row.get("pdr_x"))
             y = safe_float(row.get("pdr_y"))
             elapsed_ts = safe_int(row.get("elapsed_ts"), -1)
-            if not row.get("session") or elapsed_ts < 0 or not math.isfinite(x) or not math.isfinite(y):
+            route_distance = safe_float(row.get("route_distance_m"))
+            has_route = row.get("route_distance_status") == "estimated_steps" and math.isfinite(route_distance)
+            if not row.get("session") or elapsed_ts < 0 or (not has_route and (not math.isfinite(x) or not math.isfinite(y))):
                 continue
             rows_by_session.setdefault(row["session"], []).append(
                 {
@@ -61,6 +69,8 @@ def read_pdr_rows(path: Path) -> Dict[str, List[Dict[str, Any]]]:
                     "epoch_ts": safe_int(row.get("epoch_ts"), 0),
                     "pdr_x": x,
                     "pdr_y": y,
+                    **{field: row.get(field, "") for field in PDR_ROUTE_FIELDS},
+                    "pdr_position_status": row.get("pdr_position_status") or "legacy_unknown",
                 }
             )
     for rows in rows_by_session.values():
@@ -75,6 +85,10 @@ def read_pdr_rows(path: Path) -> Dict[str, List[Dict[str, Any]]]:
 
 
 def point_distance(left: Dict[str, Any], right: Dict[str, Any]) -> float:
+    if left.get("route_distance_status") == right.get("route_distance_status") == "estimated_steps":
+        return safe_float(right.get("route_distance_m")) - safe_float(left.get("route_distance_m"))
+    if not all(row.get("pdr_position_status") == "phone_aligned_assumption" and row.get("pdr_heading_policy") == "phone-aligned" for row in (left, right)):
+        return math.inf
     return math.hypot(float(right["pdr_x"]) - float(left["pdr_x"]), float(right["pdr_y"]) - float(left["pdr_y"]))
 
 
@@ -87,6 +101,8 @@ def link_status(
 ) -> Tuple[bool, str, float, int]:
     distance = point_distance(previous, current)
     gap_ms = int(current["elapsed_ts"]) - int(previous["elapsed_ts"])
+    if not math.isfinite(distance) or distance < 0:
+        return False, "route_distance_break", 0.0, gap_ms
     if gap_ms < 0:
         return False, "time_order_break", distance, gap_ms
     if gap_ms > max_gap_ms:
@@ -136,6 +152,11 @@ def direction_for_vertex(vertices: Sequence[Dict[str, Any]], index: int) -> Tupl
 def add_corridor_offsets(vertices: List[Dict[str, Any]], corridor_half_width_m: float) -> None:
     grouped: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
     for vertex in vertices:
+        if (vertex.get("pdr_position_status") != "phone_aligned_assumption"
+                or vertex.get("pdr_heading_policy") != "phone-aligned"
+                or not all(math.isfinite(safe_float(vertex.get(key))) for key in ("pdr_x", "pdr_y"))):
+            vertex.update(left_x="", left_y="", right_x="", right_y="")
+            continue
         grouped.setdefault((str(vertex["session"]), str(vertex["contour_id"])), []).append(vertex)
     for group in grouped.values():
         for index, vertex in enumerate(group):
@@ -236,8 +257,10 @@ def build_trajectory_contour(
                 "source_point_type": row["point_type"],
                 "source_segment_id": row["segment_id"],
                 "source_step_index": row["step_index"],
-                "pdr_x": round(float(row["pdr_x"]), 6),
-                "pdr_y": round(float(row["pdr_y"]), 6),
+                "pdr_x": round(float(row["pdr_x"]), 6) if math.isfinite(row["pdr_x"]) else "",
+                "pdr_y": round(float(row["pdr_y"]), 6) if math.isfinite(row["pdr_y"]) else "",
+                **{field: row.get(field, "") for field in PDR_ROUTE_FIELDS},
+                "trajectory_route_distance_m": round(contour_distance_m, 6) if row.get("route_distance_status") == "estimated_steps" else "",
                 "contour_distance_m": round(contour_distance_m, 6),
                 "trajectory_distance_m": round(trajectory_distance_m, 6),
                 "link_distance_m": round(distance_m, 6),
@@ -251,6 +274,8 @@ def build_trajectory_contour(
 
     add_corridor_offsets(vertices, corridor_half_width_m)
     contour_fields = [
+        *PDR_ROUTE_FIELDS,
+        "trajectory_route_distance_m",
         "vertex_id",
         "session",
         "contour_id",
@@ -305,6 +330,8 @@ def build_trajectory_contour(
         "max_link_distance_m": max_link_distance_m,
         "stationary_tolerance_m": stationary_tolerance_m,
         "explanation": (
+            "New route lengths accumulate detected step lengths independently of phone yaw; they are uncalibrated estimates. "
+            "Handheld phone XY is diagnostic only and has no geometric corridor. "
             "The contour follows time-ordered IMU/PDR samples. Unexplained long gaps break "
             "the contour even when endpoints are close. A CHECKPOINT_PAUSE to RESTART with "
             "unchanged step index and position may retain continuity under the documented "

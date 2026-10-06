@@ -1,8 +1,4 @@
-"""Preprocess classroom raw .sess data into WiFi, PDR, and image-ready tables.
-
-The script intentionally uses only the Python standard library so it can run on
-the raw-data folder without dependency setup.
-"""
+"""Prepare video frames, optional WiFi/IMU tables and a COLMAP workspace."""
 
 from __future__ import annotations
 
@@ -19,9 +15,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from colmap_bridge import prepare_colmap_workspace
-from image_mapping import build_image_wifi_tables, find_image_files, group_checkpoint_images, read_wifi_points
 from reconstruction_export import export_reconstruction_dataset
-from trajectory_contour import build_trajectory_contour
+from trajectory_contour import PDR_ROUTE_FIELDS, build_trajectory_contour
 from video_frames import run_video_frame_pipeline
 from wifi_positioning import run_wifi_positioning_pipeline
 from wifi_observations import MAX_WIFI_AGE_MS, MIN_WIFI_APS, WIFI_QUALITY_FIELDS, finite_number
@@ -41,7 +36,6 @@ class HeadingUnavailableError(ValueError):
 
 PROFILE_DEFAULTS = {
     "preview": {
-        "max_colmap_anchor_images_per_point": 10,
         "video_frame_interval_s": 1.5,
         "video_max_frames": 120,
         "video_blur_threshold": 80.0,
@@ -54,22 +48,15 @@ PROFILE_DEFAULTS = {
         "colmap_matcher": "constrained",
         "colmap_quality": "high",
         "colmap_dense_profile": "balanced",
-        "colmap_load_profile": "max",
         "colmap_num_threads": 0,
-        "colmap_stage_cooldown_s": 0,
-        "constrained_point_window": 1,
-        "constrained_slot_window": 2,
         "constrained_max_pdr_distance_m": 8.0,
         "constrained_video_frame_window": 3,
-        "constrained_video_anchor_point_window": 1,
-        "constrained_video_anchor_limit": 12,
         "image_similarity_max_pairs": 1000,
         "image_similarity_max_image_size": 720,
         "image_similarity_orb_features": 800,
         "image_similarity_min_visual_score": 0.22,
     },
     "balanced": {
-        "max_colmap_anchor_images_per_point": 12,
         "video_frame_interval_s": 1.5,
         "video_max_frames": 160,
         "video_blur_threshold": 75.0,
@@ -82,22 +69,15 @@ PROFILE_DEFAULTS = {
         "colmap_matcher": "constrained",
         "colmap_quality": "high",
         "colmap_dense_profile": "balanced",
-        "colmap_load_profile": "max",
         "colmap_num_threads": 0,
-        "colmap_stage_cooldown_s": 0,
-        "constrained_point_window": 1,
-        "constrained_slot_window": 2,
         "constrained_max_pdr_distance_m": 8.0,
         "constrained_video_frame_window": 4,
-        "constrained_video_anchor_point_window": 1,
-        "constrained_video_anchor_limit": 12,
         "image_similarity_max_pairs": 2500,
         "image_similarity_max_image_size": 800,
         "image_similarity_orb_features": 1200,
         "image_similarity_min_visual_score": 0.22,
     },
     "final": {
-        "max_colmap_anchor_images_per_point": 0,
         "video_frame_interval_s": 1.0,
         "video_max_frames": 240,
         "video_blur_threshold": 60.0,
@@ -110,22 +90,15 @@ PROFILE_DEFAULTS = {
         "colmap_matcher": "constrained",
         "colmap_quality": "extreme",
         "colmap_dense_profile": "complete",
-        "colmap_load_profile": "max",
         "colmap_num_threads": 0,
-        "colmap_stage_cooldown_s": 0,
-        "constrained_point_window": 2,
-        "constrained_slot_window": 3,
         "constrained_max_pdr_distance_m": 12.0,
         "constrained_video_frame_window": 6,
-        "constrained_video_anchor_point_window": 2,
-        "constrained_video_anchor_limit": 24,
         "image_similarity_max_pairs": 0,
         "image_similarity_max_image_size": 900,
         "image_similarity_orb_features": 1500,
         "image_similarity_min_visual_score": 0.22,
     },
     "rtx4080": {
-        "max_colmap_anchor_images_per_point": 0,
         "video_frame_interval_s": 0.75,
         "video_max_frames": 360,
         "video_blur_threshold": 50.0,
@@ -138,22 +111,15 @@ PROFILE_DEFAULTS = {
         "colmap_matcher": "constrained",
         "colmap_quality": "extreme",
         "colmap_dense_profile": "rtx4080",
-        "colmap_load_profile": "max",
         "colmap_num_threads": 0,
-        "colmap_stage_cooldown_s": 0,
-        "constrained_point_window": 2,
-        "constrained_slot_window": 3,
         "constrained_max_pdr_distance_m": 14.0,
         "constrained_video_frame_window": 7,
-        "constrained_video_anchor_point_window": 2,
-        "constrained_video_anchor_limit": 30,
         "image_similarity_max_pairs": 0,
         "image_similarity_max_image_size": 1000,
         "image_similarity_orb_features": 1800,
         "image_similarity_min_visual_score": 0.22,
     },
     "complete": {
-        "max_colmap_anchor_images_per_point": 0,
         "video_frame_interval_s": 0.5,
         "video_max_frames": 0,
         "video_blur_threshold": 40.0,
@@ -166,15 +132,9 @@ PROFILE_DEFAULTS = {
         "colmap_matcher": "constrained",
         "colmap_quality": "extreme",
         "colmap_dense_profile": "complete",
-        "colmap_load_profile": "max",
         "colmap_num_threads": 0,
-        "colmap_stage_cooldown_s": 0,
-        "constrained_point_window": 3,
-        "constrained_slot_window": 4,
         "constrained_max_pdr_distance_m": 16.0,
         "constrained_video_frame_window": 8,
-        "constrained_video_anchor_point_window": 3,
-        "constrained_video_anchor_limit": 36,
         "image_similarity_max_pairs": 0,
         "image_similarity_max_image_size": 1100,
         "image_similarity_orb_features": 2000,
@@ -229,6 +189,10 @@ class Step:
     heading_deg: float
     pdr_x: float
     pdr_y: float
+    route_distance_m: float = 0.0
+    pdr_heading_policy: str = "handheld"
+    pdr_heading_status: str = "available_uncalibrated"
+    pdr_position_status: str = "diagnostic_phone_heading"
 
 
 def normalize_mac(mac: str) -> str:
@@ -487,7 +451,10 @@ def compute_pdr(
     segments: Sequence[Segment],
     base_step_m: float,
     heading_offset_deg: float,
+    heading_policy: str = "handheld",
 ) -> List[Step]:
+    if heading_policy not in {"handheld", "phone-aligned"}:
+        raise ValueError("Unknown PDR heading policy")
     linear_accel = read_sensor(session_dir, 7)
     headings = read_heading_samples(session_dir)
 
@@ -502,17 +469,28 @@ def compute_pdr(
     x = 0.0
     y = 0.0
     steps: List[Step] = []
+    route_distance = 0.0
+    position_available = True
 
     for step_index, (segment, elapsed_ts, epoch_ts, peak_accel, accel_range) in enumerate(detected, start=1):
         normalized_range = max(accel_range, 0.05) / max(median_range, 0.05)
         step_length = base_step_m * (normalized_range ** 0.25)
         step_length = min(1.10, max(0.35, step_length))
-        heading = wrap_angle(interpolate_angle(headings, elapsed_ts) + heading_offset)
+        route_distance += step_length
+        try:
+            heading = wrap_angle(interpolate_angle(headings, elapsed_ts) + heading_offset)
+        except HeadingUnavailableError:
+            heading = math.nan
+            position_available = False
 
-        # Android yaw zero is roughly "north"; this convention leaves the final
-        # frame arbitrary until checkpoint anchors rotate/translate it.
-        x += step_length * math.sin(heading)
-        y += step_length * math.cos(heading)
+        # Phone yaw is not camera orientation or calibrated walking direction.
+        # A missing heading makes subsequent accumulated XY unavailable, while
+        # step counts and route distance remain usable without any heading.
+        if position_available:
+            x += step_length * math.sin(heading)
+            y += step_length * math.cos(heading)
+        else:
+            x = y = math.nan
         steps.append(
             Step(
                 session=session_dir.name,
@@ -527,6 +505,10 @@ def compute_pdr(
                 heading_deg=math.degrees(heading),
                 pdr_x=x,
                 pdr_y=y,
+                route_distance_m=route_distance,
+                pdr_heading_policy=heading_policy,
+                pdr_heading_status="available_uncalibrated" if math.isfinite(heading) else "unavailable",
+                pdr_position_status=("phone_aligned_assumption" if heading_policy == "phone-aligned" else "diagnostic_phone_heading") if position_available else "unavailable_heading",
             )
         )
     return steps
@@ -856,6 +838,7 @@ def build_pdr_tables(
     output_dir: Path,
     base_step_m: float,
     heading_offset_deg: float,
+    heading_policy: str = "handheld",
 ) -> Dict[str, Any]:
     event_rows: List[Dict[str, Any]] = []
     segment_rows: List[Dict[str, Any]] = []
@@ -868,12 +851,7 @@ def build_pdr_tables(
         session = session_dir.name
         events = read_events(session_dir)
         segments = build_segments(events)
-        pdr_error = ""
-        try:
-            steps = compute_pdr(session_dir, segments, base_step_m, heading_offset_deg)
-        except HeadingUnavailableError as exc:
-            steps = []
-            pdr_error = str(exc)
+        steps = compute_pdr(session_dir, segments, base_step_m, heading_offset_deg, heading_policy)
         pdr_available = bool(steps)
 
         summary[session] = {
@@ -881,8 +859,11 @@ def build_pdr_tables(
             "segment_count": len(segments),
             "step_count": len(steps),
             "distance_m": round(sum(step.step_length_m for step in steps), 6),
-            "status": "unavailable_heading" if pdr_error else "ok" if pdr_available else "no_detected_steps",
-            "error": pdr_error,
+            "status": "route_only" if pdr_available and (heading_policy == "handheld" or any(not math.isfinite(step.pdr_x) for step in steps)) else "ok" if pdr_available else "no_detected_steps",
+            "error": "",
+            "heading_policy": heading_policy,
+            "steps_without_heading": sum(step.pdr_heading_status == "unavailable" for step in steps),
+            "route_distance_basis": "detected_step_lengths_independent_of_phone_yaw_uncalibrated",
             "max_heading_gap_ms": MAX_HEADING_GAP_MS,
         }
 
@@ -896,6 +877,16 @@ def build_pdr_tables(
                 }
             )
             x, y, step_index = nearest_pdr_position(steps, event.elapsed_ts)
+            latest_step = steps[step_index - 1] if step_index else None
+            metadata = {
+                "route_distance_m": round(latest_step.route_distance_m, 6) if latest_step else 0.0 if pdr_available else "",
+                "route_distance_status": "estimated_steps" if pdr_available else "unavailable",
+                "pdr_heading_policy": heading_policy,
+                "pdr_heading_status": latest_step.pdr_heading_status if latest_step else "unavailable",
+                "pdr_position_status": latest_step.pdr_position_status if latest_step else "unavailable_heading",
+            }
+            if latest_step is None:
+                x = y = math.nan
             anchor_rows.append(
                 {
                     "session": session,
@@ -904,8 +895,9 @@ def build_pdr_tables(
                     "elapsed_ts": event.elapsed_ts,
                     "epoch_ts": event.epoch_ts,
                     "nearest_step_index": step_index,
-                    "pdr_x": round(x, 6) if pdr_available else "",
-                    "pdr_y": round(y, 6) if pdr_available else "",
+                    **metadata,
+                    "pdr_x": round(x, 6) if math.isfinite(x) else "",
+                    "pdr_y": round(y, 6) if math.isfinite(y) else "",
                     "room_x": "",
                     "room_y": "",
                     "comment": "fill room_x/room_y if this event is a known classroom checkpoint",
@@ -919,8 +911,9 @@ def build_pdr_tables(
                     "step_index": step_index,
                     "elapsed_ts": event.elapsed_ts,
                     "epoch_ts": event.epoch_ts,
-                    "pdr_x": round(x, 6) if pdr_available else "",
-                    "pdr_y": round(y, 6) if pdr_available else "",
+                    **metadata,
+                    "pdr_x": round(x, 6) if math.isfinite(x) else "",
+                    "pdr_y": round(y, 6) if math.isfinite(y) else "",
                     "step_length_m": "",
                     "heading_deg": "",
                 }
@@ -945,7 +938,13 @@ def build_pdr_tables(
             )
 
         for step in steps:
+            metadata = {
+                "route_distance_m": round(step.route_distance_m, 6), "route_distance_status": "estimated_steps",
+                "pdr_heading_policy": step.pdr_heading_policy, "pdr_heading_status": step.pdr_heading_status,
+                "pdr_position_status": step.pdr_position_status,
+            }
             row = {
+                **metadata,
                 "session": session,
                 "segment_id": step.segment_id,
                 "step_index": step.step_index,
@@ -954,24 +953,25 @@ def build_pdr_tables(
                 "peak_accel": round(step.peak_accel, 6),
                 "accel_range": round(step.accel_range, 6),
                 "step_length_m": round(step.step_length_m, 6),
-                "heading_rad": round(step.heading_rad, 9),
-                "heading_deg": round(step.heading_deg, 6),
-                "pdr_x": round(step.pdr_x, 6),
-                "pdr_y": round(step.pdr_y, 6),
+                "heading_rad": round(step.heading_rad, 9) if math.isfinite(step.heading_rad) else "",
+                "heading_deg": round(step.heading_deg, 6) if math.isfinite(step.heading_deg) else "",
+                "pdr_x": round(step.pdr_x, 6) if math.isfinite(step.pdr_x) else "",
+                "pdr_y": round(step.pdr_y, 6) if math.isfinite(step.pdr_y) else "",
             }
             step_rows.append(row)
             path_rows.append(
                 {
                     "session": session,
                     "point_type": "STEP",
+                    **metadata,
                     "segment_id": step.segment_id,
                     "step_index": step.step_index,
                     "elapsed_ts": step.elapsed_ts,
                     "epoch_ts": step.epoch_ts,
-                    "pdr_x": round(step.pdr_x, 6),
-                    "pdr_y": round(step.pdr_y, 6),
+                    "pdr_x": row["pdr_x"],
+                    "pdr_y": row["pdr_y"],
                     "step_length_m": round(step.step_length_m, 6),
-                    "heading_deg": round(step.heading_deg, 6),
+                    "heading_deg": row["heading_deg"],
                 }
             )
 
@@ -1000,6 +1000,7 @@ def build_pdr_tables(
     write_csv(
         output_dir / "pdr_steps.csv",
         [
+            *PDR_ROUTE_FIELDS,
             "session",
             "segment_id",
             "step_index",
@@ -1019,6 +1020,7 @@ def build_pdr_tables(
     write_csv(
         output_dir / "pdr_path.csv",
         [
+            *PDR_ROUTE_FIELDS,
             "session",
             "point_type",
             "segment_id",
@@ -1035,6 +1037,7 @@ def build_pdr_tables(
     write_csv(
         output_dir / "alignment_anchor_template.csv",
         [
+            *PDR_ROUTE_FIELDS,
             "session",
             "anchor_id",
             "event",
@@ -1053,7 +1056,6 @@ def build_pdr_tables(
     return summary
 
 
-
 def build_wifi_pdr_feature_table(output_dir: Path) -> Dict[str, Any]:
     wifi_path = output_dir / "wifi_wide_selected.csv"
     contour_path = output_dir / "pdr_trajectory_contour.csv"
@@ -1068,15 +1070,19 @@ def build_wifi_pdr_feature_table(output_dir: Path) -> Dict[str, Any]:
         for row in reader:
             try:
                 elapsed_ts = int(row["elapsed_ts"])
-                pdr_x = float(row["pdr_x"])
-                pdr_y = float(row["pdr_y"])
             except (KeyError, TypeError, ValueError):
+                continue
+            pdr_x, pdr_y = safe_float(row.get("pdr_x")), safe_float(row.get("pdr_y"))
+            has_route = row.get("route_distance_status") == "estimated_steps" and math.isfinite(safe_float(row.get("route_distance_m")))
+            if not has_route and not (math.isfinite(pdr_x) and math.isfinite(pdr_y)):
                 continue
             pdr_by_session.setdefault(row["session"], []).append(
                 {
                     "elapsed_ts": elapsed_ts,
                     "pdr_x": pdr_x,
                     "pdr_y": pdr_y,
+                    **{field: row.get(field, "") for field in PDR_ROUTE_FIELDS},
+                    "trajectory_route_distance_m": row.get("trajectory_route_distance_m", ""),
                     "point_type": row.get("source_point_type", row.get("point_type", "")),
                     "step_index": row.get("source_step_index", row.get("step_index", "")),
                     "trajectory_contour_id": row.get("contour_id", ""),
@@ -1093,6 +1099,7 @@ def build_wifi_pdr_feature_table(output_dir: Path) -> Dict[str, Any]:
         reader = csv.DictReader(handle)
         wifi_fields = reader.fieldnames or []
         fieldnames = wifi_fields + [
+            *PDR_ROUTE_FIELDS, "trajectory_route_distance_m",
             "pdr_x",
             "pdr_y",
             "pdr_interp_status",
@@ -1114,6 +1121,8 @@ def build_wifi_pdr_feature_table(output_dir: Path) -> Dict[str, Any]:
             fused_row = dict(row)
             fused_row.update(
                 {
+                    **{field: pdr_state.get(field, "") for field in PDR_ROUTE_FIELDS},
+                    "trajectory_route_distance_m": pdr_state.get("trajectory_route_distance_m", ""),
                     "pdr_x": "" if pdr_state["pdr_x"] is None else round(float(pdr_state["pdr_x"]), 6),
                     "pdr_y": "" if pdr_state["pdr_y"] is None else round(float(pdr_state["pdr_y"]), 6),
                     "pdr_interp_status": pdr_state["status"],
@@ -1165,8 +1174,19 @@ def trajectory_state(
     return left_id, f"{contour_distance:.6f}", f"{route_distance:.6f}", "interpolated_contour"
 
 
+def interpolated_route_metadata(left: Dict[str, Any], right: Dict[str, Any], ratio: float) -> Dict[str, Any]:
+    result = {field: left.get(field, "") if left.get(field, "") == right.get(field, "") else "unavailable" for field in PDR_ROUTE_FIELDS}
+    for key in ("route_distance_m", "trajectory_route_distance_m"):
+        a, b = safe_float(left.get(key)), safe_float(right.get(key))
+        result[key] = round(a + ratio * (b - a), 6) if all(math.isfinite(v) for v in (a, b)) and left.get("route_distance_status") == right.get("route_distance_status") == "estimated_steps" else ""
+    result["pdr_position_status"] = result.get("pdr_position_status") or "legacy_unknown"
+    return result
+
+
 def interpolate_pdr_state(points: Sequence[Dict[str, Any]], target_elapsed_ts: int) -> Dict[str, Any]:
     empty = {
+        **{field: "" for field in PDR_ROUTE_FIELDS},
+        "trajectory_route_distance_m": "",
         "pdr_x": None,
         "pdr_y": None,
         "status": "no_pdr_points",
@@ -1184,8 +1204,9 @@ def interpolate_pdr_state(points: Sequence[Dict[str, Any]], target_elapsed_ts: i
         point = points[0]
         contour_id, contour_distance, route_distance, contour_status = trajectory_state(point, point, 0.0)
         return {
-            "pdr_x": point["pdr_x"],
-            "pdr_y": point["pdr_y"],
+            **interpolated_route_metadata(point, point, 0.0),
+            "pdr_x": point["pdr_x"] if math.isfinite(safe_float(point["pdr_x"])) else None,
+            "pdr_y": point["pdr_y"] if math.isfinite(safe_float(point["pdr_y"])) else None,
             "status": "before_path",
             "gap_ms": str(abs(point["elapsed_ts"] - target_elapsed_ts)),
             "left_type": point["point_type"],
@@ -1199,8 +1220,9 @@ def interpolate_pdr_state(points: Sequence[Dict[str, Any]], target_elapsed_ts: i
         point = points[-1]
         contour_id, contour_distance, route_distance, contour_status = trajectory_state(point, point, 0.0)
         return {
-            "pdr_x": point["pdr_x"],
-            "pdr_y": point["pdr_y"],
+            **interpolated_route_metadata(point, point, 0.0),
+            "pdr_x": point["pdr_x"] if math.isfinite(safe_float(point["pdr_x"])) else None,
+            "pdr_y": point["pdr_y"] if math.isfinite(safe_float(point["pdr_y"])) else None,
             "status": "after_path",
             "gap_ms": str(abs(target_elapsed_ts - point["elapsed_ts"])),
             "left_type": point["point_type"],
@@ -1227,8 +1249,9 @@ def interpolate_pdr_state(points: Sequence[Dict[str, Any]], target_elapsed_ts: i
     if left.get("trajectory_contour_id") and right.get("trajectory_contour_id") and left["trajectory_contour_id"] != right["trajectory_contour_id"]:
         return {**empty, "status": "contour_break", "gap_ms": str(span), "trajectory_status": contour_status}
     return {
-        "pdr_x": left["pdr_x"] + ratio * (right["pdr_x"] - left["pdr_x"]),
-        "pdr_y": left["pdr_y"] + ratio * (right["pdr_y"] - left["pdr_y"]),
+        **interpolated_route_metadata(left, right, ratio),
+        "pdr_x": left["pdr_x"] + ratio * (right["pdr_x"] - left["pdr_x"]) if all(math.isfinite(safe_float(p["pdr_x"])) for p in (left, right)) else None,
+        "pdr_y": left["pdr_y"] + ratio * (right["pdr_y"] - left["pdr_y"]) if all(math.isfinite(safe_float(p["pdr_y"])) for p in (left, right)) else None,
         "status": "exact_or_duplicate" if span <= 0 else "interpolated",
         "gap_ms": "0" if span <= 0 else str(span),
         "left_type": left["point_type"],
@@ -1282,22 +1305,18 @@ def automatic_profile(hardware: Dict[str, Any]) -> str:
 
 def print_workload_summary(
     profile: str,
-    load_profile: str,
     colmap_num_threads: int,
-    stage_cooldown_s: int,
     dense_max_image_size: int,
     feature_max_image_size: int,
     max_num_features: int,
     matcher: str,
     dense_profile: str,
     video_max_frames: int,
-    max_anchor_images_per_point: int,
     image_similarity_enabled: bool,
     image_similarity_max_pairs: int,
     image_similarity_max_image_size: int,
     image_similarity_orb_features: int,
 ) -> None:
-    anchor_text = "all" if max_anchor_images_per_point <= 0 else str(max_anchor_images_per_point)
     video_text = "uncapped" if video_max_frames <= 0 else str(video_max_frames)
     similarity_text = (
         "disabled"
@@ -1305,12 +1324,12 @@ def print_workload_summary(
         else ("all constrained pairs" if image_similarity_max_pairs <= 0 else f"top {image_similarity_max_pairs} pairs")
     )
     print(
-        "[load] "
-        f"profile={profile}, load_profile={load_profile}, matcher={matcher}, dense_profile={dense_profile}, "
+        "[settings] "
+        f"profile={profile}, matcher={matcher}, dense_profile={dense_profile}, "
         f"dense_max_image_size={dense_max_image_size}, feature_max_image_size={feature_max_image_size}, "
-        f"max_features={max_num_features}, anchor_images_per_point={anchor_text}, "
-        f"video_max_frames={video_text}, colmap_threads={colmap_num_threads}, "
-        f"stage_cooldown_s={stage_cooldown_s}, image_similarity={similarity_text}, "
+        f"max_features={max_num_features}, "
+        f"video_max_frames={video_text}, colmap_threads={colmap_num_threads or 'automatic'}, "
+        f"image_similarity={similarity_text}, "
         f"image_similarity_size={image_similarity_max_image_size}, image_similarity_orb={image_similarity_orb_features}",
         flush=True,
     )
@@ -1325,17 +1344,62 @@ def log_stage(message: str) -> None:
     print(f"[stage] {message}", flush=True)
 
 
-def log_stage_done(number: int, summary: Any, skipped_reason: Optional[str] = None) -> None:
+def log_stage_done(label: str, summary: Any, skipped_reason: Optional[str] = None) -> None:
     if isinstance(summary, dict) and summary.get("status") == "skipped":
-        print(f"[skip] {number}/8 {skipped_reason or 'disabled by command-line options'}", flush=True)
+        print(f"[skip] {label} {skipped_reason or 'disabled by command-line options'}", flush=True)
+
+
+def validate_numeric_options(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Reject invalid sensor/matching settings before main resets any output."""
+    def check(name, predicate, requirement):
+        value = getattr(args, name)
+        if value is not None and (not math.isfinite(value) or not predicate(value)):
+            parser.error('--' + name.replace('_', '-') + ' must be finite and ' + requirement)
+
+    for name in ('wifi_grid_cell_size_m', 'wifi_localization_k', 'base_step_m', 'min_scan_count',
+                 'colmap_max_num_matches', 'constrained_video_frame_window',
+                 'constrained_max_pdr_distance_m', 'image_similarity_orb_features'):
+        check(name, lambda value: value > 0, 'positive')
+    for name in ('max_rssi_std', 'image_similarity_max_pairs', 'image_similarity_max_image_size',
+                 'visual_recovery_neighbors', 'colmap_feature_max_image_size', 'colmap_max_num_features',
+                 'camera_height_m'):
+        check(name, lambda value: value >= 0, 'nonnegative')
+    for name in ('min_detection_rate', 'image_similarity_min_visual_score'):
+        check(name, lambda value: 0 <= value <= 1, 'in [0,1]')
+    check('min_mean_rssi', lambda value: value <= 0, 'nonpositive')
+    check('heading_offset_deg', lambda value: True, 'a valid angle')
+    # COLMAP accepts -1 for native resolution; zero/other negatives are invalid.
+    check('colmap_dense_max_image_size', lambda value: value == -1 or value > 0,
+          '-1 (native resolution) or positive')
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--preprocess-workers', type=int, choices=(1, 2), default=2,
-                        help='Independent WiFi/PDR processes (default: 2); use 1 for serial execution.')
+    parser.set_defaults(video_input_mode="sensor_assisted")
+    parser.add_argument('--cpu-workers', type=int, default=0,
+                        help='Default CPU budget for decoder, image analysis and COLMAP: 0=all available CPUs; stage overrides take precedence.')
+    parser.add_argument('--video-decode-threads', type=int, default=0,
+                        help='FFmpeg video decoding threads: 0=inherit CPU budget, positive values override it.')
+    parser.add_argument('--video-hw-decode', choices=('auto', 'off'), default='auto',
+                        help='Prefer hardware video decoding; Windows auto selects an NVIDIA DXGI adapter when available. CPU workers are unchanged.')
+    parser.add_argument('--video-hw-device', type=int, default=-1,
+                        help='Video backend adapter index (-1=automatic); this is not a CUDA device index.')
+    parser.add_argument('--preprocess-workers', type=int, choices=(0, 1, 2), default=0,
+                        help='Independent WiFi/PDR processes: 0=automatic (up to two branches), 1=serial, 2=parallel.')
     parser.add_argument("--root", type=Path, default=Path.cwd(), help="Folder containing .sess directories.")
-    parser.add_argument("--output", type=Path, default=Path("processed"), help="Output folder.")
+    parser.add_argument("--output", type=Path, default=Path("generated/processed"), help="Output folder.")
+    parser.add_argument("--video-only", dest="video_input_mode", action="store_const", const="visual",
+                        help="Disable sensor processing unless --video-sensor-sync is supplied.")
+    parser.add_argument("--video-sensor-sync", type=Path,
+                        help="Explicit clock anchors CSV: video_name,session,video_time_s,sensor_elapsed_ts. Enables timestamp-validated IMU/PDR and fresh WiFi matching assistance.")
+    parser.add_argument("--video-sensor-alignment", choices=("fuzzy", "strict", "off"),
+                        help="Fuzzy uses embedded recording time plus an uncertainty window for soft candidates; explicit sync CSV takes precedence. Sensor-assisted video defaults to fuzzy.")
+    parser.add_argument("--video-sensor-time-uncertainty-s", type=float, default=30.,
+                        help="Assumed +/- clock uncertainty for fuzzy matching, in (0,300] seconds (default: 30); not a measured accuracy.")
+    parser.add_argument("--video-sensor-offset-s", type=float, default=0.,
+                        help="Add this correction to the embedded video wall clock when proposing sensor windows, in [-3600,3600] seconds.")
+    parser.add_argument("--run-colmap", action="store_true",
+                        help="main.py: explicitly require reconstruction after preprocessing (already the default); incompatible with preparation/export skip options.")
     parser.add_argument(
         "--reconstruction-profile",
         choices=["auto", "preview", "balanced", "final", "rtx4080", "complete"],
@@ -1348,22 +1412,17 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--min-scan-count", type=int, default=5)
     parser.add_argument("--base-step-m", type=float, default=DEFAULT_BASE_STEP_M)
     parser.add_argument("--heading-offset-deg", type=float, default=0.0)
-    parser.add_argument("--pic-dir", type=Path, default=Path("pic"), help="Folder containing ordered photos.")
-    parser.add_argument("--images-per-wifi-point", type=int, default=20)
-    parser.add_argument("--photo-grouping", choices=("fuzzy", "fixed"), default="fuzzy",
-                        help="Use camera capture pauses with a soft photo-count prior, or require fixed-count groups.")
-    parser.add_argument("--photo-group-tolerance", type=int,
-                        help="Allowed count deviation per group; default is half the reference count. Ambiguous boundaries retain fixed grouping.")
-    parser.add_argument("--photo-checkpoint-map", type=Path,
-                        help="CSV with session,point_index,image_name; allows variable photos per stop. Relative to --root.")
-    parser.add_argument("--point-event", default="CHECKPOINT_PAUSE")
-    parser.add_argument("--skip-image-wifi", action="store_true", help="Do not build image/WiFi mapping outputs.")
+    parser.add_argument("--pdr-heading-policy", choices=("handheld", "phone-aligned"), default="handheld",
+                        help="Use yaw-independent route distances by default; phone-aligned explicitly assumes stable phone-to-walking heading, never camera attitude.")
     parser.add_argument("--video-dir", type=Path, default=Path("video"), help="Folder containing route/base videos.")
     parser.add_argument("--skip-video-frames", action="store_true", help="Do not extract video frames for COLMAP.")
-    parser.add_argument("--exclude-unassigned-images", action="store_true", help="Exclude extra readable photos without checkpoint labels (included as visual-only inputs by default).")
     parser.add_argument("--video-frame-interval-s", type=float)
     parser.add_argument("--video-max-frames", type=int, help="Max frames to extract per video; use 0 for no cap.")
-    parser.add_argument("--video-blur-threshold", type=float, help="Drop video frames below this Laplacian blur score; use 0 to disable.")
+    parser.add_argument("--video-blur-threshold", type=float, help="Laplacian blur threshold (adaptive policy uses it as a ceiling); 0 disables relative blur rejection, while adaptive blank/detail floors remain.")
+    parser.add_argument("--video-blur-policy", choices=("fixed", "adaptive"),
+                        help="Adaptive sharpness selection is the default; fixed uses an absolute threshold.")
+    parser.add_argument("--video-keyframe-max-gap-s", type=float, default=2.0,
+                        help="Adaptive selection targets this maximum temporal gap using usable native frames; cannot recover unobserved views.")
     parser.add_argument("--video-keyframe-min-change", type=float, help="Drop near-duplicate video frames below this mean grayscale difference; use 0 to disable.")
     parser.add_argument("--video-keyframe-min-gap", type=int, help="Minimum gap in extracted-frame steps between kept video keyframes.")
     parser.add_argument("--video-refine-window-s", type=float, default=0., help="Native candidate search radius around each sampled time; 0 disables.")
@@ -1373,24 +1432,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--videoscene-max-clips", type=int, default=3, help="Maximum distinct local 49-view gap proposals, processed sequentially; not full-video restoration.")
     parser.add_argument("--videoscene-budget-hours", type=float, default=4., help="Completion-only time budget; not an end-to-end reconstruction deadline.")
     parser.add_argument("--ffmpeg-exe", type=Path, help="Optional path to ffmpeg.exe.")
-    parser.add_argument("--reconstruction-output", type=Path, default=Path("reconstruction_dataset"))
+    parser.add_argument("--reconstruction-output", type=Path, default=Path("generated/reconstruction_dataset"))
     parser.add_argument("--skip-reconstruction-export", action="store_true")
-    parser.add_argument(
-        "--max-colmap-anchor-images-per-point",
-        type=int,
-        help="Limit exported point photos per WiFi/checkpoint; balanced defaults to circular 12-of-20, final defaults to all.",
-    )
     parser.add_argument("--camera-height-m", type=float, default=1.50)
-    parser.add_argument("--slot-yaw-start-deg", type=float, default=0.0)
-    parser.add_argument(
-        "--slot-yaw-step-deg",
-        type=float,
-        help="Yaw step between ordered point photos. Defaults to 360 / images-per-wifi-point.",
-    )
     parser.add_argument("--skip-wifi-positioning", action="store_true")
     parser.add_argument("--wifi-grid-cell-size-m", type=float, default=1.0)
     parser.add_argument("--wifi-localization-k", type=int, default=3)
-    parser.add_argument("--colmap-workspace", type=Path, default=Path("colmap_workspace"))
+    parser.add_argument("--colmap-workspace", type=Path, default=Path("generated/colmap_workspace"))
     parser.add_argument("--colmap-log-level", choices=("compact", "verbose"), default="compact",
                         help="Console detail for preprocessing and COLMAP; full reports/logs are saved to disk.")
     parser.add_argument("--colmap-dir", type=Path, default=Path("colmap-x64-windows-cuda"))
@@ -1400,64 +1448,170 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=Path,
         help=(
             "Optional COLMAP mask directory for semantic clutter or known reflective-region filtering. "
-            "Masks must follow generated image_list names, for example anchors/image.png or video/frame.png."
+            "Masks must follow generated image_list names, for example video/frame.png."
         ),
     )
     parser.add_argument("--skip-colmap-prepare", action="store_true")
-    parser.add_argument("--visual-only", action="store_true", help="Prepare COLMAP without PDR distance fallback or PDR model alignment.")
+    parser.add_argument("--visual-only", action="store_true", help="Prepare COLMAP without sensor matching assistance or RF boundary reporting.")
     parser.add_argument("--colmap-camera-model", default="SIMPLE_RADIAL")
     parser.add_argument("--colmap-matcher", choices=["constrained", "hybrid", "exhaustive", "sequential"])
     parser.add_argument("--colmap-quality", choices=["low", "medium", "high", "extreme"])
     parser.add_argument("--colmap-dense-max-image-size", type=int)
-    parser.add_argument("--colmap-dense-profile", choices=["balanced", "rtx4080", "complete"], help="Dense/MVS parameter profile written into run_colmap_dense.bat.")
-    parser.add_argument(
-        "--colmap-load-profile",
-        choices=["standard", "max"],
-        help="COLMAP load settings; defaults to max (automatic threads, no cooldown).",
-    )
+    parser.add_argument("--colmap-dense-profile", choices=["balanced", "efficient", "rtx4080", "complete"], help="Dense/MVS settings; video-only defaults to efficient, with geometric consistency retained.")
+    parser.add_argument("--dense-max-images", type=int, default=1200,
+                        help="Hard dense-view limit (default: 1200); adaptive selection can stop earlier. 0 uses all eligible views.")
+    parser.add_argument("--dense-selection-mode", choices=("adaptive", "fixed"), default="adaptive",
+                        help="Add views until coverage targets or the hard limit are reached; fixed restores count-only selection.")
+    parser.add_argument("--dense-initial-images", type=int, default=480,
+                        help="Initial adaptive view budget, clamped to the hard limit (default: 480).")
+    parser.add_argument("--dense-min-single-coverage", type=float, default=.9,
+                        help="Target fraction of original sparse points seen by selected views (default: 0.9).")
+    parser.add_argument("--dense-min-three-coverage", type=float, default=.8,
+                        help="Target retained fraction of original three-view sparse tracks (default: 0.8).")
+    parser.add_argument("--dense-max-video-gap-s", type=float, default=4.,
+                        help="Target selected-view time gap; missing source observations remain reported (default: 4s).")
+    parser.add_argument("--dense-max-source-images", type=int, default=12,
+                        help="Maximum selected source views per dense reference (default: 12).")
     parser.add_argument(
         "--colmap-num-threads",
         type=int,
-        help="Thread cap passed to supported COLMAP stages; use 0 for COLMAP defaults.",
-    )
-    parser.add_argument(
-        "--colmap-stage-cooldown-s",
-        type=int,
-        help="Seconds to wait between heavy COLMAP stages to lower sustained peak load.",
+        help="Thread count for supported COLMAP stages; 0 (default) selects automatic threading.",
     )
     meshing = parser.add_mutually_exclusive_group()
-    meshing.add_argument("--colmap-meshing", dest="skip_colmap_meshing", action="store_false", help="Generate and retain Delaunay/Poisson inspection meshes; final.ply remains the observed point cloud.")
+    meshing.add_argument("--colmap-meshing", dest="skip_colmap_meshing", action="store_false", help="Generate and retain Delaunay/Poisson inspection meshes separately from final.ply.")
     meshing.add_argument("--skip-colmap-meshing", dest="skip_colmap_meshing", action="store_true", help="Skip optional inspection meshes (default).")
     parser.set_defaults(skip_colmap_meshing=True)
+    parser.add_argument("--keep-generated-inputs", action="store_true", help="Keep main.py's generated video frames and exported image copies after successful reconstruction.")
+    parser.add_argument('--skip-startup-cleanup', action='store_true',
+                        help='Keep historical reconstruction caches at startup; current selected outputs still follow the normal fresh-run policy.')
     parser.add_argument("--skip-point-cloud-filter", action="store_true", help="Skip the filtered fused point cloud post-processing output.")
+    parser.add_argument("--point-filter-method", choices=("observed", "wifi-density", "connected-density"), default="observed",
+                        help="Observed preserves unknown/weak surfaces and removes only verified conflicts; density methods are legacy alternatives.")
+    parser.add_argument("--point-filter-max-candidates", type=int, default=2000000,
+                        help="Maximum points assessed against depth maps (1..2000000); unassessed points are retained in observed mode.")
+    parser.add_argument("--point-filter-budget-seconds", type=float, default=120.,
+                        help="Observation assessment time budget, excluding input verification and PLY I/O (default: 120s).")
     parser.add_argument("--colmap-feature-max-image-size", type=int)
     parser.add_argument("--colmap-max-num-features", type=int)
     parser.add_argument("--colmap-max-num-matches", type=int)
-    parser.add_argument("--constrained-point-window", type=int)
-    parser.add_argument("--constrained-slot-window", type=int)
     parser.add_argument(
         "--constrained-max-pdr-distance-m",
         type=float,
         help=(
-            "Maximum along-route PDR contour distance for extra checkpoint matches. "
-            "Older exports without contour metadata fall back to XY PDR proximity."
+            "Maximum along-route distance for synchronized video sensor candidates. "
+            "Fuzzy timing windows use their supported route-distance intervals."
         ),
     )
     parser.add_argument("--constrained-video-frame-window", type=int)
-    parser.add_argument("--constrained-video-anchor-point-window", type=int)
-    parser.add_argument("--constrained-video-anchor-limit", type=int)
     parser.add_argument("--skip-image-similarity", action="store_true", help="Disable P1 selection and visual recovery; retain route/order candidates.")
     parser.add_argument("--skip-wifi-recovery", action="store_true", help="Disable WiFi pair retrieval and RF ranking in targeted recovery; retain IMU/PDR and visual recovery.")
-    parser.add_argument("--pdr-capture-mode", choices=("auto", "stationary", "off"), default="auto",
-                        help="PDR alignment: auto uses explicitly tagged same-location photo groups; stationary confirms stop capture; off disables checkpoint alignment for moving capture.")
-    parser.add_argument("--visual-recovery-neighbors", type=int, default=12, help="Appearance-retrieved candidates per image outside route/slot windows; require geometric verification. Use 0 to disable.")
+    parser.add_argument("--visual-recovery-neighbors", type=int, default=12, help="Appearance-retrieved candidates per image outside local video windows; require geometric verification. Use 0 to disable.")
     parser.add_argument("--image-similarity-max-pairs", type=int, help="Analyze all constrained pairs by default when profile value is 0; set a positive cap for a faster sample.")
     parser.add_argument("--image-similarity-max-image-size", type=int, help="Resize longest image side before ORB similarity analysis.")
     parser.add_argument("--image-similarity-orb-features", type=int, help="ORB feature count per image for match-pair diagnostics.")
-    parser.add_argument('--image-similarity-workers', type=int, choices=range(9), default=0,
-                        help='Parallel image feature readers: 0=auto (up to 8 on 16+ logical CPUs), 1=serial, 2-8=explicit.')
+    parser.add_argument('--image-similarity-workers', type=int, default=0,
+                        help='Parallel image feature and pair-verification workers: 0=inherit CPU budget, positive values override it.')
+    parser.add_argument('--colmap-ba-gpu', choices=('auto', 'on', 'off'), default='auto',
+                        help='Probe GPU sparse BA support; auto falls back visibly to CPU, on requires verified support.')
+    parser.add_argument('--sparse-strategy', choices=('all', 'backbone'), default='all',
+                        help='all keeps every frame in mapping; backbone seeds a protected video subset then expands to all frames.')
+    parser.add_argument('--sparse-ba-growth-ratio', type=float, default=1.1,
+                        help='Global BA image/point growth trigger; 1.1 keeps native frequency, opt-in 1.2 reduces growth-triggered solves.')
+    parser.add_argument('--sparse-keyframe-gap-s', type=float, default=1.,
+                        help='Target temporal spacing of backbone frames; weak matching segments retain extra frames.')
     parser.add_argument("--image-similarity-min-visual-score", type=float, help="Score threshold for feature-overlap diagnostic labels.")
     args = parser.parse_args(argv)
+    validate_numeric_options(parser, args)
+    if args.video_hw_device < -1:
+        parser.error('--video-hw-device must be -1 (automatic) or nonnegative')
+    import math
+    if not math.isfinite(args.sparse_ba_growth_ratio) or args.sparse_ba_growth_ratio <= 1:
+        parser.error('--sparse-ba-growth-ratio must be finite and greater than 1')
+    if not math.isfinite(args.sparse_keyframe_gap_s) or args.sparse_keyframe_gap_s <= 0:
+        parser.error('--sparse-keyframe-gap-s must be finite and positive')
+    for name in ('cpu_workers', 'video_decode_threads', 'image_similarity_workers'):
+        if getattr(args, name) < 0:
+            parser.error('--' + name.replace('_', '-') + ' must be nonnegative')
+    args.sensor_processing_enabled = args.video_input_mode == "sensor_assisted" or args.video_sensor_sync is not None
+    if args.sensor_processing_enabled and args.video_sensor_sync is None and args.video_sensor_alignment != "off" and not args.visual_only:
+        conventional_sync = args.root.resolve() / "video_sensor_sync.csv"
+        if conventional_sync.is_file():
+            args.video_sensor_sync = conventional_sync
+    if args.video_sensor_alignment is None:
+        args.video_sensor_alignment = "fuzzy" if args.sensor_processing_enabled else "strict"
+    if not math.isfinite(args.video_sensor_time_uncertainty_s) or not 0 < args.video_sensor_time_uncertainty_s <= 300:
+        parser.error("--video-sensor-time-uncertainty-s must be finite and in (0,300]")
+    if not math.isfinite(args.video_sensor_offset_s) or abs(args.video_sensor_offset_s) > 3600:
+        parser.error("--video-sensor-offset-s must be finite and in [-3600,3600]")
+    if args.video_sensor_sync is not None:
+        if args.video_sensor_alignment == "off":
+            parser.error("--video-sensor-sync cannot be combined with --video-sensor-alignment off")
+        if args.visual_only or args.skip_video_frames:
+            parser.error("--video-sensor-sync cannot be combined with --visual-only or --skip-video-frames")
+        try:
+            from video_sensor_fusion import load_video_sensor_sync
+            load_video_sensor_sync(args.root.resolve() / args.video_sensor_sync)
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
+        args.video_sensor_alignment = "strict"
+    if args.skip_video_frames:
+        parser.error("--video-only cannot be combined with --skip-video-frames")
+    if not args.sensor_processing_enabled:
+        args.visual_only = True
+        args.skip_wifi_recovery = True
+        args.skip_wifi_positioning = True
+    if args.colmap_dense_profile is None:
+        args.colmap_dense_profile = "efficient"
+    # Retain coverage across the whole video instead of a small fixed frame cap.
+    if args.video_max_frames is None:
+        args.video_max_frames = 0
+    if args.video_frame_interval_s is None:
+        args.video_frame_interval_s = 0.5
+    if args.video_keyframe_min_gap is None:
+        args.video_keyframe_min_gap = 1
+    if args.video_keyframe_min_change is None:
+        args.video_keyframe_min_change = 2.0
+    for field, default in (("output", "processed"), ("reconstruction_output", "reconstruction_dataset"),
+                           ("colmap_workspace", "colmap_workspace")):
+        if getattr(args, field) == Path(default):
+            suffix = "_video_sensors" if args.sensor_processing_enabled else "_video_only"
+            setattr(args, field, Path(default + suffix))
+    if args.video_blur_policy is None:
+        args.video_blur_policy = "adaptive"
+    if args.dense_max_images != 0 and args.dense_max_images < 3:
+        parser.error("--dense-max-images must be 0 (all views) or at least 3")
+    if not 2 <= args.dense_max_source_images <= 64:
+        parser.error("--dense-max-source-images must be in [2,64]")
+    if args.dense_initial_images < 3:
+        parser.error("--dense-initial-images must be at least 3")
+    for name in ("dense_min_single_coverage", "dense_min_three_coverage"):
+        value = getattr(args, name)
+        if not math.isfinite(value) or not 0 < value <= 1:
+            parser.error("--" + name.replace("_", "-") + " must be finite and in (0,1]")
+    if not math.isfinite(args.dense_max_video_gap_s) or args.dense_max_video_gap_s <= 0:
+        parser.error("--dense-max-video-gap-s must be finite and positive")
+    if not 1 <= args.point_filter_max_candidates <= 2000000:
+        parser.error("--point-filter-max-candidates must be in [1,2000000]")
+    if not math.isfinite(args.point_filter_budget_seconds) or args.point_filter_budget_seconds <= 0:
+        parser.error("--point-filter-budget-seconds must be finite and positive")
+    if args.video_frame_interval_s is not None and (
+            not math.isfinite(args.video_frame_interval_s) or args.video_frame_interval_s <= 0):
+        parser.error("--video-frame-interval-s must be finite and greater than zero")
+    if args.video_max_frames is not None and args.video_max_frames < 0:
+        parser.error("--video-max-frames must be nonnegative; use 0 for no cap")
+    for name in ("video_blur_threshold", "video_keyframe_min_change"):
+        value = getattr(args, name)
+        if value is not None and (not math.isfinite(value) or value < 0):
+            parser.error("--" + name.replace("_", "-") + " must be finite and nonnegative")
+    if args.video_keyframe_min_gap is not None and args.video_keyframe_min_gap < 1:
+        parser.error("--video-keyframe-min-gap must be at least 1")
+    if not math.isfinite(args.video_keyframe_max_gap_s) or args.video_keyframe_max_gap_s <= 0:
+        parser.error("--video-keyframe-max-gap-s must be finite and greater than zero")
+    if args.colmap_num_threads is not None and args.colmap_num_threads < 0:
+        parser.error("--colmap-num-threads must be non-negative; use 0 for automatic selection")
+    if args.run_colmap and (args.skip_colmap_prepare or args.skip_reconstruction_export
+                          ):
+        parser.error("--run-colmap requires reconstruction export and COLMAP preparation")
     if args.scene_completion == "videoscene" and args.skip_point_cloud_filter:
         parser.error("VideoScene requires point-cloud filtering; remove --skip-point-cloud-filter or use --scene-completion off")
     if not math.isfinite(args.video_refine_window_s) or not 0 <= args.video_refine_window_s <= 2:
@@ -1468,21 +1622,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("--videoscene-budget-hours must be in (0,20]")
     if not math.isfinite(args.video_refine_budget_hours) or not 0 < args.video_refine_budget_hours <= 20:
         parser.error("--video-refine-budget-hours must be in (0,20]")
-    if args.images_per_wifi_point <= 0:
-        parser.error("--images-per-wifi-point must be greater than zero")
-    if args.photo_group_tolerance is not None and not 0 <= args.photo_group_tolerance < args.images_per_wifi_point:
-        parser.error("--photo-group-tolerance must be nonnegative and smaller than --images-per-wifi-point")
-    if args.photo_checkpoint_map is not None and not args.skip_image_wifi:
-        # main.py parses before offering a rebuild/reset of existing results.
-        try:
-            root = args.root.resolve()
-            group_checkpoint_images(
-                find_image_files(root / args.pic_dir),
-                read_wifi_points(find_session_dirs(root), args.point_event),
-                args.images_per_wifi_point, root / args.photo_checkpoint_map,
-            )
-        except (OSError, ValueError) as exc:
-            parser.error(str(exc))
     return args
 
 
@@ -1506,7 +1645,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # Different reconstruction workspaces must not concurrently overwrite
         # a shared preprocessing/export directory. Acquire all locks before work.
         directories = {workspace.resolve(), (root / args.output).resolve()}
-        if not args.skip_reconstruction_export and not args.skip_image_wifi:
+        if not args.skip_reconstruction_export:
             directories.add((root / args.reconstruction_output).resolve())
         with ExitStack() as locks:
             for directory in sorted(directories):
@@ -1534,12 +1673,21 @@ def run_pipeline(args) -> int:
     require_fresh_workspace(args.root.resolve() / args.colmap_workspace)
     requested_profile = args.reconstruction_profile
     hardware = detect_nvidia_gpu()
+    from gpu_image_ops import configure_gpu_image_ops, sharpness_diagnostics
+    configure_gpu_image_ops(prefer_nvidia=bool(hardware.get('cuda_enabled')))
+    from compute_resources import pipeline_resources
+    resources = pipeline_resources(args)
     if requested_profile == "auto":
         args.reconstruction_profile = automatic_profile(hardware)
     root = args.root.resolve()
     output_dir = (root / args.output).resolve() if not args.output.is_absolute() else args.output
-    session_dirs = find_session_dirs(root)
-    if not session_dirs:
+    sensor_processing_enabled = args.sensor_processing_enabled
+    # Number the active video and optional sensor preprocessing stages.
+    stage_order = [1, 2, 3, 5, 6, 7, 8] if sensor_processing_enabled else [5, 6, 8]
+    stage_labels = {number: f"{index}/{len(stage_order)}"
+                    for index, number in enumerate(stage_order, 1)}
+    session_dirs = find_session_dirs(root) if sensor_processing_enabled else []
+    if not session_dirs and sensor_processing_enabled:
         raise PipelineStageError(f"No .sess directories found under {root}")
 
     verbose = args.colmap_log_level == "verbose"
@@ -1559,7 +1707,9 @@ def run_pipeline(args) -> int:
     video_blur_threshold = profile_value(args, "video_blur_threshold")
     video_keyframe_min_change = profile_value(args, "video_keyframe_min_change")
     video_keyframe_min_gap = profile_value(args, "video_keyframe_min_gap")
-    max_colmap_anchor_images_per_point = profile_value(args, "max_colmap_anchor_images_per_point")
+    print(f"[video] Primary input: {1.0 / video_frame_interval_s:g} candidate frames/s, "
+          f"budget={video_max_frames or 'whole clip'}, blur_policy={args.video_blur_policy}, "
+          f"target_gap={args.video_keyframe_max_gap_s:g}s; native frame resolution is preserved.", flush=True)
     colmap_dense_max_image_size = profile_value(args, "colmap_dense_max_image_size")
     colmap_dense_profile = profile_value(args, "colmap_dense_profile")
     colmap_matcher = profile_value(args, "colmap_matcher")
@@ -1567,80 +1717,65 @@ def run_pipeline(args) -> int:
     colmap_feature_max_image_size = profile_value(args, "colmap_feature_max_image_size")
     colmap_max_num_features = profile_value(args, "colmap_max_num_features")
     colmap_max_num_matches = profile_value(args, "colmap_max_num_matches")
-    colmap_load_profile = profile_value(args, "colmap_load_profile")
-    colmap_num_threads = profile_value(args, "colmap_num_threads")
-    colmap_stage_cooldown_s = profile_value(args, "colmap_stage_cooldown_s")
-    constrained_point_window = profile_value(args, "constrained_point_window")
-    constrained_slot_window = profile_value(args, "constrained_slot_window")
+    colmap_num_threads = resources['colmap_threads']
+    print(f"[resources] Available CPUs={resources['available_cpus']}; default budget={resources['cpu_workers']}; "
+          f"COLMAP threads={colmap_num_threads}; image analysis workers={resources['image_similarity_workers']}; "
+          f"video decoder threads={resources['video_decode_threads']}.", flush=True)
     constrained_max_pdr_distance_m = profile_value(args, "constrained_max_pdr_distance_m")
     constrained_video_frame_window = profile_value(args, "constrained_video_frame_window")
-    constrained_video_anchor_point_window = profile_value(args, "constrained_video_anchor_point_window")
-    constrained_video_anchor_limit = profile_value(args, "constrained_video_anchor_limit")
     image_similarity_max_pairs = profile_value(args, "image_similarity_max_pairs")
     image_similarity_max_image_size = profile_value(args, "image_similarity_max_image_size")
     image_similarity_orb_features = profile_value(args, "image_similarity_orb_features")
     if verbose:
         print_workload_summary(
             profile=args.reconstruction_profile,
-            load_profile=colmap_load_profile,
             colmap_num_threads=colmap_num_threads,
-            stage_cooldown_s=colmap_stage_cooldown_s,
             dense_max_image_size=colmap_dense_max_image_size,
             feature_max_image_size=colmap_feature_max_image_size,
             max_num_features=colmap_max_num_features,
             matcher=colmap_matcher,
             dense_profile=colmap_dense_profile,
             video_max_frames=video_max_frames,
-            max_anchor_images_per_point=max_colmap_anchor_images_per_point,
             image_similarity_enabled=not args.skip_image_similarity,
             image_similarity_max_pairs=image_similarity_max_pairs,
             image_similarity_max_image_size=image_similarity_max_image_size,
             image_similarity_orb_features=image_similarity_orb_features,
         )
 
-    log_stage(f"1-2/8 WiFi tables and PDR trajectory ({args.preprocess_workers} workers)")
-    sensor_results = run_sensor_stages(
-        session_dirs, output_dir, workers=args.preprocess_workers,
-        wifi_options=dict(min_detection_rate=args.min_detection_rate,
-                          min_mean_rssi=args.min_mean_rssi, max_rssi_std=args.max_rssi_std,
-                          min_scan_count=args.min_scan_count),
-        pdr_options=dict(base_step_m=args.base_step_m, heading_offset_deg=args.heading_offset_deg))
+    if not sensor_processing_enabled:
+        print("[input] Video-only reconstruction: WiFi and IMU priors are disabled.", flush=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        sensor_results = {
+            "wifi": {"selected_ap_count_by_session": {}, "selected_ap_union_count": 0},
+            "pdr": {"pdr": {}, "trajectory_contour": {"status": "skipped", "reason": "video_only"}},
+            "execution": {"status": "skipped", "reason": "video_only"},
+        }
+    else:
+        print(f"[input] Video with WiFi and IMU/PDR processing enabled. Video/sensor alignment={args.video_sensor_alignment}.", flush=True)
+        if args.video_sensor_alignment == "fuzzy":
+            print(f"[sensors] Approximate recording-time association: +/-{args.video_sensor_time_uncertainty_s:g}s assumed uncertainty; "
+                  "sensor candidates require visual geometry checks.", flush=True)
+        log_stage(f"1-2/{len(stage_order)} WiFi tables and PDR trajectory ({resources['sensor_workers']} workers)")
+        sensor_results = run_sensor_stages(
+            session_dirs, output_dir, workers=resources['sensor_workers'],
+            wifi_options=dict(min_detection_rate=args.min_detection_rate,
+                              min_mean_rssi=args.min_mean_rssi, max_rssi_std=args.max_rssi_std,
+                              min_scan_count=args.min_scan_count),
+            pdr_options=dict(base_step_m=args.base_step_m, heading_offset_deg=args.heading_offset_deg,
+                             heading_policy=args.pdr_heading_policy))
     selection = sensor_results['wifi']
     pdr_summary = sensor_results['pdr']['pdr']
     trajectory_contour_summary = sensor_results['pdr']['trajectory_contour']
-    log_stage("3/8 fusing WiFi fingerprints with PDR positions")
-    fused_summary = build_wifi_pdr_feature_table(output_dir)
-    log_stage_done(3, fused_summary)
-    require_stage("WiFi/PDR feature table", fused_summary, ("ok",))
-    log_stage("4/8 mapping checkpoint photos to WiFi/PDR points")
-    image_summary = (
-        {"status": "skipped"}
-        if args.skip_image_wifi
-        else build_image_wifi_tables(
-            root=root,
-            session_dirs=session_dirs,
-            output_dir=output_dir,
-            pic_dir=args.pic_dir,
-            images_per_point=args.images_per_wifi_point,
-            point_event=args.point_event,
-            photo_checkpoint_map=args.photo_checkpoint_map,
-            photo_grouping=args.photo_grouping,
-            photo_group_tolerance=args.photo_group_tolerance,
-        )
-    )
-    log_stage_done(4, image_summary, "checkpoint photo mapping disabled by --skip-image-wifi")
-    if image_summary.get("photo_grouping"):
-        grouping = image_summary["photo_grouping"]
-        counts = image_summary["group_image_counts"]
-        print(f"[grouping] {grouping['method']}; reference={args.images_per_wifi_point}; "
-              f"photos/point={min(counts, default=0)}..{max(counts, default=0)}; "
-              f"{grouping.get('inference', {}).get('reason', 'configured_assignments')}", flush=True)
-    require_stage("Checkpoint photo mapping", image_summary,
-                  ("ok", "skipped", "partial", "count_mismatch", "extra_images_ignored"))
-    log_stage("5/8 extracting route video bridge frames")
+    if sensor_processing_enabled:
+        log_stage(f"{stage_labels[3]} fusing WiFi fingerprints with PDR positions")
+    fused_summary = build_wifi_pdr_feature_table(output_dir) if sensor_processing_enabled else {"status": "skipped", "reason": "video_only"}
+    if sensor_processing_enabled:
+        log_stage_done(stage_labels[3], fused_summary)
+    require_stage("WiFi/PDR feature table", fused_summary, ("ok", "skipped"))
+    log_stage(f"{stage_labels[5]} extracting reconstruction video frames")
     video_frames_summary = (
         {"status": "skipped"}
-        if args.skip_video_frames or args.skip_image_wifi
+        if args.skip_video_frames
         else run_video_frame_pipeline(
             root=root,
             processed_dir=output_dir,
@@ -1651,46 +1786,80 @@ def run_pipeline(args) -> int:
             blur_threshold=video_blur_threshold,
             keyframe_min_change=video_keyframe_min_change,
             keyframe_min_gap=video_keyframe_min_gap,
+            blur_policy=args.video_blur_policy,
+            keyframe_max_gap_s=args.video_keyframe_max_gap_s,
             refine_window_s=args.video_refine_window_s,
             refine_budget_hours=args.video_refine_budget_hours,
             refine_coverage_search=args.video_refine_coverage_search,
+            decode_threads=resources['video_decode_threads'],
+            decode_hardware=args.video_hw_decode,
+            decode_device=args.video_hw_device,
         )
     )
     log_stage_done(
-        5,
+        stage_labels[5],
         video_frames_summary,
-        "video extraction disabled by --skip-video-frames or because image/WiFi mapping is disabled",
+        "video extraction disabled by --skip-video-frames",
     )
+    require_stage("Video-only frame extraction", video_frames_summary, ("ok",))
+    if video_frames_summary.get("frame_count", 0) < 3:
+        raise PipelineStageError("Video-only reconstruction requires at least three retained video frames")
+    video_sensor_summary = {"status": "disabled", "reason": "no_explicit_video_sensor_sync"}
+    if args.video_sensor_sync is not None:
+        from video_sensor_fusion import annotate_video_sensor_priors
+        video_sensor_summary = annotate_video_sensor_priors(output_dir, root / args.video_sensor_sync)
+        print(f"[sensors] Synchronized {video_sensor_summary.get('synchronized_frame_count', 0)}/"
+              f"{video_sensor_summary.get('frame_count', 0)} frames; "
+              f"route={video_sensor_summary.get('route_frame_count', 0)}, "
+              f"fresh WiFi={video_sensor_summary.get('wifi_frame_count', 0)}. "
+              "These are matching priors, not measured camera poses.", flush=True)
+        if not video_sensor_summary.get("synchronized_frame_count"):
+            print("[warn] No video frame could be synchronized; retaining visual reconstruction. "
+                  "Inspect video_sensor_sync_summary.json.", flush=True)
+    elif sensor_processing_enabled and args.video_sensor_alignment == "fuzzy" and not args.visual_only:
+        from video_sensor_fuzzy import annotate_fuzzy_video_sensor_priors
+        video_sensor_summary = annotate_fuzzy_video_sensor_priors(
+            output_dir, root, args.video_dir,
+            uncertainty_s=args.video_sensor_time_uncertainty_s, offset_s=args.video_sensor_offset_s,
+            ffmpeg_exe=args.ffmpeg_exe,
+        )
+        print(f"[sensors] Fuzzy time windows for {video_sensor_summary.get('fuzzy_frame_count', 0)}/"
+              f"{video_sensor_summary.get('frame_count', 0)} frames; exact synchronization is not assumed. "
+              "WiFi/IMU only propose visually verified matches.", flush=True)
+        if not video_sensor_summary.get("fuzzy_frame_count"):
+            print("[warn] No unambiguous recording-time overlap for fuzzy sensor matching; sensor tables are retained. "
+                  "Inspect video_sensor_fuzzy_summary.json.", flush=True)
+    elif sensor_processing_enabled:
+        from video_sensor_fusion import annotate_video_sensor_priors
+        video_sensor_summary = annotate_video_sensor_priors(output_dir)
+        print("[sensors] Sensor tables processed; frame association is disabled or awaiting explicit synchronization.", flush=True)
     reconstruction_output_dir = (
         (root / args.reconstruction_output).resolve()
         if not args.reconstruction_output.is_absolute()
         else args.reconstruction_output
     )
-    slot_yaw_step_deg = args.slot_yaw_step_deg
-    log_stage("6/8 exporting reconstruction image dataset")
+    log_stage(f"{stage_labels[6]} exporting reconstruction image dataset")
     reconstruction_summary = (
         {"status": "skipped"}
-        if args.skip_reconstruction_export or args.skip_image_wifi
+        if args.skip_reconstruction_export
         else export_reconstruction_dataset(
             root=root,
             processed_dir=output_dir,
             output_dir=reconstruction_output_dir,
             camera_height_m=args.camera_height_m,
-            slot_yaw_start_deg=args.slot_yaw_start_deg,
-            slot_yaw_step_deg=slot_yaw_step_deg,
             copy_images=True,
-            max_anchor_images_per_point=max_colmap_anchor_images_per_point,
             include_video_frames=not args.skip_video_frames,
-            include_unassigned_images=not args.exclude_unassigned_images,
+            include_sensor_priors=sensor_processing_enabled,
         )
     )
     log_stage_done(
-        6,
+        stage_labels[6],
         reconstruction_summary,
-        "reconstruction export disabled by --skip-reconstruction-export or because image/WiFi mapping is disabled",
+        "reconstruction export disabled by --skip-reconstruction-export",
     )
-    require_stage("Reconstruction export", reconstruction_summary, ("ok", "skipped", "incomplete_points"))
-    log_stage("7/8 building WiFi positioning artifacts")
+    require_stage("Reconstruction export", reconstruction_summary, ("ok", "skipped"))
+    if 7 in stage_labels:
+        log_stage(f"{stage_labels[7]} building WiFi positioning artifacts")
     wifi_positioning_summary = (
         {"status": "skipped"}
         if args.skip_wifi_positioning or reconstruction_summary.get("status") == "skipped"
@@ -1701,18 +1870,15 @@ def run_pipeline(args) -> int:
             localization_k=args.wifi_localization_k,
         )
     )
-    log_stage_done(
-        7,
-        wifi_positioning_summary,
-        "WiFi positioning disabled or reconstruction export was skipped",
-    )
-    require_stage("WiFi positioning", wifi_positioning_summary, ("ok", "skipped", "no_valid_fingerprints"))
+    if 7 in stage_labels:
+        log_stage_done(stage_labels[7], wifi_positioning_summary, "WiFi positioning disabled or reconstruction export was skipped")
+    require_stage("WiFi positioning", wifi_positioning_summary, ("ok", "skipped", "no_valid_fingerprints", "no_usable_position_labels"))
     colmap_workspace_dir = (
         (root / args.colmap_workspace).resolve()
         if not args.colmap_workspace.is_absolute()
         else args.colmap_workspace
     )
-    log_stage("8/8 preparing COLMAP workspace and run scripts")
+    log_stage(f"{stage_labels[8]} preparing COLMAP workspace and run scripts")
     colmap_summary = (
         {"status": "skipped"}
         if args.skip_colmap_prepare or reconstruction_summary.get("status") == "skipped"
@@ -1730,48 +1896,63 @@ def run_pipeline(args) -> int:
             quality=colmap_quality,
             dense_max_image_size=colmap_dense_max_image_size,
             visual_only=args.visual_only,
-            pdr_capture_mode=args.pdr_capture_mode,
             scene_completion=args.scene_completion,
             videoscene_max_clips=args.videoscene_max_clips,
             videoscene_budget_hours=args.videoscene_budget_hours,
             feature_max_image_size=colmap_feature_max_image_size,
             max_num_features=colmap_max_num_features,
             max_num_matches=colmap_max_num_matches,
-            load_profile=colmap_load_profile,
             colmap_num_threads=colmap_num_threads,
-            stage_cooldown_s=colmap_stage_cooldown_s,
             dense_profile=colmap_dense_profile,
+            colmap_ba_gpu=args.colmap_ba_gpu,
+            sparse_strategy=args.sparse_strategy,
+            sparse_ba_growth_ratio=args.sparse_ba_growth_ratio,
+            sparse_keyframe_gap_s=args.sparse_keyframe_gap_s,
+            dense_max_images=args.dense_max_images,
+            dense_max_source_images=args.dense_max_source_images,
+            dense_coverage_policy=({
+                "mode": "adaptive",
+                "initial_images": min(args.dense_initial_images, args.dense_max_images) if args.dense_max_images else args.dense_initial_images,
+                "min_single_view_coverage": args.dense_min_single_coverage,
+                "min_three_view_coverage": args.dense_min_three_coverage,
+                "max_video_gap_s": args.dense_max_video_gap_s,
+            } if args.dense_selection_mode == "adaptive" else None),
+            point_filter_method=args.point_filter_method,
+            point_filter_max_candidates=args.point_filter_max_candidates,
+            point_filter_budget_seconds=args.point_filter_budget_seconds,
             run_meshing=not args.skip_colmap_meshing,
             run_point_cloud_filter=not args.skip_point_cloud_filter,
-            constrained_point_window=constrained_point_window,
-            constrained_slot_window=constrained_slot_window,
             constrained_max_pdr_distance_m=constrained_max_pdr_distance_m,
             constrained_video_frame_window=constrained_video_frame_window,
-            constrained_video_anchor_point_window=constrained_video_anchor_point_window,
-            constrained_video_anchor_limit=constrained_video_anchor_limit,
             run_image_similarity=not args.skip_image_similarity,
             wifi_recovery_enabled=not args.skip_wifi_recovery,
             image_similarity_max_pairs=image_similarity_max_pairs,
             image_similarity_max_image_size=image_similarity_max_image_size,
             image_similarity_orb_features=image_similarity_orb_features,
             image_similarity_min_visual_score=profile_value(args, "image_similarity_min_visual_score"),
-            image_similarity_workers=args.image_similarity_workers,
+            image_similarity_workers=resources['image_similarity_workers'],
             visual_recovery_neighbors=args.visual_recovery_neighbors,
         )
     )
-    log_stage_done(8, colmap_summary, "COLMAP preparation disabled or reconstruction export was skipped")
+    log_stage_done(stage_labels[8], colmap_summary, "COLMAP preparation disabled or reconstruction export was skipped")
     require_stage("COLMAP workspace preparation", colmap_summary)
     write_json(
         output_dir / "processing_summary.json",
         {
             "status": "ok",
+            "input_mode": "video_only",
+            "sensor_processing_enabled": sensor_processing_enabled,
+            "video_sensor_alignment": args.video_sensor_alignment,
             "root": str(root),
             "sessions": [path.name for path in session_dirs],
             "requested_reconstruction_profile": requested_profile,
             "reconstruction_profile": args.reconstruction_profile,
             "hardware_probe": hardware,
+            "compute_resources": resources,
+            "sharpness_backend": sharpness_diagnostics(),
             "profile_defaults": PROFILE_DEFAULTS[args.reconstruction_profile],
             "sensor_execution": sensor_results['execution'],
+            "video_sensor_assistance": video_sensor_summary,
             "wifi": {
                 "selected_ap_count_by_session": selection["selected_ap_count_by_session"],
                 "selected_ap_union_count": selection["selected_ap_union_count"],
@@ -1779,7 +1960,6 @@ def run_pipeline(args) -> int:
             "pdr": pdr_summary,
             "trajectory_contour": trajectory_contour_summary,
             "wifi_pdr_features": fused_summary,
-            "image_wifi": image_summary,
             "video_frames": video_frames_summary,
             "reconstruction_export": reconstruction_summary,
             "wifi_positioning": wifi_positioning_summary,
@@ -1797,7 +1977,6 @@ def run_pipeline(args) -> int:
             )
         print("[info] trajectory_contour:", trajectory_contour_summary)
         print("[info] wifi_pdr_features:", fused_summary)
-        print("[info] image_wifi:", image_summary)
         print("[info] video_frames:", video_frames_summary)
         print("[info] reconstruction_export:", reconstruction_summary)
         print("[info] wifi_positioning:", wifi_positioning_summary)

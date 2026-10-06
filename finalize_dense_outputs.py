@@ -168,9 +168,15 @@ def commit_final(source: Path, final: Path, summary: Path, payload: dict[str, An
         raise
     finally:
         if not keep_recovery:
-            shutil.rmtree(transaction)
-            staged_summary.unlink(missing_ok=True)
-            old_summary.unlink(missing_ok=True)
+            try:
+                shutil.rmtree(transaction)
+            except OSError as exc:
+                print(f"[finalize warning] Temporary files retained at {transaction}: {exc}", flush=True)
+            for temporary in (staged_summary, old_summary):
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError as exc:
+                    print(f"[finalize warning] Temporary file retained at {temporary}: {exc}", flush=True)
 
 
 def cleanup_intermediate_files(dense_dir: Path, final_path: Path) -> list[str]:

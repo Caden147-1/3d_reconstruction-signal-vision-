@@ -1,2 +1,4 @@
 @echo off
-call "%~dp0colmap_workspace\run_colmap_sparse.bat"
+setlocal
+python "%~dp0run_colmap.py" sparse --workspace "%~dp0generated\colmap_workspace" %*
+exit /b %errorlevel%

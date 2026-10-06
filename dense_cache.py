@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import math
 from pathlib import Path
 import shutil
 from typing import Any
@@ -19,11 +20,58 @@ from colmap_workspace_check import (
     write_provenance,
 )
 from workspace_lock import WorkspaceBusyError, locked_workspace
+from runner_migration import compatible_runner_identity
 
 
 CACHE_RECORD = "mvs_cache_identity.json"
 CACHE_IDENTITY_VERSION = 2
 CACHE_FOLDERS = ("images", "sparse", "stereo")
+
+
+def dense_selection_config(workspace: Path) -> dict[str, Any] | None:
+    """Opt in explicitly; absent/disabled selection retains the legacy identity."""
+    config = read_record(workspace / "colmap_workspace_summary.json").get("dense_selection_config")
+    if config is None:
+        return None
+    if not isinstance(config, dict) or type(config.get("enabled", False)) is not bool:
+        raise ValueError("Dense selection configuration must use a boolean enabled flag")
+    if not config.get("enabled", False):
+        return None
+    required = {"enabled", "max_images", "max_source_images"}
+    if not required <= set(config) <= required | {"coverage_policy"}:
+        raise ValueError("Dense selection configuration has missing or unknown fields")
+    maximum, sources = config.get("max_images"), config.get("max_source_images")
+    if type(maximum) is not int or (maximum != 0 and maximum < 3):
+        raise ValueError("Dense selection max_images must be zero (unlimited) or at least three")
+    if type(sources) is not int or not 2 <= sources <= 64:
+        raise ValueError("Dense selection max_source_images must be between two and 64")
+    if "coverage_policy" in config:
+        policy = config["coverage_policy"]
+        fields = {"mode", "initial_images", "min_single_view_coverage", "min_three_view_coverage", "max_video_gap_s"}
+        if not isinstance(policy, dict) or set(policy) != fields or policy.get("mode") != "adaptive":
+            raise ValueError("Dense coverage_policy requires the complete adaptive policy")
+        initial = policy["initial_images"]
+        if type(initial) is not int or initial < 3 or (maximum and initial > maximum):
+            raise ValueError("Dense coverage initial_images must be at least three and within the hard image budget")
+        for key in ("min_single_view_coverage", "min_three_view_coverage", "max_video_gap_s"):
+            value = policy[key]
+            if type(value) not in (int, float) or not math.isfinite(value):
+                raise ValueError(f"Dense coverage {key} must be finite")
+            if value <= 0 or (key != "max_video_gap_s" and value > 1):
+                raise ValueError(f"Dense coverage {key} is outside its valid range")
+    return config
+
+
+def dense_selection_identity(workspace: Path, *, identify: FileIdentityReader = file_identity):
+    config = dense_selection_config(workspace)
+    if config is None:
+        return None
+    identify(workspace / "colmap_workspace_summary.json")
+    code = {name: identify(Path(__file__).with_name(name))
+            for name in ("dense_keyframes.py", "mvs_observations.py", "dense_cache.py")}
+    if any(value is None for value in code.values()):
+        raise ValueError("Dense selection source code is missing")
+    return {"schema_version": 1, "config": config, "source_code": code}
 
 
 def dense_input_identity(
@@ -44,13 +92,27 @@ def dense_input_identity(
             "path": selected_model.resolve().relative_to(workspace.resolve()).as_posix(),
             "model": sparse_model_identity(selected_model, identify=identify),
         }
-    return {
+    # Snapshot readers must observe the receipt used to select a historical
+    # compatible runner identity, as well as the migration proof and scripts.
+    identify(workspace / "dense" / CACHE_RECORD)
+    identity = {
         "schema_version": CACHE_IDENTITY_VERSION,
         "dense_input": model_identity,
         "sparse_provenance": identify(workspace / PROVENANCE_NAME),
-        "dense_runner": identify(workspace / "run_colmap_dense.bat"),
+        "dense_runner": compatible_runner_identity(
+            workspace, "run_colmap_dense.bat",
+            read_record(workspace / "dense" / CACHE_RECORD).get("identity", {}).get("dense_runner"),
+            identify=identify),
         "colmap_executable": identify(executable) if executable is not None else None,
     }
+    selection = dense_selection_identity(workspace, identify=identify)
+    stage_recipe = workspace / 'run_colmap_dense.bat'
+    if stage_recipe.is_file() and 'rem portable-stage-v1' in stage_recipe.read_text(encoding='utf-8').splitlines():
+        identity['execution_code'] = {name: identify(Path(__file__).resolve().parent / name)
+                                      for name in ('portable_stage.py', 'process_control.py')}
+    if selection is not None:
+        identity["dense_selection"] = selection
+    return identity
 
 
 def cache_identity(workspace: Path) -> dict[str, Any]:
@@ -89,8 +151,18 @@ def reconstruction_binding(dense):
         names = [name + suffix for name in ("cameras", "images", "points3D")]
         if all((model / name).is_file() for name in names):
             names += [name + suffix for name in ("frames", "rigs") if (model / (name + suffix)).is_file()]
-            return {"cache_identity": record["identity"],
-                    "dense_model": {name: file_identity(model / name) for name in names}}
+            binding = {"cache_identity": record["identity"],
+                       "dense_model": {name: file_identity(model / name) for name in names}}
+            if record["identity"].get("dense_selection") is not None:
+                if record["identity"]["dense_selection"] != dense_selection_identity(dense.parent):
+                    raise ValueError("Completed dense selection configuration or source code changed")
+                expected = record.get("inputs", {}).get("files", {})
+                files = {name: file_identity(dense / name) for name in (
+                    "depth_source_summary.json", "stereo/patch-match.cfg", "stereo/fusion.cfg")}
+                if any(value is None or expected.get(name) != value for name, value in files.items()):
+                    raise ValueError("Completed dense selection report or stereo configuration changed")
+                binding["dense_selection_files"] = files
+            return binding
     raise ValueError("Completed MVS receipt has no complete undistorted model")
 
 
@@ -149,6 +221,104 @@ def check_stereo_map(path, channels, image_size, max_image_size=-1):
     return {"size": after.st_size, "sha256": digest.hexdigest()}, positive, (width, height)
 
 
+def validate_dense_selection(workspace, plan, references, registered_names, config):
+    """Require a bounded, authenticated subset and a closed explicit source plan."""
+    import math
+
+    selection = plan.get("dense_selection")
+    if not isinstance(selection, dict) or selection.get("config") != config:
+        raise ValueError("Dense selection report does not match the enabled configuration")
+
+    def names_in(field):
+        values = selection.get(field)
+        if (not isinstance(values, list) or any(not isinstance(name, str) for name in values)
+                or len(values) != len(set(values))):
+            raise ValueError(f"Invalid dense selection name list: {field}")
+        return set(values)
+
+    selected = names_in("selected_names")
+    candidates = names_in("candidate_selected_names")
+    removed = names_in("removed_unsupported_names")
+    if selected != references or not selected <= candidates <= registered_names or removed != candidates - selected:
+        raise ValueError("Dense selection views differ from the registered candidates or PatchMatch references")
+    if config["max_images"] and len(candidates) > config["max_images"]:
+        raise ValueError("Dense selection exceeds its configured image budget")
+    if config["max_images"] == 0 and candidates != registered_names:
+        raise ValueError("Unlimited dense selection must consider all registered views before geometric exclusions")
+    if (selection.get("registered_view_count") != len(registered_names)
+            or selection.get("selected_view_count") != len(selected)):
+        raise ValueError("Dense selection view counts do not match its model and references")
+    required = [workspace / "colmap_workspace_summary.json", workspace / "metadata/images_manifest.csv",
+                Path(__file__).with_name("dense_keyframes.py"), Path(__file__).with_name("mvs_observations.py")]
+    identities = plan.get("inputs", {})
+    if not isinstance(identities, dict):
+        raise ValueError("Dense selection has no authenticated input identities")
+    for path in required:
+        identity = file_identity(path)
+        if identity is None or identities.get(str(path.resolve())) != identity:
+            raise ValueError(f"Dense selection does not authenticate its input: {path.name}")
+    sources = plan.get("sources")
+    if not isinstance(sources, dict) or set(sources) != references or plan.get("status") != "ready":
+        raise ValueError("Dense selection needs a ready source plan for every selected reference")
+    for ref, rows in sources.items():
+        if not isinstance(rows, list) or not 2 <= len(rows) <= config["max_source_images"]:
+            raise ValueError("Dense selection source count exceeds its configured bounds")
+        source_names = []
+        for row in rows:
+            if not isinstance(row, dict):
+                raise ValueError("Dense selection source evidence must be an object")
+            angle, tracks = row.get("median_angle_degrees"), row.get("shared_tracks")
+            if (row.get("usable") is not True or not isinstance(angle, (int, float))
+                    or not math.isfinite(angle) or not 2 <= angle <= 60
+                    or not isinstance(tracks, (int, float)) or not math.isfinite(tracks) or tracks < 30):
+                raise ValueError("Dense selection source lacks usable shared-track and parallax evidence")
+            source_names.append(row.get("source"))
+        if (any(not isinstance(name, str) for name in source_names) or len(set(source_names)) != len(source_names)
+                or ref in source_names or not set(source_names) <= references):
+            raise ValueError("Dense selection sources are not closed over its selected references")
+    if config.get("coverage_policy") is not None:
+        validate_selection_coverage(workspace, selection, references, config["coverage_policy"])
+
+
+def _coverage_equal(recorded, expected):
+    """Compare complete reports while allowing only floating-point roundoff."""
+    if isinstance(expected, dict):
+        return (isinstance(recorded, dict) and set(recorded) == set(expected)
+                and all(_coverage_equal(recorded[key], value) for key, value in expected.items()))
+    if isinstance(expected, list):
+        return (isinstance(recorded, list) and len(recorded) == len(expected)
+                and all(_coverage_equal(a, b) for a, b in zip(recorded, expected)))
+    if type(expected) in (float, int):
+        return (type(recorded) in (float, int) and math.isfinite(recorded) and math.isfinite(expected)
+                and math.isclose(recorded, expected, rel_tol=1e-9, abs_tol=1e-9))
+    return type(recorded) is type(expected) and recorded == expected
+
+
+def validate_selection_coverage(workspace, selection, references, policy):
+    """Recompute adaptive evidence; unmet targets do not invalidate its images."""
+    import csv
+    import mvs_observations
+    from dense_keyframes import adaptive_coverage_report, assess_coverage_targets
+    from reconstruction_metrics import Snapshot
+
+    snapshot = Snapshot()
+    views, _points = mvs_observations.read_model(workspace / "dense/sparse", snapshot)
+    manifest = workspace / "metadata/images_manifest.csv"
+    snapshot.identity(manifest)
+    with manifest.open(encoding="utf-8-sig", newline="") as handle:
+        metadata = {row["image_file"]: row for row in csv.DictReader(handle)}
+    selected = [view for view in views if view["name"] in references]
+    report = adaptive_coverage_report(views, selected, metadata, policy)
+    if not _coverage_equal(selection.get("coverage_report"), report):
+        raise ValueError("Dense adaptive coverage report does not match its model and selected views")
+    targets = assess_coverage_targets(report, policy)
+    recorded = selection.get("coverage_targets")
+    if (not isinstance(recorded, dict)
+            or any(key not in recorded or not _coverage_equal(recorded[key], value) for key, value in targets.items())):
+        raise ValueError("Dense adaptive coverage targets do not match the measured coverage")
+    snapshot.verify_unchanged()
+
+
 def validate_cache_inputs(workspace):
     """Snapshot the undistorted inputs before any PatchMatch output is accepted."""
     import cv2
@@ -177,6 +347,9 @@ def validate_cache_inputs(workspace):
         raise ValueError("Invalid or duplicated PatchMatch reference images")
     plan_path = dense / 'depth_source_summary.json'
     plan = read_record(plan_path)
+    selection_config = dense_selection_config(workspace)
+    if selection_config is not None:
+        validate_dense_selection(workspace, plan, references, names, selection_config)
     if references != names or plan:
         if plan.get('status') != 'ready' or set(plan.get('sources', {})) != references:
             raise ValueError('Partial PatchMatch coverage requires its depth source plan')
@@ -363,6 +536,7 @@ def prepare_cache(workspace):
             print(f"[dense cache] Incomplete/changed cache will be recomputed: {exc}", flush=True)
         else:
             write_provenance(record_path, {**record, "status": "prepared",
+                                          "execution_runner": file_identity(workspace / "run_colmap_dense.bat"),
                                           "inputs": validate_cache_inputs(workspace)})
             return {"status": "reused", "removed": []}
 
@@ -384,6 +558,7 @@ def prepare_cache(workspace):
             print(f"[dense cache] Partial cache cannot be resumed: {exc}", flush=True)
         else:
             write_provenance(record_path, {"status": "prepared", "identity": identity,
+                                          "execution_runner": file_identity(workspace / "run_colmap_dense.bat"),
                                           "inputs": inputs, "partial": partial})
             return {"status": "resumed", "removed": partial["removed"],
                     "retained_views": partial["retained_views"]}
@@ -402,7 +577,8 @@ def prepare_cache(workspace):
                 target.unlink()
             removed.append(target.name)
     dense.mkdir(parents=True, exist_ok=True)
-    write_provenance(record_path, {"status": "prepared", "identity": identity})
+    write_provenance(record_path, {"status": "prepared", "identity": identity,
+                                  "execution_runner": file_identity(workspace / "run_colmap_dense.bat")})
     return {"status": "invalidated", "removed": removed}
 
 
@@ -465,6 +641,7 @@ def complete_cache(workspace):
         write_provenance(record_path, {**record, "status": "invalid", "error": str(exc)})
         raise
     write_provenance(record_path, {"status": "complete", "identity": identity,
+                                  "execution_runner": file_identity(workspace / "run_colmap_dense.bat"),
                                   "inputs": inputs, "outputs": outputs})
     return {"status": "complete"}
 

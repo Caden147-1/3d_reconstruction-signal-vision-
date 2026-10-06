@@ -1,2 +1,4 @@
 @echo off
-call "%~dp0colmap_workspace\run_colmap_full.bat"
+setlocal
+python "%~dp0main.py" %*
+exit /b %errorlevel%

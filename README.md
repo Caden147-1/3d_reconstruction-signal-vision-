@@ -1,575 +1,408 @@
-# 3D Reconstruction With WiFi, IMU and Vision
+# Indoor 3D Reconstruction from Video
 
-This project reconstructs indoor scenes from checkpoint photos and route videos,
-using WiFi observations and IMU/PDR trajectories as supporting constraints.
-COLMAP supplies the observed geometry. VideoScene can propose additions inside
-locally bounded, multiview-supported gaps after point-cloud filtering.
+**A video-based reconstruction pipeline with WiFi and IMU assistance.**
 
-## Source layout
+This project reconstructs indoor scenes from 4K60p video using COLMAP, with WiFi observations and IMU-derived walking trajectories providing additional matching candidates. It covers frame selection, camera estimation, dense reconstruction, point-cloud filtering, and quality reporting through a single entry point.
 
-| Location | Responsibility |
+Video is the only visual input: no separate photographs are required. Sensor recordings can start at a different time from the video; uncertain timing is handled through explicit uncertainty windows rather than assumed synchronization.
+
+The primary output is a colored point cloud, accompanied by coverage diagnostics and records linking the result to its inputs and configuration.
+
+[Quick Start](#quick-start) · [Pipeline](#pipeline) · [Sensor Assistance](#sensor-assistance) · [Configuration](#configuration) · [Outputs](#outputs) · [Recovery](#recovery) · [Limitations](#limitations)
+
+## Features
+
+| Capability | Approach |
 | --- | --- |
-| `main.py` | Main preprocessing and reconstruction entry |
-| `run_colmap.py` | COLMAP stages and recovery commands |
-| Root helper modules | Capture inputs, geometry, provenance and native runners |
-| `experiments/` | Generated local results; not source code |
+| Native video frame selection | Preserves source resolution and selects sharper nearby original frames without synthesizing image content. |
+| Capture coverage | Samples the full clip and balances sharpness, visual change, and temporal continuity. |
+| Visual matching | Combines local and multiscale temporal pairs with additional appearance candidates for revisits and links between clips. |
+| Sensor assistance | Uses WiFi fingerprints and continuous IMU/PDR route segments to propose matches that require visual geometric verification. |
+| Adaptive dense reconstruction | Selects views using sparse-track coverage and time gaps, subject to configurable computational budgets. |
+| Conservative point filtering | Removes assessed multi-view conflicts while retaining uncertain or unassessed points. |
+| Inspectable results | Exports point clouds, quality reports, stage logs, and source identities for validation and recovery. |
 
-Use `main.py` for the main pipeline and `run_colmap.py` for individual stages.
-All reconstruction quality profiles default to COLMAP's automatic thread settings
-and zero inter-stage cooldown. The launcher no longer asks about a low-peak mode.
-Explicit thread/cooldown overrides remain available for manual configuration.
-New defaults apply when workspace scripts are generated; an active reconstruction
-continues with its original settings.
-WiFi parsing and PDR/trajectory preparation now run in two owned processes, then
-join before fingerprint/position fusion. Set `--preprocess-workers 1` for the
-serial path. `processing_summary.json` records each branch's elapsed time and the
-combined wall time. A failed branch or Ctrl-C stops both workers before the
-workspace lock is released; worker diagnostics are retained in `processed/logs/`.
-Preprocessing also locks its output and exported dataset directories. Concurrent
-runs need distinct `--output`, `--reconstruction-output` and `--colmap-workspace`
-directories, so separate workspaces cannot accidentally overwrite shared tables.
+## Pipeline
 
-Image similarity prepares image features in parallel, with one ORB instance per
-worker. Automatic mode uses up to eight workers on machines with at least 16
-logical CPUs, and up to four on smaller machines. Pair verification and
-RANSAC remain ordered. Use `--image-similarity-workers 1` for serial execution,
-`0` for automatic selection, or `2` through `8` for an explicit worker count.
-This preserves the feature settings and geometry acceptance thresholds.
-Completed image tasks immediately free a slot for the next image, while final
-results retain the input order. Thread counts are never changed from worker
-threads. On cancellation, pending work is cancelled and already running native
-image operations finish before their thread pool exits.
-The dependent reconstruction stages still wait for complete inputs:
-`sparse -> undistort -> PatchMatch -> fusion -> filtering`. These changes improve
-CPU preprocessing; they do not promise a proportional speedup for a saturated
-single-GPU PatchMatch pass or modify an already running workspace.
-Historical experiment reports retain their original commands and hashes;
-those commands may refer to optional tools that have been removed.
-
-## Scope
-
-- IMU/PDR provides a relative walking trajectory, continuous route-contour
-  constraints where observations support continuity, and alignment references.
-- Fresh WiFi RSSI fingerprints provide optional revisit/matching candidates.
-  Candidates still require visual geometric verification; checkpoint order alone
-  is not a wireless measurement.
-- WiFi also estimates a fuzzy capture-support region and promotes nearby visual
-  wall hypotheses. RSSI similarity connects local support regions; confidence and
-  checkpoint camera scatter control their strength. These outputs use the visual
-  reconstruction's relative frame and do not require a successful PDR alignment.
-- Neither the walking contour nor the WiFi interpolation envelope is a room wall.
-- VideoScene outputs are synthetic hypotheses, not recovered wireless or visual
-  measurements. This project uses an observed COLMAP prior rather than the
-  paper's NoPoSplat prior; it is not the complete paper implementation.
-
-## Fuzzy WiFi extent and wall candidates
-
-After a verified dense reconstruction, run:
-
-```powershell
-python run_colmap.py boundary --workspace colmap_workspace
+```mermaid
+flowchart TD
+    V[4K60p video] --> F[Native frame selection]
+    S[Optional WiFi and IMU logs] --> T[Sensor processing and time association]
+    F --> M[Visual matching and geometric verification]
+    T -->|Additional candidates| M
+    M --> R[COLMAP sparse reconstruction]
+    R --> D[Coverage-based dense view selection]
+    D --> E[Depth estimation and fusion]
+    E --> P[Observation conflict filtering]
+    P --> O[Final point cloud and quality report]
 ```
 
-The command prints a standalone `viewer.html` path under
-`colmap_workspace/wifi_boundary/`; `latest.json` points to the newest view and
-its `boundary.json` evidence. Newly generated sensor-assisted dense scripts run
-this step automatically. Existing reconstructions need no MVS rerun.
+The default workflow produces observed geometry. Optional VideoScene completion is a separate, explicitly enabled step for local gaps with supporting observations.
 
-The viewer shows a fuzzy wireless-support field, checkpoint positions, and
-vertical visual plane candidates. Adjust the support contour and compare wall
-scores with the WiFi slider at zero. For a saved alternative, use
-`python wifi_boundary.py --workspace colmap_workspace --wifi-weight 0`.
-Zero disables RF promotion of wall scores; it does not rebuild the upstream
-reconstruction without WiFi or hide the separate radio-support field.
-The estimator prefers the authenticated `supported.ply` observation layer;
-if unavailable, it uses verified observed final geometry, never generated points.
+All retained frames may participate in sparse reconstruction. Dense processing uses a selected subset to control computation while reporting the coverage that subset retains. Temporal candidates remain available to COLMAP even when a smaller visual preview is inconclusive; additional appearance and sensor candidates must pass preview geometry checks.
 
-Interior, uncalibrated RSSI samples do not directly locate outer walls. Low
-support means unknown, not outside the room. Field width is a modeling choice
-relative to checkpoint spacing; scores are not calibrated probabilities. WiFi
-can favor visual planes near the sampled area but cannot create a wall without
-visual evidence. The capture plane is estimated from checkpoint camera centers,
-not certified by IMU gravity; no metre scale, closed floor plan, or accurate wall
-semantics is claimed. Distorted visual poses produce distorted hypotheses.
-The source cloud and camera poses stay unchanged.
+## Quick Start
 
-## Requirements
+### Requirements
 
-The full runner currently targets **Windows with an NVIDIA CUDA GPU**. It uses
-Windows COLMAP executables and generated `.bat` scripts, not a Linux/macOS runner.
-Use Python 3.10-3.12; the current environment was checked with Python 3.10.
-Install Git with Git LFS and a CUDA-enabled COLMAP distribution separately.
-FFmpeg on PATH is optional; OpenCV also handles native video extraction.
+- Windows or Linux with an NVIDIA CUDA GPU for the full reconstruction workflow.
+- Python 3.10–3.12; the current development environment uses Python 3.10.
+- A CUDA-enabled COLMAP distribution with the project's COLMAP 3.13-style command-line options, installed separately.
+- Python dependencies from [requirements.txt](requirements.txt).
 
-From the project directory, create the main environment:
+FFmpeg is optional; OpenCV also supports native video decoding. New workspaces use a shared Python stage executor on Windows and Linux. Generated `.bat` recipes remain the canonical stage configuration for provenance and Windows compatibility; the Python executor runs their supported commands directly without a command shell.
+
+From the project directory:
 
 ```powershell
 py -3.10 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-```
-
-An existing compatible Python environment can be used instead. Always install
-`requirements.txt` with the same interpreter used to launch `main.py`.
-VideoScene dependencies are installed separately under `VideoScene/.venv`,
-without replacing packages in the main environment. COLMAP subprocesses launched
-through `run_colmap.py` inherit the launching Python environment.
-Activate the main environment before using the `python` commands below:
-
-```powershell
 .\.venv\Scripts\Activate.ps1
 ```
 
-VideoScene is disabled by default; use `--scene-completion videoscene`
-to opt in. Its code, model assets and
-isolated environment must already be prepared under the ignored `VideoScene/`
-directory to enable `--scene-completion videoscene`. The project does not include
-an automatic installer or downloader.
+An existing compatible Conda environment can be used instead. Install dependencies with the same interpreter used to run the pipeline.
 
-The adapter expects the official `THU-SI/VideoScene` code revision
-`de23c631fdb0663e5e732317c4642f38e4bd295f` and `hanyang/VideoScene` weight revision
-`cf6075132cb3d7e1b42b6e7e382748b424387f19`. Place the weight files under
-`VideoScene/checkpoints/checkpoints/`, preserving their relative paths in
-`videoscene_runner.py` (`WEIGHT_FILES` and `CONFIG_FILES`). Both the distilled
-checkpoint and full base transformer are required, together with the VAE,
-prompt embedding and configs (approximately 27.8 GB total).
+On Linux:
 
-For an existing pinned checkout, prepare its separate environment with:
-
-```powershell
-py -3.10 -m venv VideoScene/.venv
-.\VideoScene\.venv\Scripts\python.exe -m pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu124
-.\VideoScene\.venv\Scripts\python.exe -m pip install -r requirements-videoscene.txt
-python videoscene_completion.py --check
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+python main.py --colmap-exe /path/to/colmap
 ```
 
-The completion check launches the isolated interpreter, imports dependencies
-and the pinned official code, and runs a tiny CUDA/BF16 attention operation with
-a 90-second timeout. Reconstruction entry points perform runtime preflight
-before rebuild cleanup. Inference also verifies model file hashes. These checks
-do not establish generated output quality. Sequential CPU offload, VAE tiling
-and a CUDA allocator cap limit memory usage but do not guarantee sufficient
-VRAM or runtime. BF16-capable CUDA is required.
+Prepare the inputs described below before running the last command. A compatible `colmap` on `PATH` is detected automatically; `--colmap-dir` also accepts a Linux installation containing `bin/colmap`.
 
-## Inputs
+Before clearing a stopped run, `main.py` checks that the selected COLMAP executable runs, reports a CUDA build, and exposes the feature/matching and dense command options used by this pipeline. This check does not run reconstruction or certify GPU driver health. Linux discovery ignores bundled Windows executables.
+
+### Prepare the inputs
 
 ```text
 project/
-  main.py
-  requirements.txt
-  pic/                            checkpoint photos, ordered by filename
-  video/                          continuous route videos
-  recording.sess/                 phone WiFi/IMU/movement logs
-  colmap-x64-windows-cuda/
-    bin/colmap.exe
+├── main.py
+├── requirements.txt
+├── video/                       Input videos
+├── <capture>.sess/              Supported WiFi/IMU session logs
+├── video_sensor_sync.csv        Optional measured time correspondences
+├── colmap-x64-windows-cuda/     Local COLMAP installation
+└── generated/                   Generated data and reconstruction outputs
 ```
 
-The default is fuzzy ordered grouping with 20 photos per `CHECKPOINT_PAUSE` as
-a soft reference, set by `--images-per-wifi-point`. It reads JPEG EXIF
-`DateTimeOriginal` and relative pauses between photos; the camera clock does not
-need to match the WiFi/PDR clock. Dynamic programming finds contiguous groups
-within the count tolerance (default half the reference: 10--30 for a reference
-of 20), balancing distinct pauses against count changes. Set
-`--photo-group-tolerance 5` to limit groups to 15--25, or `--photo-grouping fixed`
-to retain strict 20-photo grouping. These settings describe the capture protocol,
-not any particular dataset.
+Use sensor logs from the same capture as the video. The pipeline reads the actual stream resolution, frame rate, and timestamps rather than assuming exactly 60 fps. COLMAP can also be supplied through `--colmap-exe`.
 
-Missing/unusable EXIF, reversed camera times, unsupported boundaries or nearly
-tied alternatives retain fixed grouping with an explanation in
-`image_wifi_summary.json`. No filesystem modification times or sensor timestamp
-matching are used. A capture pause can also occur at the same location: inferred
-boundaries remain estimates, with score margins, ignored pauses and count-limit
-warnings available for review. Trailing photos remain unassigned. An explicit
-`--photo-checkpoint-map photo_checkpoints.csv` overrides automatic inference.
-The UTF-8 CSV columns are `session,point_index,image_name`: use the `.sess`
-folder name, the 1-based checkpoint index within that session, and the exact
-filename in `--pic-dir`. Each row assigns one photo; row order within a point
-defines its view order. For example:
+Each video receives a separate extraction directory, including clips with identical stems or non-ASCII names. If any clip cannot be decoded or yields no usable frames, preprocessing reports the affected files and stops before reconstruction so a partial capture is not silently treated as complete.
 
-```csv
-session,point_index,image_name
-example.sess,1,DSC00001.JPG
-example.sess,1,DSC00002.JPG
-example.sess,2,DSC00005.JPG
-```
-
-For an explicit map, duplicate assignments, unknown
-checkpoints and missing files fail validation; omitted photos remain unassigned,
-and omitted checkpoints retain their sensor rows without photo anchors. The map
-hash is recorded in `image_wifi_summary.json`. Export counts and default view
-steps use each point's own group size. Circular view order remains a candidate
-pairing/pose-seed heuristic, not a measured heading. When inference falls back to
-fixed counts, a missing or extra photo can still shift later groups.
-Readable, unique unassigned photos are now included as `visual_only_photo` inputs
-by default. `unassigned_image_audit.csv` records exclusions for missing/corrupt
-files, paths outside the capture directory, and exact duplicates. These photos
-receive no checkpoint, PDR pose or WiFi fingerprint. Visual retrieval and geometric
-verification determine usable overlap; passing the file audit does not establish
-scene membership. Use `--exclude-unassigned-images` to exclude them. Extra-photo
-camera folders separate image resolutions from checkpoint/video groups; sharing
-intrinsics within a folder assumes a common camera and lens setting.
-Missing fresh WiFi observations do not remove photos or valid PDR coordinates.
-Post-reconstruction PDR reports also contain `photo_grouping`, which does not
-require valid PDR coordinates. It compares robust camera-group centers, within-
-group spread and distances to other groups in the same session. The report lists
-photos much closer to another center, overlapping groups (including possible
-revisits), and insufficient support. These are review flags; no assignment,
-camera, or observation is changed. `priority_review_checkpoint_count` excludes
-groups flagged only because another group's extent overlaps them. Thresholds
-are relative to local spacing, so changing scene scale or coordinate axes does
-not change their meaning. `--capture-mode off` disables this stationary check.
-Checkpoint photos are grouped in capture order: finish acquisition at one point
-before moving to the next. Photo timestamps need not match sensor timestamps.
-WiFi aggregation uses all finite raw AP observations in `wifi_long.csv`, including
-APs omitted by the global selection filter. Repeated AP/timestamp observations
-count once. Each measurement belongs to at most one checkpoint; recorded stays
-receive higher confidence than nearest-checkpoint assignments (bounded to 120 s).
-Delayed logger observations and uncertain point associations receive continuous
-age/time penalties. Per-AP weighted medians and RSSI dispersion produce a robust
-fingerprint and confidence; missing APs are not synthesized. Points with at least
-two observed APs can propose matches with their confidence carried downstream.
-
-WiFi retrieval ranks candidates by shared-AP RSSI, reliability, overlap and point
-confidence. Each point nominates up to four neighboring points, with a 1.5
-priority multiplier. Each nominated stop pair has at most 64 image pairs by
-default (the historical eight-by-eight budget), now allocated across all photos
-at both stops. Already proposed edges are excluded before allocation; underused
-photos receive priority, with deterministic tie breaking independent of assumed
-camera yaw. The legacy `images_per_point` argument controls the pair budget, not
-a fixed subset of participating images. Coverage counts are recorded per stop.
-When visual verification has a pair budget, one quarter is reserved for WiFi
-proposals and shared across stops and photos before RF priority breaks ties.
-Every added pair still needs geometric
-verification. These weights affect retrieval/verification and WiFi positioning;
-they are not COLMAP bundle-adjustment weights. A point without RF evidence retains
-its photos and PDR position but is not given an invented fingerprint.
-
-After the first visual checks, recovery gives weak images and small disconnected
-components a second, bounded search against the supported main component. It
-excludes previously considered pairs before selecting the top candidates, and
-uses available WiFi similarity as a ranking bonus. This additional search is
-limited to `recovery_neighbors` pairs per target and uses the same geometric gate.
-PDR alignment failures report the best candidate consensus and per-checkpoint
-fit residuals for diagnosis; those values do not relax alignment acceptance.
-Without measured video/sensor synchronization, video frames remain visual-only.
-
-## Run
+### Run
 
 ```powershell
 python main.py
 ```
 
-Confirm the full COLMAP run when prompted. A confirmed full rebuild intentionally
-resets old reconstruction outputs. Back up a result you want to retain first.
-Declining the prompt runs preprocessing/workspace preparation only when there
-are no reconstruction outputs. An existing workspace is protected: declining
-or running noninteractively exits before preprocessing can change its images,
-matching pairs, configuration or reports. Use `python run_colmap.py resume` to
-continue existing results, or choose a new `--colmap-workspace` for new inputs.
-Direct preprocessing and workspace-preparation calls enforce the same guard.
-
-For completed or interrupted reconstructions, confirming a full rebuild resets
-old COLMAP outputs before preprocessing, after checking required VideoScene files
-and the COLMAP executable. This restarts reconstruction, not a checkpoint resume.
-Declining the full rebuild leaves the interrupted workspace untouched and exits
-before preprocessing. The workspace lock rejects a second independent run before
-prompts or cleanup; never remove a live lock file to bypass this protection.
-
-Sparse reconstruction now checks PDR after visual mapping, using one vote per
-checkpoint, robust fitting, held-out checkpoint validation and camera scatter.
-`--pdr-capture-mode auto` (default) uses only photo groups explicitly tagged as
-`ordered_checkpoint_same_location`. Use `stationary` to confirm that protocol
-for older metadata; use `off` to disable this alignment stage for moving capture.
-This switch controls PDR alignment, not photo association or WiFi retrieval.
-
-Each stop now estimates a robust camera center with continuous Cauchy weights.
-Every finite camera remains in the group. A stop's contribution is reduced by
-its raw camera spread relative to the median spacing to up to three nearby
-distinct stops; taking more photos does not multiply the stop's alignment weight.
-The weighted fit is applied as one global similarity transform only after the
-existing consensus, held-out and residual checks pass. It does not pull each
-camera toward a stop, change bundle-adjustment weights, or turn RSSI into a
-distance measurement. Diagnostic JSON retains per-camera and per-stop weights
-even when alignment is withheld. No new sparse rebuild is needed just to inspect
-these diagnostics; existing certified reconstructions are not automatically
-realigned when the code changes.
-
-Existing models can be checked without starting reconstruction or alignment:
+This starts video and sensor preprocessing, COLMAP reconstruction, point filtering, and quality reporting. To reconstruct without sensor logs:
 
 ```powershell
-python pdr_alignment.py --inspect-only --model colmap_workspace/sparse/0 --manifest colmap_workspace/metadata/images_manifest.csv --report pdr_inspection.json --grouping-review-csv photo_grouping_review.csv
+python main.py --video-only
 ```
 
-The optional grouping CSV preserves every checkpoint photo, including unregistered
-ones. It shows original filenames, current session-local and global checkpoint
-IDs, group flags, geometric proximity evidence, and available observation counts
-and 8x8 image coverage. `nearer_point_index` is the session-local ID of the other
-group; it is not an automatic correction. `not_registered` means no camera
-position is available, and `no_flag` does not mean the assignment is verified.
-Missing support metrics stay blank rather than becoming zero. The JSON report
-records the CSV hash and source-model/manifest identities. Inspection does not
-run `main.py` or modify the model or photo assignments.
+The default final cloud is:
 
-For a dataset export's manifest, also pass `--exported-manifest` to translate
-image names into the workspace namespace. The report must be outside the input
-model. Local motion checks order stops by their recorded event times, retain
-contour-break edges as unsupported, and compare displacement scale and unsigned
-turning angles only within a continuous contour. Scale comparisons exclude the
-edge being examined and require at least three other usable edges. These checks
-expose disagreement; they do not change grouping, camera poses or alignment gates.
-Only a reliable subset from one capture session can be used for alignment.
-Rejected PDR keeps the raw visual coordinate frame. Alignment writes to a staging
-directory and is selected only after the complete model and residuals pass
-validation. The decision is saved in `pdr_alignment_decision.json`, bound into
-sparse provenance, and included in evaluations. PDR and dense reconstruction
-select the valid sparse component with the most registered images, breaking ties
-by sparse point count and then folder name. An aligned model is used only when
-authenticated to that component. Dense caches bind the selected model's path and
-hashes; older caches are rebuilt, while existing PLY files remain until export.
-Historical provenance still authenticates unchanged sparse files, so correcting
-model selection does not require feature extraction or matching again. Existing
-PDR decisions for a different component are not applied to the selected model.
-Old sparse scripts without this gate are
-refused before rebuild cleanup; `main.py` can regenerate them during a confirmed
-full rebuild, or prepare a separate new workspace.
+```text
+generated/colmap_workspace/dense/final.ply
+```
 
-Newly launched subprocess trees are owned by a Windows Job Object: the child is
-created suspended, attached, then resumed. Exceptions and timeouts terminate and
-wait for descendants before returning to the workspace lock. Closing the owner
-also terminates its job children (see [Windows Job Objects](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects)).
-This does not retrofit protection onto an already running launcher.
+Open the PLY in a point-cloud viewer such as MeshLab. Inspect `quality_report.json` alongside the visual result.
 
-The default workflow is:
+> **Run behavior:** If the selected workspace is active, `main.py` follows its console output. Otherwise, it validates the inputs, clears the selected generated output directories, and starts a new reconstruction. This reset includes an existing `final.ply`. To preserve and continue a stopped run, use the [recovery commands](#recovery).
 
-1. Parse WiFi/IMU logs and construct supported PDR route contours.
-2. Associate checkpoint photos and extract route-video keyframes.
-3. Compare nearby native frames, retaining the sharper original or candidate.
-   If all initial candidates remain below the blur threshold, search further
-   within that sampling bin (at most 2 seconds or 45% of the interval).
-4. Prepare visually verified matching candidates using route and WiFi constraints.
-5. Run COLMAP sparse reconstruction. After undistortion, select explicit depth
-   sources using at least 30 common tracks and a median triangulation angle of
-   2--60 degrees; prefer sources from different capture stops. Dense execution
-   omits unsupported depth references while preserving all sparse cameras and
-   photos. `dense/depth_source_summary.json` records excluded views; the cache
-   and fusion validate the same explicit subset. Fewer than three mutually
-   supported views stops dense execution.
-   These are conservative internal checks, not a guarantee of correct geometry.
-6. Classify observed points using calibrated depth support and export `dense/final.ply`.
-   Unknown points remain available; only repeated, diverse free-space conflicts
-   without support are excluded. Density-only filtering is an explicit legacy option.
-7. Optionally run VideoScene and save gated synthetic hypotheses separately.
-   `main.py` defaults to `--scene-completion off`; its checkpoint model
-   uses `--pdr-capture-mode stationary` for rotation-at-stop capture.
-8. Write JSON quality and provenance reports.
+Nonempty custom output directories require a recorded owner or generated-output metadata before reset; a similar directory name alone is insufficient. Invalid numeric settings, missing masks and output paths that overlap selected tools are rejected before reset. Following an active run drains its final buffered output before returning the exit status.
 
-Native frame selection does not synthesize or sharpen pixels. Its fallback adds
-at most eight seeks per sample and never lowers the blur threshold. An entirely
-blurred selection stays empty. Video reports include retained-bin fraction and
-maximum temporal gap, including clip boundaries; these are sampling diagnostics,
-not 3D surface coverage. Use `--no-video-refine-coverage-search` for the narrow
-search, or `--video-refine-window-s 0` to disable refinement. The retired FlashVSR
-replacement branch remains excluded. WiFi fingerprint model generation remains
-in the main workflow.
+## Sensor Assistance
 
-Useful options:
+Sensor processing is enabled by default. WiFi fingerprints suggest revisits, while IMU/PDR supplies supported route segments. These signals assist match retrieval; they do not directly set camera positions, orientations, or metric scale.
+
+### Uncertain start-time offset
+
+The default `--video-sensor-alignment fuzzy` combines embedded video recording time with the sensor clock to propose uncertain time windows. It does not assume simultaneous recording starts or use file-copy timestamps as capture times.
+
+- `--video-sensor-time-uncertainty-s 30` assumes a window of ±30 seconds. This is a configurable tolerance, not measured accuracy.
+- `--video-sensor-offset-s` adds a known correction to the embedded video clock, in seconds.
+- Missing metadata, ambiguous sessions, or unstable clocks leave frames unassociated while preserving ordinary visual matching.
+
+Fuzzy association retains time windows rather than inventing exact sensor samples or camera poses. Inspect `video_sensor_fuzzy_summary.json` and the workspace's `video_sensor_assistance` summary to see how much sensor evidence was usable.
+
+### Measured synchronization
+
+When time correspondences are known, provide a CSV with the following columns:
+
+```csv
+video_name,session,video_time_s,sensor_elapsed_ts
+clip.mov,capture_session,0,10000
+clip.mov,capture_session,60,70000
+```
+
+Replace these illustrative values with measured correspondences. Video time is in seconds; sensor elapsed time is in milliseconds. Two or more anchors estimate clock offset and drift within a supported interval. A single anchor assumes equal clock rates.
 
 ```powershell
-python main.py --scene-completion videoscene
-python main.py --video-refine-window-s 0
-python main.py --video-refine-budget-hours 2
+python main.py --video-sensor-sync video_sensor_sync.csv
+```
+
+Explicit synchronization takes precedence over fuzzy association and is checked for timestamp validity, drift, and residual error. In the default sensor-assisted mode, a root-level `video_sensor_sync.csv` is discovered automatically unless automatic association is disabled. An explicit sync CSV also enables sensor processing when used with `--video-only`.
+
+Use `--video-sensor-alignment strict` for explicit-anchor association only, or `off` to disable fuzzy and automatically discovered association while retaining sensor preprocessing.
+
+## Configuration
+
+These defaults apply when `main.py` creates a new workspace. Explicit options take precedence; existing workspaces retain their recorded settings.
+
+| Option | Default | Purpose |
+| --- | --- | --- |
+| `--reconstruction-profile` | `final` | Reconstruction settings; `auto` selects a profile using the current GPU. |
+| `--video-frame-interval-s` | `0.5` | Two candidate frames per second across the full clip. |
+| `--video-max-frames` | `0` | No per-video candidate-frame cap. |
+| `--video-blur-policy` | `adaptive` | Selects frames using relative sharpness and detail checks. |
+| `--video-refine-window-s` | `0.25` | Searches nearby native frames; the effective radius is limited by the sampling interval. |
+| `--visual-recovery-neighbors` | `12` | Additional appearance-retrieval budget per image. |
+| `--colmap-dense-profile` | `efficient` | Dense settings with geometric consistency checks. |
+| `--dense-selection-mode` | `adaptive` | Adds views where coverage targets remain unmet. |
+| `--dense-initial-images` | `480` | Initial dense-view budget. |
+| `--dense-max-images` | `1200` | Hard dense-view limit; `0` requests all eligible views. |
+| `--dense-max-source-images` | `12` | Maximum source views per dense reference. |
+| `--point-filter-method` | `observed` | Preserves uncertain points and filters assessed conflicts. |
+| `--cpu-workers` | `0` | Shared default budget: all CPUs available to this process. Positive stage overrides take precedence. |
+| `--video-hw-decode` | `auto` | Prefer available hardware video decoding; use `off` for software decoding. CPU thread budgets remain unchanged. |
+| `--video-hw-device` | `-1` | Automatic video adapter selection. Windows prefers an NVIDIA DXGI adapter; explicit indices belong to the video backend, not CUDA. |
+| `--video-decode-threads` | `0` | Inherits the CPU budget for native video decoding and nearby-frame refinement. |
+| `--colmap-num-threads` | `0` | Inherits the CPU budget for feature extraction, matching, mapping and fusion. |
+| `--image-similarity-workers` | `0` | Inherits the CPU budget for feature extraction and geometric pair verification, bounded by pending tasks. |
+| `--preprocess-workers` | `0` | Runs the two independent WiFi/PDR branches concurrently when the CPU budget permits. |
+| `--colmap-ba-gpu` | `auto` | Probes GPU sparse bundle adjustment; enables it only when the solver is verified. |
+| `--sparse-ba-growth-ratio` | `1.1` | Image and point growth thresholds for global BA; opt-in `1.2` reduces growth-triggered solves. Iteration limits and final refinement are retained. |
+| `--sparse-strategy` | `all` | Map all frames by default. Opt-in `backbone` seeds a protected subset, then offers all frames to the mapper again. |
+| `--sparse-keyframe-gap-s` | `1.0` | Target backbone spacing; retain extra frames for weak matches, disconnected segments, unknown timestamps and clip endpoints. |
+| `--scene-completion` | `off` | Optional VideoScene completion. |
+
+Adaptive dense selection targets 90% single-view sparse-point coverage, 80% retention of three-view sparse tracks, and a four-second selected-view time gap. These are evidence-retention targets, not guarantees of complete surfaces. Unreachable targets remain visible in `dense/depth_source_summary.json`.
+
+Useful examples:
+
+```powershell
+# Increase candidate sampling to four frames per second
+python main.py --video-frame-interval-s 0.25
+
+# Specify the COLMAP executable
 python main.py --colmap-exe "C:\Tools\COLMAP\bin\colmap.exe"
+
+# Preprocess and export without preparing or running COLMAP
+python main.py --skip-colmap-prepare
+
+# Keep an independent workspace for comparison
+python main.py --output generated/compare/processed --reconstruction-output generated/compare/dataset --colmap-workspace generated/compare/workspace
+
+# View all available options
 python main.py --help
 ```
 
-VideoScene defaults to up to three distinct 49-frame 720x480 proposals, processed
-sequentially within a four-hour completion budget, not an end-to-end runtime
-guarantee. Selection prioritizes novel supported gap coverage along compatible
-route segments. Missing pixels need coherent observed depth brackets and
-actual shared-track parallax between endpoints at different checkpoints, plus
-agreement across views, including both calibrated endpoints. A narrow generated
-texture context assists local MVS, but only validated hole points can be added;
-observed geometry is never replaced. Reports include projected target coverage,
-not just a successful inference flag. Large unsupported regions and reflective
-content are not automatically filled. Failure or no accepted proposal does not
-authorize fabricated replacement geometry. Observed backups and accepted
-synthetic additions have separate provenance under `dense/videoscene/<run>/`.
+Higher sampling rates provide more candidate observations but increase processing and storage costs. Preserving native input resolution does not mean every feature or depth computation runs at 4K. Additional frames cannot compensate for missing viewpoints or motion blur throughout the capture.
 
-`--skip-wifi-recovery` disables both explicit RF pair retrieval and RF scoring
-in targeted recovery. Both arms still prioritize cross-checkpoint recovery and
-require visual verification; this switch does not disable the IMU/PDR route.
+### Hardware utilization
 
-The root `run_colmap_dense.bat` uses `resume` and follows the configuration
-originally recorded in the workspace, preserving existing reconstruction inputs.
-It no longer forces VideoScene on. Previously prepared workspaces retain their
-recorded settings. Use `python run_colmap.py resume --with-videoscene` to opt in
-for a workspace that recorded completion as off.
-Completed compatible hypothesis runs are reused rather than inferred again.
+Running `python main.py` uses all detected available CPUs as the default worker budget. `--cpu-workers N` sets a shared default for video decoding, image analysis and supported COLMAP stages. Positive `--video-decode-threads`, `--image-similarity-workers` and `--colmap-num-threads` values override that default for their stages. OS affinity and detected container quotas are respected. The two sensor preprocessing branches remain two tasks; additional idle workers would not accelerate them.
 
-Quality reports mark retained unknown observation points as `dense_needs_review`;
-successful execution does not certify geometry. The WiFi boundary output includes
-`wall_diagnostics` with plane rejection counts. If observed geometry is insufficient
-for walls, the fuzzy capture extent is still exported, without inventing walls.
+Image features and all three geometric-verification passes use bounded worker pools with stable output order. Each outer task uses one OpenCV native thread to prevent nested pools from competing for the same CPUs; the previous setting is restored afterward. Matching thresholds, frame coverage and recovery budgets are independent of this scheduling policy.
 
-Completion conditions supported holes with RGB reprojected from both calibrated
-endpoint photos. The depth estimates used for that warp are hypotheses, not new
-measurements; original rendered colors remain the MVS context outside the hole
-and its narrow blend boundary. Accepted points must project into at least one
-target hole, agree with at least three views (observed depth or supported hole
-prior), have support at both endpoints, and avoid observed free-space conflicts.
-Requiring holes in all three views would discard points whose other views already
-have useful observed depth. `conditioning.json` and `geometry_validation.json`
-record conditioning coverage and the separate validation losses.
+Video decoding passes an explicit thread budget when opening FFmpeg-backed captures, including nearby-frame refinement. This overrides the implicit 16-thread default in [OpenCV 4.10's FFmpeg backend](https://github.com/opencv/opencv/blob/4.10.0/modules/videoio/src/cap_ffmpeg_impl.hpp#L909-L920). Unsupported backends fall back visibly to their defaults. More decoder threads do not guarantee higher throughput for every codec or clip; `--video-decode-threads` permits tuning without changing other stages.
 
-`dense/videoscene/<run>/observed.ply` is the **before-completion backup**;
-`generated_additions.ply` and `completed.ply` are separate hypothesis/preview
-layers. The observed `dense/final.ply` stays unchanged by default. Explicit
-`python videoscene_completion.py --merge-generated` enables the previous merge
-behavior and records generated provenance. To compare with the original
-unconditioned rendering, use `python videoscene_completion.py --prior-conditioning observed`.
-The default is `--prior-conditioning endpoints`. Increasing `--max-clips` only
-helps when more distinct, supported gaps exist; it does not recover surfaces
-with no useful observations.
+Hardware decoding is requested for both initial frame extraction and nearby-frame refinement. On Windows, the pipeline enumerates DXGI adapters and prefers NVIDIA through D3D11 video decoding; it does not assume that CUDA device 0 is Windows video adapter 0. On Linux, automatic mode uses the hardware backends available in the installed OpenCV/FFmpeg build (typically VAAPI); NVIDIA NVDEC availability is not implied by CUDA support elsewhere. If the selected hardware backend cannot open the clip, software decoding keeps the existing CPU worker budget. The actual backend and device are logged and saved in `video_frames_summary.json` and refinement records. Selecting `auto` uses OpenCV extraction so decoded timestamps remain available.
 
-## Outputs and Recovery
+Hardware decoding preserves native frame dimensions but can produce slightly different pixel values from software decoding because of decoder and color-conversion implementations. A local 4K60 check preserved sampled frame positions and timestamps, including seeks; it did not establish bit-identical images or equivalent final reconstruction quality. Use `python main.py --video-hw-decode off` for software-decoder comparisons. This acceleration applies to video preprocessing and does not move CPU-only sparse bundle adjustment onto the GPU. See [OpenCV's hardware decoder configuration](https://github.com/opencv/opencv/blob/4.13.0/modules/videoio/src/cap_ffmpeg_hw.hpp).
 
-COLMAP stages now use compact console output by default. Interactive terminals
-update the PatchMatch progress on one line; redirected output prints progress
-at most every 15 seconds, plus pass and stage changes. Warnings and errors remain
-visible. `ETA/pass` estimates only the current photometric/geometric pass from
-completed views; it does not include later passes, fusion or completion.
-Complete subprocess output is saved under `colmap_workspace/logs/` (or the selected
-workspace's `logs/`), with the log path printed at startup and exit.
-Use `python main.py --colmap-log-level verbose` or
-`python run_colmap.py dense --log-level verbose` for native console output.
-Output changes take effect on the next launch; an already running reconstruction
-keeps its current console. Reconstruction resolution and iteration counts are
-unchanged. Dense output validation reads its shared PatchMatch settings once per
-validation instead of rereading the JSON for every view.
+Native-frame sharpness scoring also supports OpenCL GPU acceleration. Before OpenCV initializes, the pipeline prefers NVIDIA when detected, while respecting an explicit `OPENCV_OPENCL_DEVICE` selection. For large grayscale images it checks double-precision support, compares the score against the CPU result, and measures throughput including image uploads and result synchronization. GPU scoring is used only when that check shows a speed advantage; unsupported, slower or failing devices fall back to CPU. Small thumbnails stay on CPU to avoid transfer overhead. CPU scoring also avoids a large temporary floating-point image by using an exact integer Laplacian with double-precision reduction. This preserves the scoring formula and does not lower the CPU worker budget.
 
-- `processed/`: WiFi/PDR tables, photo associations, video frames and metadata.
-- `reconstruction_dataset/`: COLMAP-ready images, route seeds and WiFi models.
-- `colmap_workspace/`: matching inputs, generated runners, sparse/dense models.
-- `colmap_workspace/dense/final.ply`: filtered observed cloud; synthetic additions
-  enter this file only when `--merge-generated` is explicitly supplied.
-- `final_output_summary.json`, `videoscene_summary.json` and `quality_report.json`:
-  identities, provenance and quality status within the workspace.
+Startup prints the resolved budgets, and `generated/processed/processing_summary.json` records them under `compute_resources`. The COLMAP workspace records the actual thread settings used by its generated recipes.
 
-Raw `fused.ply` is retained. Binary PLY files are intended for tools such as
-MeshLab, not text editors. Meshing is off by default; `--colmap-meshing` enables
-inspection meshes, but does not make their interpolated surfaces observations.
+At mapping startup, an isolated small reconstruction checks the installed Ceres GPU solver. `--colmap-ba-gpu auto` reports the outcome and uses CPU BA when GPU support is missing or unverified. `on` requires a successful probe and fails visibly otherwise; `off` explicitly selects CPU BA. New runs record actual mapper commands, per-stage timing and sparse coverage in `sparse_optimization.json`, calibration in `video_intrinsics_summary.json`, and the resource decision in `compute_resources.json`.
 
-Final export stages both the PLY and its provenance, keeps rollback copies until
-both commits succeed, and only then removes optional intermediates. If rollback
-itself fails, recovery copies are retained and their paths are reported. Cleanup
-receipt failures leave the committed identity valid and mark cleanup as pending.
+CUDA feature extraction and stereo support do not imply CUDA/cuDSS support in Ceres. Some COLMAP distributions therefore use the GPU for matching and depth estimation while bundle adjustment stays on the CPU. Using all available resources does not guarantee 100% utilization: algorithm dependencies, small tasks, memory traffic, and solver support still matter. Coverage and validation budgets remain configurable quality controls, not hidden utilization throttles.
 
-Stage-specific entry points are retained because they support recovery without
-rerunning everything:
+Existing runs retain their recorded executable, code, and thread settings. New settings apply to newly prepared workspaces; moving a Windows workspace to Linux requires regenerating its paths and recipes rather than executing old absolute paths.
 
-```powershell
-python run_colmap.py full
-python run_colmap.py resume --dry-run
-python run_colmap.py resume
-python run_colmap.py dense
-python run_colmap.py filter
-python run_colmap.py completion --max-clips 3
-python run_colmap.py report
-python reconstruction_quality.py --workspace colmap_workspace --check-freshness
+### Sparse scheduling and coverage validation
+
+Global BA is triggered when **any** image-growth, point-growth or fixed-interval condition is met. Changing only the fixed frame interval does not suppress the growth triggers. The pipeline configures both growth ratios while preserving the native fixed-interval safety triggers, local BA, solver iteration limits, triangulation filters and final global refinement. See the [COLMAP 3.13 incremental pipeline](https://github.com/colmap/colmap/blob/3.13.0/src/colmap/controllers/incremental_pipeline.cc#L349-L360).
+
+All-frame mapping remains the default. Experimental `--sparse-strategy backbone` chooses temporally distributed frames using verified match support and restores graph bridges and weak segments. Features and matches for every input frame are retained. After a successful backbone, a second mapper pass loads that model and attempts to register all remaining frames, including triangulation and bundle adjustment. If fewer than 90% of selected frames register, the pipeline falls back to mapping all frames from scratch. This fallback can cost more time; a connected match graph alone does not guarantee reliable geometry. This option is not a guaranteed acceleration and should be validated per capture.
+
+The native `1.1` growth ratio also remains the default: initial real-video comparisons did not pass the conservative observation-retention gate consistently across both tested segments. To opt into reduced frequency, use `python main.py --sparse-ba-growth-ratio 1.2`; add `--sparse-strategy backbone` to test the two-stage strategy. These options change newly prepared runs, not a mapper already in progress.
+
+New `main.py` runs also test a bounded calibration recovery after mapping when video intrinsics were held fixed. A separate candidate refines focal length and lens distortion while retaining the principal point. When camera coverage is inadequate, the mapper tries to register the remaining frames using the refined model and existing matches. The default native execution budgets are 300 seconds for calibration and 900 seconds for registration; input validation and candidate checks take additional time. Registration uses the existing CPU worker budget and the verified GPU BA capability; standalone bundle adjustment uses the native solver's thread selection.
+
+Recovery candidates must retain every previously registered image, at least 95% of original feature observations and sparse points, no larger video gaps, plausible intrinsics, and bounded reprojection error recomputed from the candidate geometry. A candidate is selected only when registration or measured error improves. Failed, interrupted or unhelpful trials keep the baseline; their decisions are recorded in `sparse_recovery_summary.json`. This follows COLMAP's supported [late intrinsic refinement and continued mapping](https://github.com/colmap/colmap/blob/3.13.0/doc/faq.rst), but does not guarantee recovery of missing surfaces.
+
+Before dense reconstruction, datasets and individual clips with at least 20 frames must register at least 75% of their supplied images. Large gaps in the registered video timeline also block continuation: the allowed gap accounts for the clip duration and original sampling intervals. Short sequences receive coverage warnings while still requiring at least three registered views. A failed check preserves sparse outputs and stops before expensive depth estimation; a successful native mapper exit alone is insufficient. These checks describe camera coverage, not ground-truth surface completeness. They apply to `main.py` and the staged sparse/dense workflow; the legacy `automatic` command uses COLMAP's combined native workflow instead.
+
+To compare native scheduling, reduced BA frequency, and the backbone strategy on an isolated subset of an existing matched workspace:
+
+```bash
+python sparse_ablation.py --source generated/colmap_workspace --output generated/sparse_comparison --colmap-exe /path/to/colmap --start-s 150 --frames 60 --threads 4 --timeout-s 600
 ```
 
-Use these only with current generated scripts and matching inputs. Dense caches
-are reused only when provenance, configuration and recorded output hashes match.
-Certification checks the undistorted sparse model, registered images, PatchMatch
-view coverage, and each geometric depth/normal map's dimensions, byte count and
-finite payload. Old cache receipts without these output checks are recomputed.
-Completion requires a
-filtered final with its hash and reconstruction binding. Old exports without
-that binding require a new filtered export from corresponding verified dense
-data; do not fabricate a receipt for an old cloud. `--prepare-only` allows preview
-preparation without merging. Do not delete an active `.pipeline.lock` file.
+Use the actual executable path on Windows or Linux. The output directory must be new and on the same volume as the source images; input JPEGs are hard-linked and SQLite rows are copied through a read-only source connection. The source database and models are not changed. For multiple videos, specify `--clip`. Each native mapping stage has a timeout; interrupted experiments are recorded as failures, not as completed models.
 
-`run_colmap_dense.bat` and the legacy workspace `run_colmap_dense_high.bat` now
-delegate to the locked `resume` entry. The legacy name no longer invokes removed
-floor/dark-surface scripts or overrides the configured reconstruction profile.
-Newly generated workspaces include this compatibility entry too.
+Successful experiments automatically remove their copied databases, linked input images and intermediate snapshots. Models, logs, metadata and comparison reports are retained under the ignored `generated/` directory. Use `--keep-intermediates` to retain the diagnostic inputs; failed experiments retain them by default.
 
-Resume keeps a verified final and runs only missing completion/report stages.
-After a completed sparse stage, an interrupted MVS stage can continue through
-the canonical dense runner if no existing PLY would be removed. Unverified or
-interrupted sparse results require an explicit rebuild. Existing PLY files with
-mismatched provenance are preserved and cause a refusal. Filtering verifies MVS
-hashes, uses a proven fused source or re-fuses into an isolated staging directory,
-and retains previous finals before publishing a changed result. `--dry-run`
-checks identities and prints the planned stages without running reconstruction.
+`comparison.json` reports registered image identities, 3D points, feature-observation retention, reprojection error, video coverage gaps, global-refinement events and elapsed time. Feature observations are compared by image name and feature index because 3D point IDs differ between runs. The conservative sparse screening gate requires no lost baseline images, at least 95% observation and point retention, no larger temporal gaps, and bounded reprojection error. Passing it does **not** establish dense surface completeness. Concurrent reconstruction and native solver variability also limit timing comparisons; validate a full dense result before accepting a quality-sensitive configuration.
 
-New dense runners checkpoint undistorted inputs before PatchMatch. With matching
-inputs, an interrupted run retains validated per-view depth/normal pairs and
-recomputes missing or damaged pairs. A damaged photometric dependency invalidates
-the geometric pass; other valid photometric views remain reusable. Completed
-receipts skip both undistortion and PatchMatch, including repeated interruptions
-before fusion. Older partial caches without an input checkpoint are recomputed
-once because their inputs cannot be authenticated.
+## Outputs
 
-Quality reports bind their input images, model, configuration and PLY files by
-SHA-256, and are written atomically. `--check-freshness` exits with code 2 for an
-old or changed report. Completion and the stage runner refresh reports;
-`python run_colmap.py report` refreshes them manually. Reports stay in their
-reconstruction workspace by default; no compatibility copy is written to the
-project root. Experimental workspaces use their own dataset metadata and reports.
+```text
+generated/
+├── processed/                   Sensor tables, frame metadata, preprocessing summaries
+├── reconstruction_dataset/      Exported images, manifests, WiFi fingerprints
+└── colmap_workspace/
+    ├── main_console.log         Combined pipeline output
+    ├── main_run_state.json      Run status and exit code
+    ├── logs/                    Detailed COLMAP logs and stage timings
+    ├── sparse/                  Sparse reconstruction
+    ├── dense/
+    │   ├── fused.ply            Raw fused point cloud
+    │   ├── final.ply            Final point cloud
+    │   ├── final_output_summary.json
+    │   └── depth_source_summary.json
+    └── quality_report.json      Coverage, quality, and source validation
+```
 
-The selected sparse model's quality report now includes per-camera linked
-observation counts, out-of-image coordinates, 8x8 feature occupancy, bounding-box
-spread and a spatial eigenvalue ratio. Unlinked features do not count as 3D
-support. Views with features in at most two grid cells are listed for inspection;
-this is not an automatic rejection rule or a surface-area estimate.
-`reconstruction_evaluation.py compare` also lists per-camera observation and
-grid-coverage losses relative to the first report, so aggregate point gains do
-not hide local losses. Binary and text models use the same calculations; absent
-metrics in older reports are reported as unavailable.
+Quality reporting distinguishes successful execution from geometry that needs review. Diagnostics include frame-sampling gaps, image registration, sparse components, feature support, dense-view coverage, and filtering uncertainty. A successful exit code alone does not certify reconstruction accuracy.
 
-The default compact console shows stage progress, warnings and a short final
-summary. Full preprocessing statistics are saved to `processed/processing_summary.json`;
-COLMAP output and stage timings remain under the workspace's `logs/` directory.
-Repeated identical warnings are counted, routine metadata stays in the log, and
-per-stage timing tables are omitted from the compact console. Use
-`python main.py --colmap-log-level verbose` (or `run_colmap.py --log-level verbose`)
-to display full details.
+After successful reconstruction and validation, the pipeline removes recorded temporary frame copies and exported dataset images. Original captures, metadata, reports, COLMAP inputs, databases, sparse models, depth caches, and final outputs remain available. Failed or interrupted runs retain their inputs for recovery.
 
-Subprocess monitoring records the active stage, elapsed time and time since the
-last complete output line every 60 seconds. The console heartbeat appears when
-there has been no visible update for that interval, including during silent bundle
-adjustment. On Windows, a batch shell left without any child process for 30
-seconds fails with a diagnostic instead of waiting indefinitely. An exited
-launcher whose output pipe stays open gets a 5-second drain period before its
-remaining descendants are terminated. Logs are flushed on timer ticks and timing
-reports include the exit code and any monitoring failure.
+Use `--keep-generated-inputs` to disable post-success image cleanup. This does **not** disable the startup reset performed by `main.py`. Generated outputs and raw captures are excluded from normal Git commits through `.gitignore`; files already tracked by Git require separate handling.
 
-Silence alone does not establish a hang: long computations remain allowed by
-default. Set `COLMAP_OUTPUT_TIMEOUT_SECONDS` to a positive number to opt into a
-no-output deadline (`0` disables it). Ctrl-C remains responsive while waiting for
-output. Generated batch runners recognize all nonzero exit codes, including
-negative Windows crash codes.
+Before opening a new run's console log, `main.py` now prunes recognized historical caches under `experiments/`, `generated/`, and legacy output directories. Eligible data includes historical stereo depth/normal/consistency maps, undistorted image copies, all but the two newest complete sparse snapshots per historical workspace, and video-frame copies whose source videos still exist. Original workspace images are retained because they may be the only remaining copies of older captures. Unknown files, redirected paths, source code, captures, Git history, environments and model weights are not cleanup targets. All affected output owners are locked before deletion; a busy owner defers cleanup.
 
-Sparse mapping saves recovery candidates every 50 registered frames under
-`sparse_snapshots/<run-id>/`, separately from completed sparse models. These
-snapshots are never automatically certified or selected for dense reconstruction;
-they require validation before manual recovery. This does not change bundle
-adjustment parameters or guarantee recovery from a numerical solver failure.
+The selected run directories, explicitly configured input paths, and the default current workspace are protected from historical-cache pruning. An active selected run is followed without cleanup. As before, starting a fresh `main.py` run subsequently resets its selected stopped-run outputs; use the recovery commands below when those intermediate results must be reused. Before that reset, existing PLY outputs, camera models, reports and logs are preserved in `generated/results/`. Large immutable results use same-volume hard links where possible, while mutable reports/logs are copied. These archives are for inspecting saved results, not for resuming MVS.
 
-## Moving to Another Machine
+`generated/startup_cleanup_report.json` records deleted paths, logical bytes and available disk space. Pruned historical depth caches must be recomputed before further depth-dependent processing; preserved point clouds remain available. `--skip-startup-cleanup` disables historical-cache pruning only, not the selected workspace's normal fresh-run reset. Cleanup does not impose a total disk quota, and the current reconstruction may still need substantial additional space as it runs.
 
-1. Transfer source code and the required `pic/`, `video/` and `.sess` inputs.
-   Raw data, binaries, generated outputs and weights are intentionally not in Git.
-2. Recreate the main Python environment; do not copy virtual environments between
-   machines. If using VideoScene, also prepare its pinned checkout and isolated
-   environment as described above. Verified weights can be copied into the same
-   relative checkpoint layout.
-3. Install CUDA-enabled COLMAP in the relative directory above, provide
-   `--colmap-exe`, or make `colmap` available on PATH.
-4. Run `main.py` in the new location to regenerate workspace paths and scripts.
-   Existing generated scripts/metadata can contain old absolute paths; do not
-   reuse them unchanged after moving. Confirming a full run resets old outputs.
+## Recovery
 
-This project introduction documents the workflow. Runtime reports use CSV/JSON;
-controlled comparisons also provide a small Markdown table. Documentation and tests bundled inside ignored third-party checkouts
-are not modified by project source cleanup.
+Continue a stopped reconstruction without restarting preprocessing:
+
+```powershell
+python run_colmap.py resume --workspace generated/colmap_workspace --dry-run
+python run_colmap.py resume --workspace generated/colmap_workspace
+```
+
+The dry run validates existing files and prints the planned stages without running reconstruction. Reuse requires compatible input identities, configuration, and output checks. An old or interrupted result is not automatically treated as a verified cache.
+
+Individual stages are also available:
+
+```powershell
+python run_colmap.py dense
+python run_colmap.py filter
+python run_colmap.py report
+```
+
+These commands default to `generated/colmap_workspace`; specify `--workspace` for another location. For a new dense comparison based on a verified sparse result:
+
+```powershell
+python sparse_reuse.py --workspace generated/colmap_workspace --output generated/dense_compare/workspace
+python run_colmap.py dense --workspace generated/dense_compare/workspace
+```
+
+The destination must not exist. The original result is retained, and depth maps are recomputed in the new workspace. Images may use hard links; use `--copy-images` for independent copies and never edit linked inputs in place.
+
+For an incomplete point cloud, inspect sampling gaps first, then sparse registration and components, dense-view coverage, and filtering diagnostics. Increasing dense resolution cannot repair failed camera registration.
+
+Observation filtering now schedules spatially local batches across the scene so broad, repeatedly selected views do not monopolize the assessment. Newly prepared runs allow up to two million original points within the existing 120-second assessment budget; `--point-filter-max-candidates` and `--point-filter-budget-seconds` adjust those limits. Verification and PLY I/O are outside that assessment budget. Reports distinguish sampled points, tested points, camera coverage and unresolved points. Before deletion, provisional conflicts are checked against all eligible projectable views. Any credible support vetoes deletion, and unfinished checks retain the point as unknown. Part of the same assessment budget is reserved for this check. Unknown or unassessed geometry remains in the output, and evidence is never propagated to neighboring points.
+
+The console uses compact progress output by default. Interactive terminals redraw the active progress bar; redirected output uses plain snapshots approximately every 15 seconds and on subtask completion. The combined console log stores cursor-free snapshots, while native COLMAP output remains in full under `logs/`. Stage headings identify the sparse or dense sequence, so restarting a local step count is explicit. Use `python main.py --colmap-log-level verbose` or `python run_colmap.py resume --log-level verbose` for detailed native output.
+
+Frame extraction and refinement, image/pair analysis, SIFT extraction, matching blocks, undistortion, PatchMatch passes, stereo fusion and point-filtering passes report completed work and elapsed time. Where a finite workload is known, ETA is estimated from recent measured throughput after initial sampling. It covers only the displayed subtask, not total pipeline completion. Slow items and I/O stalls can extend the estimate; a stopped or budget-limited pass keeps its actual count instead of jumping to 100%. Reused PatchMatch caches can make a pass estimate conservative because skipped views emit no native completion messages.
+
+Sparse mapping and global bundle adjustment have a changing workload and convergence-dependent stopping conditions. They display registered-frame counts, the current operation and elapsed time with `ETA unavailable`, rather than treating registration percentage as a reliable time estimate. Other tasks without measurable totals also report elapsed time. Native stage timings remain recorded in `logs/*.timing.json`. Use `python run_colmap.py resume --no-runtime-estimate` to disable estimates while keeping progress counts.
+
+## Optional Extensions
+
+### WiFi extent and wall hypotheses
+
+```powershell
+python run_colmap.py boundary --workspace generated/colmap_workspace
+```
+
+This diagnostic combines explicitly synchronized WiFi/video positions with observed geometry to estimate a fuzzy capture-support region and rank visual wall candidates. It requires sufficient non-collinear positions; uncertain time windows alone cannot assign a scan to one camera position.
+
+Outputs include a standalone viewer under `wifi_boundary/`. They are hypotheses in the reconstruction's relative coordinate frame, not a measured floor plan or metric indoor localization result. Missing support leaves the observed reconstruction intact.
+
+### VideoScene completion
+
+VideoScene is disabled by default. When enabled, it proposes additions only for local gaps with supporting multi-view observations. The adapter uses an observed COLMAP prior and is not a complete implementation of the original paper's NoPoSplat pipeline.
+
+<details>
+<summary>Environment and model setup</summary>
+
+Prepare the official `THU-SI/VideoScene` checkout under `VideoScene/` at revision `de23c631fdb0663e5e732317c4642f38e4bd295f`. The adapter expects `hanyang/VideoScene` weights at revision `cf6075132cb3d7e1b42b6e7e382748b424387f19`, stored under `VideoScene/checkpoints/checkpoints/`.
+
+The distilled checkpoint, base transformer, VAE, prompt embedding, and configuration files are required. Exact paths and hashes are defined in [videoscene_runner.py](videoscene_runner.py). Code and model assets are not downloaded automatically.
+
+Create the isolated environment:
+
+```powershell
+py -3.10 -m venv VideoScene/.venv
+.\VideoScene\.venv\Scripts\python.exe -m pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu124
+.\VideoScene\.venv\Scripts\python.exe -m pip install -r requirements.txt
+python videoscene_completion.py --check
+```
+
+The check verifies dependencies and a small CUDA/BF16 operation. Inference also validates model assets. Passing preflight does not guarantee sufficient memory or successful full inference.
+
+</details>
+
+```powershell
+# Enable completion for a new reconstruction
+python main.py --scene-completion videoscene
+
+# Attempt a bounded completion on an existing result
+python run_colmap.py completion --max-clips 1 --budget-hours 0.5
+```
+
+Accepted additions must satisfy original endpoint depth, multi-view support, parallax, and free-space checks. Generated views cannot validate one another as original evidence. If no additions pass, the existing final stays unchanged.
+
+Completion retains an observed backup and separates accepted generated points under `dense/videoscene/<run>/`. Published clouds use `source_id` to distinguish observed points (`0`) from generated additions (`1`).
+
+## Limitations
+
+- **Capture coverage matters.** Surfaces need overlapping observations from different positions. Resolution and frame rate cannot supply missing parallax, texture, or viewpoints.
+- **Sensor assistance is conditional.** Missing or ambiguous timing reduces usable sensor evidence. WiFi and PDR do not independently establish camera geometry or metric scale.
+- **Reflective and weakly textured surfaces remain difficult.** Conservative filtering preserves uncertainty and may retain floating errors; it does not fill missing walls.
+- **Runtime depends on the capture and hardware.** Frame counts, candidate matches, image sizes, dense coverage, and optional completion affect time and memory use.
+- **Completion is inferential.** Generated additions remain distinguishable from observed geometry and cannot recover surfaces absent from all supporting observations.
+
+## Project Structure
+
+| Module | Responsibility |
+| --- | --- |
+| [main.py](main.py) | Full pipeline entry, run lifecycle, and cleanup |
+| [preprocess_pipeline.py](preprocess_pipeline.py) | Preprocessing and configuration |
+| [video_frames.py](video_frames.py), [video_refinement.py](video_refinement.py) | Native frame sampling, sharpness selection, and coverage |
+| `video_sensor_*.py` | Clock association and sensor-assisted matching |
+| [image_similarity.py](image_similarity.py) | Appearance retrieval and geometric preview checks |
+| [colmap_bridge.py](colmap_bridge.py), [run_colmap.py](run_colmap.py) | Workspace preparation, COLMAP execution, and recovery |
+| [dense_keyframes.py](dense_keyframes.py), [mvs_observations.py](mvs_observations.py) | Dense view selection and observation support |
+| [reconstruction_quality.py](reconstruction_quality.py) | Quality diagnostics and report generation |
+| [videoscene_completion.py](videoscene_completion.py) | Optional completion and validation |
+
+## Validation
+
+Run the regression checks:
+
+```powershell
+python -m unittest discover -s tests
+```
+
+The checks cover video input handling, sensor retention, candidate selection, geometry gating, and a small real 60fps clip through preprocessing and workspace preparation. They do not replace full GPU reconstruction or quality evaluation on a representative 4K capture.
+
+Resource and stage tests additionally cover explicit overrides, GPU fallback, literal path arguments, child exit codes, dense-cache branching, and generated recipe parsing. The CI matrix runs the tests on Windows and Linux; a successful CPU test run does not certify a particular machine's COLMAP/CUDA installation.
+
+Additional checks cover native-build preflight before cleanup, multi-clip filename collisions, Unicode image paths, partial extraction failures, and resolution consistency when re-fusing cached depth maps. Linux process tests exercise nested child ownership and graceful SIGTERM cancellation; those integration tests are skipped on Windows.
+
+Raw captures, generated results, local binaries, environments, and model weights are not included in the repository. Recreate environments and regenerate workspace paths when moving the project to another machine.

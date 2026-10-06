@@ -7,9 +7,24 @@ import numpy as np
 
 from dense_surface_filter import positions, vertex_chunks
 from ply_io import PLY_TYPES, parse_ply_header, validate_ply
+from mvs_observations import undistorted_intrinsics
 
 
 WIDTH, HEIGHT, FRAME_COUNT = 720, 480, 49
+SELECTION_POLICY = {
+    "version": "observed_overlap_local_pairs_v2",
+    "minimum_projected_points": 100,
+    "minimum_baseline_depth_ratio": .025,
+    "short_baseline_depth_ratio": .18,
+    "maximum_baseline_depth_ratio": .5,
+    "minimum_common_projection_ratio": .35,
+    "extended_common_projection_ratio": .6,
+    "minimum_observed_overlap": .35,
+    "extended_observed_overlap": .6,
+    "overlap_denominator": "larger_endpoint_projected_point_count",
+    "depth_statistic": "median_middle_depth_of_points_projecting_into_all_three_views",
+    "interpretation": "Sampled points in all three image bounds; occlusion is not tested here.",
+}
 
 
 def quaternion_rotation(q):
@@ -36,13 +51,7 @@ def read_cameras(model):
             continue
         cid, kind, width, height, *params = line.split()
         p = list(map(float, params))
-        if kind == "PINHOLE" and len(p) == 4:
-            fx, fy, cx, cy = p
-        elif kind == "SIMPLE_PINHOLE" and len(p) == 3:
-            fx, cx, cy = p
-            fy = fx
-        else:
-            raise ValueError("Completion requires an undistorted PINHOLE model")
+        fx, fy, cx, cy = undistorted_intrinsics(kind, p)
         width, height = int(width), int(height)
         k = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=float)
         if width <= 0 or height <= 0 or min(fx, fy) <= 0 or not np.isfinite(k).all():
@@ -91,6 +100,62 @@ def project(xyz, view):
     pixel = np.zeros((len(xyz), 2), dtype=np.int32)
     pixel[good] = np.rint(uv[good]).astype(np.int32)
     return pixel, z, good
+
+
+def baseline_rejection(ratio, overlap):
+    """Apply the bounded short/extended policy to shared projected samples."""
+    if not math.isfinite(ratio) or ratio <= 0:
+        return "invalid_baseline_depth_ratio"
+    if not math.isfinite(overlap) or not 0 <= overlap <= 1:
+        return "invalid_common_projection_ratio"
+    if ratio < SELECTION_POLICY["minimum_baseline_depth_ratio"]:
+        return "baseline_too_small"
+    if ratio > SELECTION_POLICY["maximum_baseline_depth_ratio"]:
+        return "baseline_too_large"
+    extended = ratio > SELECTION_POLICY["short_baseline_depth_ratio"]
+    required = SELECTION_POLICY["extended_common_projection_ratio" if extended else "minimum_common_projection_ratio"]
+    if overlap < required:
+        return "insufficient_extended_common_projection" if extended else "insufficient_common_projection"
+    return None
+
+
+def pair_sampling_support(sample, first, last, baseline):
+    """Screen a calibrated pair using common projected samples, without I/O.
+
+    The overlap fraction uses the larger endpoint count, so a narrow view
+    wholly contained in a much wider view cannot claim full overlap. All
+    shared points must also project into the middle view. This is an image
+    bounds check, not an occlusion or depth-consistency test; downstream full
+    rendering and original-image depth checks remain necessary.
+    """
+    sample = np.asarray(sample, dtype=np.float64)
+    if sample.ndim != 2 or sample.shape[1] != 3:
+        raise ValueError("Pair samples must have shape (N, 3)")
+    middle = interpolate_views(first, last, 3)[1]
+    projections = [project(sample, view) for view in (first, last, middle)]
+    masks = [item[2] for item in projections]
+    counts = [int(mask.sum()) for mask in masks]
+    common = masks[0] & masks[1] & masks[2]
+    common_count = int(common.sum())
+    overlap = common_count / max(counts[0], counts[1], 1)
+    median = float(np.median(projections[2][1][common])) if common_count else None
+    ratio = float(baseline / median) if median is not None and math.isfinite(baseline) else None
+    reason = None
+    if not math.isfinite(baseline) or baseline <= 0:
+        reason = "invalid_baseline"
+    elif min(counts) < SELECTION_POLICY["minimum_projected_points"]:
+        reason = "insufficient_projected_points"
+    elif common_count < SELECTION_POLICY["minimum_projected_points"]:
+        reason = "insufficient_common_projected_points"
+    else:
+        reason = baseline_rejection(ratio, overlap)
+    regime = None if ratio is None else (
+        "short" if ratio <= SELECTION_POLICY["short_baseline_depth_ratio"] else "extended")
+    return {"eligible": reason is None, "reject_reason": reason,
+            "first_projected_points": counts[0], "last_projected_points": counts[1],
+            "middle_projected_points": counts[2], "common_projected_points": common_count,
+            "common_projection_ratio": overlap, "shared_median_depth": median,
+            "baseline_depth_ratio": ratio, "baseline_regime": regime}
 
 
 def render_cloud(cloud, view):
@@ -245,6 +310,48 @@ def gate_points(xyz, views, depths, masks, expected, *, diagnostics=False):
     return keep
 
 
+def observed_depth_support(xyz, views, maps, *, depth_error=.03, minimum_angle=2.):
+    """Validate proposals against two real-image MVS depth measurements.
+
+    Rendered clouds, interpolated hole depths and generated frames are not
+    independent observations. Only authenticated original geometric depth maps
+    belong here. Unknown depths cannot vote; front-of-surface conflicts veto.
+    """
+    from mvs_observations import project as project_observed
+
+    if len(views) != 2 or len(maps) != 2 or views[0]["name"] == views[1]["name"]:
+        raise ValueError("Completion validation requires two distinct observed cameras")
+    supported = np.ones(len(xyz), dtype=bool)
+    conflict = ~np.isfinite(xyz).all(axis=1)
+    counts = []
+    for view, pair in zip(views, maps):
+        vote = np.zeros(len(xyz), dtype=bool)
+        if pair is not None:
+            depth, normal = pair
+            height, width = depth.shape
+            pixels, z, good = project_observed(xyz, view, size=(width, height))
+            ids = np.flatnonzero(good)
+            x, y = np.rint(pixels[good]).astype(np.intp).T
+            measured = depth[y, x]
+            valid = np.isfinite(measured) & (measured > 0)
+            valid_normal = np.isfinite(normal[y, x]).all(axis=1) & (np.linalg.norm(normal[y, x], axis=1) > .5)
+            vote[ids] = valid & valid_normal & (np.abs(z[ids]-measured) <= depth_error*measured)
+            conflict[ids] |= valid & (z[ids] < (1-depth_error)*measured)
+        supported &= vote
+        counts.append(int(vote.sum()))
+    rays = [xyz-view["C"] for view in views]
+    lengths = np.linalg.norm(rays[0], axis=1)*np.linalg.norm(rays[1], axis=1)
+    cosine = np.divide(np.sum(rays[0]*rays[1], axis=1), lengths,
+                       out=np.ones(len(xyz)), where=lengths > 1e-12)
+    angle = np.degrees(np.arccos(np.clip(np.abs(cosine), 0, 1)))
+    parallax = np.isfinite(angle) & (angle >= minimum_angle)
+    keep = supported & parallax & ~conflict
+    return keep, {"candidate_points": len(xyz), "support_by_observed_view": counts,
+                  "two_observed_views": int(supported.sum()),
+                  "insufficient_parallax": int((supported & ~parallax).sum()),
+                  "free_space_conflicts": int(conflict.sum()), "accepted_points": int(keep.sum())}
+
+
 def write_fixed_model(folder, views, database_images=None):
     folder.mkdir(parents=True, exist_ok=True)
     cameras, images = {}, []
@@ -271,10 +378,12 @@ def write_vertices(path, properties, chunks, count):
         handle.write(("\n".join([*header, "end_header"]) + "\n").encode("ascii"))
         written = 0
         for chunk in chunks:
+            missing = set(dtype.names)-set(chunk.dtype.names)
+            if missing:
+                raise ValueError(f"Missing PLY vertex properties: {sorted(missing)}")
             out = np.zeros(len(chunk), dtype=dtype)
             for name in dtype.names:
-                if name in chunk.dtype.names:
-                    out[name] = chunk[name]
+                out[name] = chunk[name]
             out.tofile(handle)
             written += len(out)
     if written != count:
@@ -282,18 +391,30 @@ def write_vertices(path, properties, chunks, count):
     validate_ply(path)
 
 
+def label_source(chunk, source_id):
+    """Add an explicit per-vertex origin without changing geometry or colors."""
+    fields = [(name, chunk.dtype.fields[name][0]) for name in chunk.dtype.names if name != "source_id"]
+    result = np.empty(len(chunk), dtype=fields+[("source_id", "u1")])
+    for name, _ in fields:
+        result[name] = chunk[name]
+    result["source_id"] = source_id
+    return result
+
+
 def merge_clouds(observed, additions, output):
     with observed.open("rb") as handle:
         header = parse_ply_header(handle)
     if any(e["count"] for e in header["elements"][1:]):
         raise ValueError("Completion cannot merge into a mesh")
-    supported = {"x", "y", "z", "nx", "ny", "nz", "red", "green", "blue"}
+    supported = {"x", "y", "z", "nx", "ny", "nz", "red", "green", "blue", "source_id"}
     if not {p[0] for p in header["vertex_properties"]}.issubset(supported):
         raise ValueError("Refusing to discard unknown PLY properties")
     count = validate_ply(additions)["vertex"]
 
     def chunks():
-        yield from vertex_chunks(observed)
-        yield from vertex_chunks(additions)
+        for source_id, path in enumerate((observed, additions)):
+            for chunk in vertex_chunks(path):
+                yield label_source(chunk, source_id)
 
-    write_vertices(output, header["vertex_properties"], chunks(), header["vertex_count"] + count)
+    properties = [(name, kind) for name, kind in header["vertex_properties"] if name != "source_id"]
+    write_vertices(output, properties+[("source_id", "uchar")], chunks(), header["vertex_count"] + count)

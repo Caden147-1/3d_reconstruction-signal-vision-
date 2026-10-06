@@ -116,26 +116,44 @@ class WindowsJob:
 @contextmanager
 def managed_process(command, **kwargs):
     job = WindowsJob() if os.name == "nt" else None
+    # Linux descendants join the outer stage's process group so cancellation
+    # also reaches mapper/ffmpeg grandchildren instead of orphaning new sessions.
+    inherited_group = not job and os.environ.get('FYP_MANAGED_PROCESS_GROUP') == '1'
     process = None
+    main_thread = threading.current_thread() is threading.main_thread()
+    manages_sigterm = not job and main_thread
+    previous_sigterm = None
+
+    def terminate(signum, _frame):
+        # POSIX's default SIGTERM action bypasses finally blocks. Turn it into
+        # normal unwinding so descendants stop before callers release locks.
+        raise SystemExit(128 + signum)
+
+    if manages_sigterm:
+        previous_sigterm = signal.signal(signal.SIGTERM, terminate)
     try:
         if job:
             # Attach before user code can spawn descendants outside the job.
             kwargs["creationflags"] = kwargs.get("creationflags", 0) | 0x4  # CREATE_SUSPENDED
         else:
-            kwargs["start_new_session"] = True
+            kwargs["start_new_session"] = not inherited_group
+            child_env = dict(kwargs.get('env', os.environ))
+            child_env['FYP_MANAGED_PROCESS_GROUP'] = '1'
+            kwargs['env'] = child_env
         process = subprocess.Popen(command, **kwargs)
         if job:
             job.attach_and_resume(process)
             process.active_tree_processes = job.active_processes
         yield process
     finally:
-        main_thread = threading.current_thread() is threading.main_thread()
         previous = signal.signal(signal.SIGINT, signal.SIG_IGN) if main_thread else None
+        if manages_sigterm:
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
         try:
             try:
                 if job:
                     job.close()
-                elif process:
+                elif process and not inherited_group:
                     try:
                         os.killpg(process.pid, signal.SIGKILL)
                     except ProcessLookupError:
@@ -153,3 +171,5 @@ def managed_process(command, **kwargs):
         finally:
             if main_thread:
                 signal.signal(signal.SIGINT, previous)
+            if manages_sigterm:
+                signal.signal(signal.SIGTERM, previous_sigterm)

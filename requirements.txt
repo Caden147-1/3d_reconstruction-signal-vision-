@@ -1,5 +1,14 @@
 # Main reconstruction environment (Python 3.10-3.12).
-# Optional VideoScene dependencies use a separate VideoScene/.venv environment.
+# The optional VideoScene adapter uses the dependencies below in a separate
+# VideoScene/.venv environment, with PyTorch installed as described in README.md.
 numpy==1.26.4
 opencv-python==4.10.0.84
 tqdm==4.66.5
+diffusers==0.32.2
+transformers==4.45.2
+accelerate==0.34.0
+safetensors==0.4.5
+decord==0.6.0
+imageio==2.36.1
+imageio-ffmpeg==0.5.1
+sentencepiece==0.2.0

@@ -1,0 +1,27 @@
+name: Pipeline checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cpu-regression:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ['3.10', '3.12']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install CPU test dependencies
+        run: python -m pip install numpy==1.26.4 opencv-python-headless==4.10.0.84 tqdm==4.66.5
+      - name: Run video and execution checks
+        run: python -m unittest discover -s tests

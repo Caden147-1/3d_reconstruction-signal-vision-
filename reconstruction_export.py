@@ -3,20 +3,22 @@
 from __future__ import annotations
 
 import csv
-import hashlib
 import json
 import math
 import re
 import shutil
 from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
-import cv2
-import numpy as np
 
-from wifi_observations import WIFI_QUALITY_FIELDS, WIFI_ASSOCIATION_FIELDS, valid_fingerprint, fingerprint_confidence
-from video_frames import VIDEO_FRAME_PROVENANCE_FIELDS, bind_frame_to_route
+from wifi_observations import WIFI_QUALITY_FIELDS, WIFI_ASSOCIATION_FIELDS, fingerprint_confidence
+from video_frames import VIDEO_FRAME_PROVENANCE_FIELDS
+from trajectory_contour import PDR_ROUTE_FIELDS
+from video_sensor_fusion import (
+    VIDEO_SENSOR_SYNC_FIELDS, clear_video_sensor_priors, has_valid_video_sensor_sync,
+)
+from video_sensor_fuzzy import FUZZY_FIELDS, has_fuzzy_video_sensor_window
 
 
 def read_csv(path: Path) -> Tuple[List[str], List[Dict[str, str]]]:
@@ -69,13 +71,6 @@ def resolve_source_image(root: Path, image_path: str) -> Path:
     return path if path.is_absolute() else root / path
 
 
-def exported_image_name(row: Dict[str, str]) -> str:
-    point_index = safe_int(row.get("global_point_index"))
-    slot = safe_int(row.get("image_slot"))
-    original_name = Path(row.get("image_name", "")).name
-    return f"point_{point_index:03d}_slot_{slot:02d}_{original_name}"
-
-
 def safe_name_part(value: str, default: str = "item") -> str:
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._-")
     return cleaned or default
@@ -88,189 +83,18 @@ def exported_video_frame_name(row: Dict[str, str]) -> str:
     return f"video_base_{sequence_index:06d}_{video_stem}_{frame_name}"
 
 
-def audit_unassigned_images(
-    root: Path,
-    processed_dir: Path,
-    mapped_image_rows: Sequence[Dict[str, str]],
-    include_unassigned_images: bool = True,
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
-    """Select decodable extra photos without inventing checkpoint metadata.
-
-    Eligibility establishes file integrity and exact-byte uniqueness only. It
-    does not establish that a photo belongs to the reconstructed scene; later
-    visual geometric verification must establish usable overlap.
-    """
-    root = root.resolve()
-    _, candidates = read_csv(processed_dir / "unassigned_images.csv")
-    capture_dir = root / "pic"
-    mapping_summary_path = processed_dir / "image_wifi_summary.json"
-    if mapping_summary_path.is_file():
-        with mapping_summary_path.open(encoding="utf-8") as handle:
-            mapping_summary = json.load(handle)
-        if mapping_summary.get("pic_dir"):
-            capture_dir = resolve_source_image(root, str(mapping_summary["pic_dir"]))
-    capture_dir = capture_dir.resolve()
-    mapped_paths = {
-        resolve_source_image(root, row["image_path"]).resolve()
-        for row in mapped_image_rows if row.get("image_path")
-    }
-    accepted: List[Dict[str, Any]] = []
-    audit: List[Dict[str, Any]] = []
-    pending: List[Tuple[Path, Dict[str, Any]]] = []
-    seen_paths: set[Path] = set()
-    suffixes = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
-    for index, row in enumerate(candidates, start=1):
-        record: Dict[str, Any] = {
-            "candidate_index": index,
-            "image_name": row.get("image_name", ""),
-            "source_image_path": row.get("image_path", ""),
-            "original_unassigned_reason": row.get("reason", ""),
-            "status": "rejected",
-            "reason": "",
-            "exported_image_file": "",
-            "source_sha256": "",
-            "source_size_bytes": "",
-            "width": "",
-            "height": "",
-            "duplicate_of": "",
-        }
-        audit.append(record)
-        if not include_unassigned_images:
-            record["reason"] = "disabled_by_option"
-            continue
-        if not row.get("image_path", "").strip():
-            record["reason"] = "missing_source_path"
-            continue
-        try:
-            source = resolve_source_image(root, row["image_path"]).resolve()
-            if not source.is_relative_to(capture_dir):
-                record["reason"] = "outside_capture_directory"
-                continue
-            record["source_image_path"] = relative_path(source, root)
-            if source in mapped_paths:
-                record["reason"] = "already_mapped_source"
-                continue
-            if source in seen_paths:
-                record["reason"] = "duplicate_source_path"
-                continue
-            seen_paths.add(source)
-            if source.suffix.lower() not in suffixes:
-                record["reason"] = "unsupported_image_extension"
-                continue
-            if not source.is_file():
-                record["reason"] = "source_not_found_or_not_file"
-                continue
-            record["source_size_bytes"] = source.stat().st_size
-            pending.append((source, record))
-        except (OSError, RuntimeError, ValueError) as error:
-            record["reason"] = "invalid_source_path"
-            record["error"] = str(error)
-
-    # Identical bytes have identical file sizes. Hash only mapped sources that
-    # could duplicate an extra photo, avoiding full decoding of mapped images.
-    candidate_sizes = {record["source_size_bytes"] for _, record in pending}
-    known_content: Dict[str, str] = {}
-    duplicate_reference_failures: List[str] = []
-    for source in sorted(mapped_paths):
-        try:
-            if source.is_file() and source.stat().st_size in candidate_sizes:
-                digest = hashlib.sha256(source.read_bytes()).hexdigest()
-                known_content.setdefault(digest, relative_path(source, root))
-        except OSError:
-            duplicate_reference_failures.append(relative_path(source, root))
-    export_names: set[str] = set()
-    for source, record in pending:
-        try:
-            data = source.read_bytes()
-            digest = hashlib.sha256(data).hexdigest()
-            record["source_sha256"] = digest
-            record["source_size_bytes"] = len(data)
-            if digest in known_content:
-                record["reason"] = "duplicate_file_content"
-                record["duplicate_of"] = known_content[digest]
-                continue
-            decoded = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR) if data else None
-            if decoded is None or decoded.ndim != 3 or min(decoded.shape[:2]) < 2:
-                record["reason"] = "unreadable_or_invalid_image"
-                continue
-            record["height"], record["width"] = map(int, decoded.shape[:2])
-            identity = source.relative_to(capture_dir).as_posix()
-            identity_digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
-            export_name = f"visual_only_{identity_digest}_{safe_name_part(source.stem)[:80]}{source.suffix.lower()}"
-            if export_name in export_names:
-                record["reason"] = "export_name_collision"
-                continue
-            record.update(status="accepted", reason="readable_unique_visual_candidate", exported_image_file=export_name)
-            accepted.append({"source": source, "image_file": export_name,
-                             "source_sha256": digest, "source_size_bytes": len(data),
-                             "width": record["width"], "height": record["height"]})
-            known_content[digest] = relative_path(source, root)
-            export_names.add(export_name)
-        except (OSError, ValueError, cv2.error) as error:
-            record["reason"] = "source_read_or_decode_failed"
-            record["error"] = str(error)
-    summary = {
-        "enabled": include_unassigned_images,
-        "capture_directory": str(capture_dir),
-        "input_candidate_count": len(candidates),
-        "accepted_count": len(accepted),
-        "rejected_count": len(candidates)-len(accepted),
-        "rejection_reason_counts": dict(sorted(Counter(row["reason"] for row in audit if row["status"] == "rejected").items())),
-        "duplicate_reference_read_failures": duplicate_reference_failures,
-        "duplicate_policy": "resolved_source_path_and_exact_file_sha256_against_mapped_and_accepted_images",
-        "eligibility_scope": "Readable unique capture files; scene membership and geometric overlap require visual verification.",
-        "output": "unassigned_image_audit.csv",
-    }
-    return accepted, audit, summary
-
-
-def pose_seed_for_row(
-    row: Dict[str, str],
-    camera_height_m: float,
-    slot_yaw_start_deg: float,
-    slot_yaw_step_deg: Optional[float],
-) -> Dict[str, Any]:
-    slot = safe_int(row.get("image_slot"), 1)
-    if slot_yaw_step_deg is None:
-        slot_yaw_step_deg = 360.0 / max(1, safe_int(row.get("image_group_size"), 20))
-    yaw_deg = slot_yaw_start_deg + (slot - 1) * slot_yaw_step_deg
-    return {
-        "pdr_x": row.get("pdr_x", ""),
-        "pdr_y": row.get("pdr_y", ""),
-        "pdr_z": camera_height_m,
-        "yaw_seed_deg": round(yaw_deg, 6),
-        "pitch_seed_deg": 0.0,
-        "roll_seed_deg": 0.0,
-        "pose_seed_source": "pdr_xy_plus_ordered_anchor_view_yaw",
-    }
-
-
 def pose_seed_for_video_row(row: Dict[str, str], camera_height_m: float) -> Dict[str, Any]:
     return {
+        **{field: row.get(field, "") for field in PDR_ROUTE_FIELDS},
+        "pdr_position_status": row.get("pdr_position_status") or "legacy_unknown",
         "pdr_x": row.get("pdr_x", ""),
         "pdr_y": row.get("pdr_y", ""),
-        "pdr_z": camera_height_m,
+        "pdr_z": camera_height_m if row.get("pdr_heading_policy") == "phone-aligned" and row.get("pdr_position_status") == "phone_aligned_assumption" else "",
         "yaw_seed_deg": "",
         "pitch_seed_deg": "",
         "roll_seed_deg": "",
         "pose_seed_source": row.get("pdr_bind_source", "video_base_frame"),
     }
-
-
-def read_expected_images_per_point(processed_dir: Path) -> Optional[int]:
-    summary_path = processed_dir / "image_wifi_summary.json"
-    if not summary_path.exists():
-        return None
-    try:
-        with summary_path.open("r", encoding="utf-8") as handle:
-            summary = json.load(handle)
-    except (OSError, json.JSONDecodeError):
-        return None
-    value = summary.get("images_per_wifi_point")
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
 
 
 def convex_hull(points: Sequence[Tuple[float, float]]) -> List[Tuple[float, float]]:
@@ -296,99 +120,36 @@ def convex_hull(points: Sequence[Tuple[float, float]]) -> List[Tuple[float, floa
     return lower[:-1] + upper[:-1]
 
 
-def point_key(row: Dict[str, str]) -> str:
-    return f"{row.get('session', '')}|{row.get('global_point_index', '')}"
+def build_sensor_fingerprint_rows(sensor_rows: Sequence[Dict[str, str]]) -> List[Dict[str, Any]]:
+    """Keep independent sensor observations without inventing camera positions.
 
-
-def select_evenly_spaced_rows(rows: Sequence[Dict[str, str]], limit: int) -> List[Dict[str, str]]:
-    if limit <= 0 or len(rows) <= limit:
-        return list(rows)
-    return [rows[idx * len(rows) // limit] for idx in range(limit)]
-
-
-def select_anchor_image_rows(
-    image_rows: Sequence[Dict[str, str]],
-    max_images_per_point: int,
-) -> Tuple[List[Dict[str, str]], Dict[str, Any]]:
-    if max_images_per_point <= 0:
-        selected_slots_by_point: Dict[str, List[int]] = {}
-        for row in image_rows:
-            selected_slots_by_point.setdefault(point_key(row), []).append(safe_int(row.get("image_slot")))
-        for slots in selected_slots_by_point.values():
-            slots.sort()
-        return list(image_rows), {
-            "enabled": False,
-            "max_images_per_point": 0,
-            "input_rows": len(image_rows),
-            "selected_rows": len(image_rows),
-            "dropped_rows": 0,
-            "capped_point_count": 0,
-            "selection_strategy": "all_anchor_images",
-            "selected_slots_by_point": selected_slots_by_point,
-        }
-
-    grouped: Dict[str, List[Dict[str, str]]] = {}
-    for row in image_rows:
-        grouped.setdefault(point_key(row), []).append(row)
-
-    selected: List[Dict[str, str]] = []
-    capped_point_count = 0
-    selected_slots_by_point: Dict[str, List[int]] = {}
-    for key in sorted(
-        grouped,
-        key=lambda item: (
-            grouped[item][0].get("session", ""),
-            safe_int(grouped[item][0].get("global_point_index")),
-        ),
-    ):
-        point_rows = sorted(grouped[key], key=lambda row: safe_int(row.get("image_slot")))
-        kept_rows = select_evenly_spaced_rows(point_rows, max_images_per_point)
-        if len(kept_rows) < len(point_rows):
-            capped_point_count += 1
-        selected.extend(kept_rows)
-        selected_slots_by_point[key] = [safe_int(row.get("image_slot")) for row in kept_rows]
-
-    return selected, {
-        "enabled": True,
-        "max_images_per_point": max_images_per_point,
-        "input_rows": len(image_rows),
-        "selected_rows": len(selected),
-        "dropped_rows": len(image_rows) - len(selected),
-        "point_count": len(grouped),
-        "capped_point_count": capped_point_count,
-        "selection_strategy": "circular_even_slots",
-        "selected_slots_by_point": selected_slots_by_point,
-    }
-
-
-def build_fingerprint_rows(point_rows: Sequence[Dict[str, str]], ap_fields: Sequence[str]) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
-    for row in point_rows:
-        output = {
-            "session": row.get("session", ""),
-            "point_index": row.get("point_index", ""),
-            "global_point_index": row.get("global_point_index", ""),
-            "pdr_x": row.get("pdr_x", ""),
-            "pdr_y": row.get("pdr_y", ""),
-            "wifi_scan_index": row.get("wifi_scan_index", ""),
-            "wifi_elapsed_ts": row.get("wifi_elapsed_ts", ""),
+    WiFi/PDR fusion uses the sensor clock. Its rows remain useful without any
+    association to a video frame, and unknown coordinates must remain unknown.
+    Preserve the original scan/route fields alongside the library's aliases.
+    """
+    return [
+        {
+            **row,
+            "point_index": "",
+            "global_point_index": "",
+            "wifi_scan_index": row.get("wifi_scan_index") or row.get("scan_index", ""),
+            "wifi_elapsed_ts": row.get("wifi_elapsed_ts") or row.get("elapsed_ts", ""),
             "wifi_gap_ms": row.get("wifi_gap_ms", ""),
-            "mapping_status": row.get("mapping_status", ""),
+            "pdr_position_status": row.get("pdr_position_status") or "legacy_unknown",
+            "mapping_status": "independent_sensor_observation",
         }
-        for field in ap_fields:
-            output[field] = row.get(field, "")
-        for field in [*WIFI_QUALITY_FIELDS, *WIFI_ASSOCIATION_FIELDS]:
-            output[field] = row.get(field, "")
-        rows.append(output)
-    return rows
+        for row in sensor_rows
+    ]
 
 
 def build_boundary_rows(point_rows: Sequence[Dict[str, str]]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     coord_to_rows: Dict[Tuple[float, float], List[Dict[str, str]]] = {}
     for row in point_rows:
+        if row.get("pdr_heading_policy") != "phone-aligned" or row.get("pdr_position_status") != "phone_aligned_assumption":
+            continue
         x = safe_float(row.get("pdr_x"))
         y = safe_float(row.get("pdr_y"))
-        if math.isnan(x) or math.isnan(y):
+        if not math.isfinite(x) or not math.isfinite(y):
             continue
         coord_to_rows.setdefault((x, y), []).append(row)
 
@@ -429,54 +190,48 @@ def write_colmap_image_list(path: Path, image_paths: Sequence[str]) -> None:
             handle.write(f"{image_path.replace(chr(92), '/')}\n")
 
 
-
 def export_reconstruction_dataset(
     root: Path,
     processed_dir: Path,
     output_dir: Path,
     camera_height_m: float = 1.50,
-    slot_yaw_start_deg: float = 0.0,
-    slot_yaw_step_deg: Optional[float] = None,
     copy_images: bool = True,
-    max_anchor_images_per_point: int = 0,
     include_video_frames: bool = True,
-    include_unassigned_images: bool = True,
+    include_sensor_priors: bool = True,
 ) -> Dict[str, Any]:
-    _long_fields, image_rows = read_csv(processed_dir / "image_wifi_long.csv")
-    point_fields, point_rows = read_csv(processed_dir / "image_wifi_points.csv")
+    """Export video frames and independent sensor observations."""
+    sensor_fields, sensor_rows = (
+        read_csv(processed_dir / "wifi_pdr_features.csv") if include_sensor_priors else ([], [])
+    )
     _video_fields, video_rows = (
         read_csv(processed_dir / "video_frames_manifest.csv")
         if include_video_frames
         else ([], [])
     )
-    unassigned_images, unassigned_audit, unassigned_summary = audit_unassigned_images(
-        root, processed_dir, image_rows, include_unassigned_images=include_unassigned_images,
-    )
-    write_csv(output_dir / "unassigned_image_audit.csv", [
-        "candidate_index", "image_name", "source_image_path", "original_unassigned_reason",
-        "status", "reason", "exported_image_file", "source_sha256", "source_size_bytes",
-        "width", "height", "duplicate_of", "error",
-    ], unassigned_audit)
-    expected_images_per_point = read_expected_images_per_point(processed_dir)
-    expected_by_point = {
-        point_key(row): safe_int(row.get("image_group_size"), expected_images_per_point or 0)
-        for row in point_rows
-        if row.get("image_group_size") not in (None, "") or expected_images_per_point is not None
-    }
-    if not image_rows and not video_rows and not unassigned_images:
-        summary = {
-            "status": "missing_input",
-            "processed_dir": str(processed_dir),
-            "output_dir": str(output_dir),
-            "image_rows": len(image_rows),
-            "point_rows": len(point_rows),
-            "include_unassigned_images": include_unassigned_images,
-            "unassigned_image_audit": unassigned_summary,
-        }
+    if any(row.get("source_type", "video_base_frame") != "video_base_frame" or not row.get("video_name") for row in video_rows):
+        raise ValueError("Video export requires extracted frames with source_type=video_base_frame and video_name")
+    sanitized_video_rows = []
+    for row in video_rows:
+        if include_sensor_priors and has_valid_video_sensor_sync(row):
+            sanitized_video_rows.append(row)
+        elif include_sensor_priors and has_fuzzy_video_sensor_window(row):
+            # A time window authorizes soft retrieval context, not one scan,
+            # exact sensor time, interpolated PDR coordinate, or camera pose.
+            cleaned = clear_video_sensor_priors(row, "fuzzy_time_window")
+            cleaned.update({field: row.get(field, "") for field in FUZZY_FIELDS})
+            cleaned.update(session=row["session"], bind_type="fuzzy_video_sensor_window")
+            sanitized_video_rows.append(cleaned)
+        else:
+            sanitized_video_rows.append(clear_video_sensor_priors(
+                row, "sensor_priors_disabled" if not include_sensor_priors
+                else row.get("video_sensor_sync_status") or "no_explicit_sync"))
+    video_rows = sanitized_video_rows
+    if not video_rows:
+        summary = {"status": "missing_input", "processed_dir": str(processed_dir),
+                   "output_dir": str(output_dir), "video_frame_rows": 0,
+                   "include_sensor_priors": include_sensor_priors}
         write_json(output_dir / "export_summary.json", summary)
         return summary
-    original_image_row_count = len(image_rows)
-    image_rows, anchor_selection_summary = select_anchor_image_rows(image_rows, max_anchor_images_per_point)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     images_dir = output_dir / "images"
@@ -486,96 +241,17 @@ def export_reconstruction_dataset(
         shutil.rmtree(images_dir)
     images_dir.mkdir(parents=True, exist_ok=True)
 
-    ap_fields = [field for field in point_fields if field.startswith("ap_")]
+    ap_fields = list(dict.fromkeys(field for field in [*sensor_fields,
+                                                      *(_video_fields if include_sensor_priors else [])]
+                                  if field.startswith("ap_")))
     manifest_rows: List[Dict[str, Any]] = []
     pose_rows: List[Dict[str, Any]] = []
     colmap_image_paths: List[str] = []
     missing_sources: List[str] = []
 
-    for row in image_rows:
-        if not row.get("image_name"):
-            continue
-        source = resolve_source_image(root, row.get("image_path", ""))
-        export_name = exported_image_name(row)
-        exported_rel_path = str(Path("images") / export_name)
-        exported_path = output_dir / exported_rel_path
-        if source.exists():
-            if copy_images:
-                shutil.copy2(source, exported_path)
-            colmap_image_paths.append(exported_rel_path)
-        else:
-            missing_sources.append(row.get("image_path", ""))
-
-        pose_seed = pose_seed_for_row(
-            {**row, "image_group_size": row.get("image_group_size") or expected_images_per_point or 20},
-            camera_height_m=camera_height_m,
-            slot_yaw_start_deg=slot_yaw_start_deg,
-            slot_yaw_step_deg=slot_yaw_step_deg,
-        )
-        common = {
-            "image_file": export_name,
-            "image_rel_path": exported_rel_path,
-            "source_image_path": relative_path(source, root),
-            "source_type": "wifi_anchor_photo",
-            "bind_type": ("checkpoint_photo_with_weighted_wifi" if row.get("wifi_observation_status") == "aggregated_checkpoint"
-                          else "checkpoint_photo_with_fresh_wifi" if valid_fingerprint(row) else "checkpoint_photo_without_valid_wifi"),
-            "wifi_label_weight": fingerprint_confidence(row),
-            **{field: row.get(field, "") for field in [*WIFI_QUALITY_FIELDS, *WIFI_ASSOCIATION_FIELDS, *ap_fields]},
-            "image_association_basis": row.get("image_association_basis", "ordered_checkpoint_same_location"),
-            "image_grouping_method": row.get("image_grouping_method", ""),
-            "session": row.get("session", ""),
-            "point_index": row.get("point_index", ""),
-            "global_point_index": row.get("global_point_index", ""),
-            "image_slot": row.get("image_slot", ""),
-            "anchor_slot_count": row.get("image_group_size") or expected_images_per_point or "",
-            "image_number": row.get("image_number", ""),
-            "point_elapsed_ts": row.get("point_elapsed_ts", ""),
-            "pdr_reference_elapsed_ts": row.get("pdr_reference_elapsed_ts", ""),
-            "pdr_interp_status": row.get("pdr_interp_status", ""),
-            "wifi_scan_index": row.get("wifi_scan_index", ""),
-            "wifi_gap_ms": row.get("wifi_gap_ms", ""),
-            "mapping_status": row.get("mapping_status", ""),
-            "source_exists": int(source.exists()),
-            "video_name": "",
-            "video_frame_index": "",
-            "video_sequence_index": "",
-            "video_time_s": "",
-            "nearest_global_point_index": row.get("global_point_index", ""),
-            "left_global_point_index": row.get("global_point_index", ""),
-            "right_global_point_index": row.get("global_point_index", ""),
-            "route_ratio": "",
-            "trajectory_contour_id": row.get("trajectory_contour_id", ""),
-            "trajectory_contour_distance_m": row.get("trajectory_contour_distance_m", ""),
-            "trajectory_distance_m": row.get("trajectory_distance_m", ""),
-            "trajectory_position_source": (
-                "checkpoint_sensor_timestamp" if row.get("pdr_interp_status") == "exact_checkpoint"
-                else "unavailable" if row.get("pdr_interp_status") == "checkpoint_pdr_unavailable"
-                else "checkpoint_nearest_log_timestamp"
-            ),
-        }
-        manifest_rows.append({**common, **pose_seed})
-        pose_rows.append(
-            {
-                "image_file": export_name,
-                "image_rel_path": exported_rel_path,
-                "source_type": "wifi_anchor_photo",
-                "bind_type": common["bind_type"],
-                "session": row.get("session", ""),
-                "global_point_index": row.get("global_point_index", ""),
-                "image_slot": row.get("image_slot", ""),
-                "anchor_slot_count": common["anchor_slot_count"],
-                "video_name": "",
-                "video_frame_index": "",
-                "video_sequence_index": "",
-                **pose_seed,
-            }
-        )
-
     for row in video_rows:
         if not row.get("frame_path"):
             continue
-        if row.get("trajectory_position_source") != "synchronized_video_sensor_timestamp":
-            row = {**row, **bind_frame_to_route([], 0, 0)}
         source = resolve_source_image(root, row.get("frame_path", ""))
         export_name = exported_video_frame_name(row)
         exported_rel_path = str(Path("images") / export_name)
@@ -594,16 +270,18 @@ def export_reconstruction_dataset(
             "source_image_path": relative_path(source, root),
             "source_type": row.get("source_type", "video_base_frame"),
             "bind_type": row.get("bind_type", "video_base_frame"),
-            "wifi_label_weight": 0.0,
-            "session": "",
+            "wifi_label_weight": fingerprint_confidence(row),
+            **{field: row.get(field, "") for field in [*WIFI_QUALITY_FIELDS, *WIFI_ASSOCIATION_FIELDS, *ap_fields,
+                                                        *VIDEO_SENSOR_SYNC_FIELDS, *FUZZY_FIELDS]},
+            "session": row.get("session", ""),
             "point_index": "",
             "global_point_index": "",
-            "image_slot": "",
-            "anchor_slot_count": "",
-            "image_number": "",
             "point_elapsed_ts": "",
-            "wifi_scan_index": "",
-            "wifi_gap_ms": "",
+            "pdr_reference_elapsed_ts": row.get("pdr_reference_elapsed_ts", ""),
+            "pdr_interp_status": row.get("pdr_interp_status", ""),
+            "wifi_scan_index": row.get("wifi_scan_index", ""),
+            "wifi_elapsed_ts": row.get("wifi_elapsed_ts", ""),
+            "wifi_gap_ms": row.get("wifi_gap_ms", ""),
             "mapping_status": row.get("bind_type", "video_base_frame"),
             "source_exists": int(source.exists()),
             "video_name": row.get("video_name", ""),
@@ -617,6 +295,7 @@ def export_reconstruction_dataset(
             "right_global_point_index": row.get("right_global_point_index", ""),
             "route_ratio": row.get("route_ratio", ""),
             "trajectory_contour_id": row.get("trajectory_contour_id", ""),
+            "trajectory_route_distance_m": row.get("trajectory_route_distance_m", ""),
             "trajectory_contour_distance_m": row.get("trajectory_contour_distance_m", ""),
             "trajectory_distance_m": row.get("trajectory_distance_m", ""),
             "trajectory_position_source": row.get("trajectory_position_source", "unavailable"),
@@ -628,10 +307,10 @@ def export_reconstruction_dataset(
                 "image_rel_path": exported_rel_path,
                 "source_type": row.get("source_type", "video_base_frame"),
                 "bind_type": row.get("bind_type", "video_base_frame"),
-                "session": "",
+                "session": row.get("session", ""),
+                **{field: row.get(field, "") for field in VIDEO_SENSOR_SYNC_FIELDS},
+                **{field: row.get(field, "") for field in FUZZY_FIELDS},
                 "global_point_index": "",
-                "image_slot": "",
-                "anchor_slot_count": "",
                 "video_name": row.get("video_name", ""),
                 "video_frame_index": row.get("video_frame_index", ""),
                 "video_sequence_index": row.get("video_sequence_index", ""),
@@ -639,30 +318,10 @@ def export_reconstruction_dataset(
             }
         )
 
-    for image in unassigned_images:
-        source = image["source"]
-        export_name = image["image_file"]
-        exported_rel_path = str(Path("images") / export_name)
-        if copy_images:
-            shutil.copy2(source, output_dir / exported_rel_path)
-        colmap_image_paths.append(exported_rel_path)
-        manifest_rows.append({
-            "image_file": export_name,
-            "image_rel_path": exported_rel_path,
-            "source_image_path": relative_path(source, root),
-            "source_type": "visual_only_photo",
-            "bind_type": "unassigned_visual_only",
-            "wifi_label_weight": 0.0,
-            "mapping_status": "unassigned_visual_only",
-            "source_exists": 1,
-            "source_sha256": image["source_sha256"],
-            "source_size_bytes": image["source_size_bytes"],
-            "image_width": image["width"],
-            "image_height": image["height"],
-        })
-
-    fingerprint_rows = build_fingerprint_rows(point_rows, ap_fields)
-    boundary_rows, boundary_summary = build_boundary_rows(point_rows)
+    fingerprint_rows = build_sensor_fingerprint_rows(sensor_rows)
+    boundary_rows, boundary_summary = build_boundary_rows(fingerprint_rows)
+    for row in boundary_rows:
+        row["source"] = "convex_hull_of_wifi_sensor_scans_not_camera_map"
 
     manifest_fields = [
         "image_file",
@@ -675,21 +334,17 @@ def export_reconstruction_dataset(
         "source_type",
         "bind_type",
         "wifi_label_weight",
-        "image_association_basis",
-        "image_grouping_method",
         *WIFI_ASSOCIATION_FIELDS,
         *WIFI_QUALITY_FIELDS,
         *ap_fields,
         "session",
         "point_index",
         "global_point_index",
-        "image_slot",
-        "anchor_slot_count",
-        "image_number",
         "point_elapsed_ts",
         "pdr_reference_elapsed_ts",
         "pdr_interp_status",
         "wifi_scan_index",
+        "wifi_elapsed_ts",
         "wifi_gap_ms",
         "mapping_status",
         "source_exists",
@@ -699,11 +354,15 @@ def export_reconstruction_dataset(
         "video_time_s",
         "video_time_source",
         *VIDEO_FRAME_PROVENANCE_FIELDS,
+        *VIDEO_SENSOR_SYNC_FIELDS,
+        *FUZZY_FIELDS,
         "nearest_global_point_index",
         "left_global_point_index",
         "right_global_point_index",
         "route_ratio",
         "trajectory_contour_id",
+        "trajectory_route_distance_m",
+        *PDR_ROUTE_FIELDS,
         "trajectory_contour_distance_m",
         "trajectory_distance_m",
         "trajectory_position_source",
@@ -716,14 +375,15 @@ def export_reconstruction_dataset(
         "pose_seed_source",
     ]
     pose_fields = [
+        *PDR_ROUTE_FIELDS,
+        *VIDEO_SENSOR_SYNC_FIELDS,
+        *FUZZY_FIELDS,
         "image_file",
         "image_rel_path",
         "source_type",
         "bind_type",
         "session",
         "global_point_index",
-        "image_slot",
-        "anchor_slot_count",
         "video_name",
         "video_frame_index",
         "video_sequence_index",
@@ -736,6 +396,7 @@ def export_reconstruction_dataset(
         "pose_seed_source",
     ]
     fingerprint_fields = [
+        *PDR_ROUTE_FIELDS,
         "session",
         "point_index",
         "global_point_index",
@@ -749,6 +410,8 @@ def export_reconstruction_dataset(
         *WIFI_QUALITY_FIELDS,
         *ap_fields,
     ]
+    if include_sensor_priors:
+        fingerprint_fields = list(dict.fromkeys([*fingerprint_fields, *sensor_fields]))
     boundary_fields = [
         "boundary_order",
         "session",
@@ -769,7 +432,11 @@ def export_reconstruction_dataset(
         for optional_name in ("video_frames_manifest.csv", "video_frames_summary.json"):
             source = processed_dir / optional_name
             if source.exists():
-                shutil.copy2(source, output_dir / optional_name)
+                if optional_name == "video_frames_manifest.csv":
+                    write_csv(output_dir / optional_name,
+                              list(dict.fromkeys([*_video_fields, *VIDEO_SENSOR_SYNC_FIELDS, *FUZZY_FIELDS])), video_rows)
+                else:
+                    shutil.copy2(source, output_dir / optional_name)
                 copied_optional_metadata.append(optional_name)
     else:
         for optional_name in ("video_frames_manifest.csv", "video_frames_summary.json"):
@@ -781,37 +448,23 @@ def export_reconstruction_dataset(
         "pdr_trajectory_contour.csv",
         "pdr_trajectory_edges.csv",
         "pdr_trajectory_contour_summary.json",
+        "wifi_pdr_features.csv",
+        "video_sensor_sync.csv",
+        "video_sensor_sync_summary.json",
+        "video_sensor_fuzzy_context.json",
+        "video_sensor_fuzzy_summary.json",
     ):
         source = processed_dir / optional_name
-        if source.exists():
+        if include_sensor_priors and source.exists():
             shutil.copy2(source, output_dir / optional_name)
             copied_optional_metadata.append(optional_name)
-
-    point_image_counts: Dict[str, int] = {point_key(row): 0 for row in point_rows}
-    for row in manifest_rows:
-        if row.get("source_type") != "wifi_anchor_photo":
-            continue
-        key = point_key(row)
-        point_image_counts[key] = point_image_counts.get(key, 0) + 1
-    expected_count = expected_images_per_point or max(expected_by_point.values() or point_image_counts.values() or [0])
-    exported_expected_count = (
-        min(expected_count, max_anchor_images_per_point)
-        if max_anchor_images_per_point > 0
-        else expected_count
-    )
-    exported_expected_by_point = {
-        key: min(count, max_anchor_images_per_point) if max_anchor_images_per_point > 0 else count
-        for key, count in expected_by_point.items()
-    }
-    incomplete_points = [key for key, count in point_image_counts.items()
-                         if count != exported_expected_by_point.get(key, exported_expected_count)]
+        elif (output_dir / optional_name).exists():
+            (output_dir / optional_name).unlink()
 
     copied_count = len(list(images_dir.iterdir())) if images_dir.exists() else 0
     status = "ok"
     if missing_sources:
         status = "missing_source_images"
-    elif incomplete_points:
-        status = "incomplete_points"
 
     summary = {
         "status": status,
@@ -820,37 +473,27 @@ def export_reconstruction_dataset(
         "output_dir": str(output_dir),
         "copy_images": copy_images,
         "camera_height_m": camera_height_m,
-        "slot_yaw_start_deg": slot_yaw_start_deg,
-        "slot_yaw_step_deg": slot_yaw_step_deg,
         "include_video_frames": include_video_frames,
-        "include_unassigned_images": include_unassigned_images,
-        "image_rows": original_image_row_count,
-        "selected_image_rows": len(image_rows),
-        "anchor_image_selection": anchor_selection_summary,
-        "anchor_image_rows": sum(1 for row in manifest_rows if row.get("source_type") == "wifi_anchor_photo"),
+        "include_sensor_priors": include_sensor_priors,
+        "synchronized_video_frame_rows": sum(has_valid_video_sensor_sync(row) for row in manifest_rows),
+        "fuzzy_video_frame_rows": sum(has_fuzzy_video_sensor_window(row) for row in manifest_rows),
         "video_frame_rows": sum(1 for row in manifest_rows if row.get("source_type") == "video_base_frame"),
-        "visual_only_image_rows": sum(1 for row in manifest_rows if row.get("source_type") == "visual_only_photo"),
         "source_type_counts": dict(sorted(Counter(row["source_type"] for row in manifest_rows).items())),
-        "unassigned_image_audit": unassigned_summary,
-        "point_rows": len(point_rows),
-        "expected_images_per_wifi_point": (expected_count if len(set(expected_by_point.values())) <= 1 else None),
-        "expected_exported_images_per_wifi_point": (exported_expected_count if len(set(exported_expected_by_point.values())) <= 1 else None),
-        "expected_exported_images_by_point": exported_expected_by_point,
+        "independent_sensor_observation_rows": len(sensor_rows),
+        "wifi_fingerprint_rows": len(fingerprint_rows),
+        "wifi_fingerprint_source": "wifi_pdr_features.csv",
         "exported_image_rows": len(manifest_rows),
         "copied_image_file_count": copied_count,
         "colmap_image_count": len(colmap_image_paths),
         "wifi_ap_feature_count": len(ap_fields),
         "missing_source_image_count": len(missing_sources),
         "missing_source_images": missing_sources[:20],
-        "incomplete_point_count": len(incomplete_points),
-        "incomplete_points": incomplete_points[:20],
         "copied_optional_metadata": copied_optional_metadata,
         "boundary": boundary_summary,
         "outputs": {
             "images": "images",
             "colmap_image_list": "colmap_image_list.txt",
             "images_manifest": "images_manifest.csv",
-            "unassigned_image_audit": "unassigned_image_audit.csv",
             "camera_pose_seed": "camera_pose_seed.csv",
             "wifi_fingerprint_library": "wifi_fingerprint_library.csv",
             "wifi_boundary_seed": "wifi_boundary_seed.csv",

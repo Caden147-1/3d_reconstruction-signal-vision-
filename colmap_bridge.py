@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import csv
+from bisect import bisect_left
 import hashlib
 import json
 import math
+import os
 import shutil
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -19,6 +21,7 @@ METADATA_FILES = [
     "images_manifest.csv",
     "camera_pose_seed.csv",
     "wifi_fingerprint_library.csv",
+    "wifi_pdr_features.csv",
     "wifi_boundary_seed.csv",
     "wifi_localization_model.json",
     "wifi_localization_eval.csv",
@@ -27,6 +30,10 @@ METADATA_FILES = [
     "wifi_signal_grid.csv",
     "video_frames_manifest.csv",
     "video_frames_summary.json",
+    "video_sensor_sync_summary.json",
+    "video_sensor_sync.csv",
+    "video_sensor_fuzzy_context.json",
+    "video_sensor_fuzzy_summary.json",
     "pdr_trajectory_contour.csv",
     "pdr_trajectory_edges.csv",
     "pdr_trajectory_contour_summary.json",
@@ -36,6 +43,22 @@ METADATA_FILES = [
 
 
 DENSE_PROFILES: Dict[str, Dict[str, Any]] = {
+    "efficient": {
+        "description": "Bounded video MVS with moderate sampling and original geometric validation thresholds.",
+        "patch_match": {
+            "geom_consistency": 1, "window_radius": 7, "window_step": 1,
+            "num_samples": 15, "num_iterations": 5, "filter": 1,
+            "filter_min_ncc": 0.05, "cache_size": 8,
+        },
+        "fusion": {
+            "min_num_pixels": 3, "max_reproj_error": 2.5,
+            "max_depth_error": 0.02, "max_normal_error": 15,
+            "check_num_images": 60,
+        },
+        "run_meshing": True,
+        "cleanup_intermediate_ply": True,
+        "point_filter_max_points": 0,
+    },
     "balanced": {
         "description": "Balanced indoor reconstruction with bounded dense and post-processing cost.",
         "patch_match": {
@@ -111,43 +134,9 @@ DENSE_PROFILES: Dict[str, Dict[str, Any]] = {
 }
 
 
-LOAD_PROFILES: Dict[str, Dict[str, Any]] = {
-    "standard": {
-        "description": "Moderate throttling for normal desktop use.",
-        "num_threads": 4,
-        "stage_cooldown_s": 5,
-    },
-    "max": {
-        "description": "Use COLMAP defaults with no artificial cooldown.",
-        "num_threads": 0,
-        "stage_cooldown_s": 0,
-    },
-}
+P2_CONTOUR_REASONS = {"video_imu_route"}
 
 
-REASON_BASE_WEIGHTS: Dict[str, float] = {
-    "same_wifi_point_nearby_slots": 1.00,
-    "nearby_wifi_points": 0.88,
-    "trajectory_contour_neighbors": 0.90,
-    "nearby_trajectory_points": 0.92,
-    "nearby_pdr_points": 0.74,
-    "video_sequence": 0.70,
-    "video_to_wifi_anchor": 0.62,
-    "video_to_trajectory_anchor": 0.66,
-}
-
-SOURCE_PAIR_WEIGHTS: Dict[Tuple[str, str], float] = {
-    ("wifi_anchor_photo", "wifi_anchor_photo"): 1.00,
-    ("video_base_frame", "video_base_frame"): 0.82,
-    ("wifi_anchor_photo", "video_base_frame"): 0.72,
-}
-
-
-P2_CONTOUR_REASONS = {
-    "trajectory_contour_neighbors",
-    "nearby_trajectory_points",
-    "video_to_trajectory_anchor",
-}
 P1_VISUAL_SUPPORT_DECISIONS = {
     "geometry_supported",
     "feature_overlap",
@@ -208,64 +197,76 @@ def find_colmap_exe(root: Path, colmap_dir: Optional[Path] = None, colmap_exe: O
         return (colmap_exe if colmap_exe.is_absolute() else root / colmap_exe).resolve()
     if colmap_dir is not None:
         resolved_dir = colmap_dir if colmap_dir.is_absolute() else root / colmap_dir
-        candidates.extend([resolved_dir / "bin" / "colmap.exe", resolved_dir / "COLMAP.bat"])
-    candidates.extend(
-        [
+        candidates.extend([resolved_dir / "bin" / "colmap.exe", resolved_dir / "COLMAP.bat"] if os.name == 'nt'
+                          else [resolved_dir / 'bin' / 'colmap', resolved_dir / 'colmap'])
+    if os.name != 'nt':
+        candidates.extend([root / 'colmap' / 'bin' / 'colmap', root / 'colmap'])
+    if os.name == 'nt':
+        candidates.extend([
             root / "colmap-x64-windows-cuda" / "bin" / "colmap.exe",
             root / "colmap-x64-windows-cuda" / "COLMAP.bat",
             root / "colmap" / "bin" / "colmap.exe",
             root / "colmap.exe",
-        ]
-    )
+        ])
     for candidate in candidates:
-        if candidate.exists():
+        if candidate.is_file():
             return candidate.resolve()
     found = shutil.which("colmap")
     if found:
         return Path(found).resolve()
-    return candidates[0].resolve() if candidates else (root / "colmap.exe").resolve()
+    return candidates[0].resolve() if candidates else (root / ("colmap.exe" if os.name == 'nt' else "colmap")).resolve()
 
 
 def workspace_image_group(row: Dict[str, str]) -> str:
-    """Keep inputs with distinct capture geometry in separate camera folders."""
-    if row.get("source_type") == "visual_only_photo":
-        width, height = safe_int(row.get("image_width")), safe_int(row.get("image_height"))
-        if width > 0 and height > 0:
-            return f"visual_photos_{width}x{height}"
-        # Unknown geometry must not inherit a checkpoint camera calibration.
-        import hashlib
-        return "visual_photo_" + hashlib.sha256(row.get("image_file", "").encode()).hexdigest()[:16]
-    return "video" if row.get("source_type") == "video_base_frame" else "anchors"
+    """Only extracted video frames may enter a new reconstruction."""
+    if row.get("source_type") != "video_base_frame" or not row.get("video_name"):
+        raise ValueError("Reconstruction inputs must be extracted video frames with video_name metadata")
+    return "video"
 
 
-def workspace_image_name(row: Dict[str, str]) -> str:
+def workspace_image_name(row: Dict[str, str], *, group: Optional[str] = None) -> str:
+    workspace_image_group(row)
     source_name = Path(row.get("image_file", ""))
     if not source_name.name or source_name.is_absolute() or ".." in source_name.parts:
         raise ValueError(f"Unsafe or missing reconstruction image name: {source_name}")
-    return (Path(workspace_image_group(row)) / source_name.name).as_posix()
+    return (Path(group or workspace_image_group(row)) / source_name.name).as_posix()
 
 
 def build_workspace_manifest(manifest_rows: Sequence[Dict[str, str]]) -> List[Dict[str, str]]:
     """Map exported filenames to source-specific workspace folders.
 
-    COLMAP can then share intrinsics within the photo group and within the video
-    group, instead of forcing their visibly different image geometries into one
-    camera model.
+    Each video clip/resolution gets its own camera when multiple video groups
+    exist. Keep the original video/ layout for a single video group, including
+    older exports without decoded dimensions. Existing workspace manifests and
+    reconstruction files are not rewritten by this preparation helper.
     """
     rows: List[Dict[str, str]] = []
     seen: set[str] = set()
+
+    def video_key(row: Dict[str, str]) -> Tuple[str, int, int]:
+        width, height = safe_int(row.get("image_width")), safe_int(row.get("image_height"))
+        if width <= 0 or height <= 0:
+            width = height = 0
+        return (row.get("video_name", "").replace("\\", "/"), width, height)
+
+    video_keys = {video_key(row) for row in manifest_rows
+                  if row.get("image_file") and row.get("source_type") == "video_base_frame"}
+    video_groups = {key: "video_" + hashlib.sha256(json.dumps(key).encode("utf-8")).hexdigest()[:16]
+                    for key in video_keys} if len(video_keys) > 1 else {}
     for source_row in manifest_rows:
         source_name = source_row.get("image_file", "")
         if not source_name:
             continue
         row = dict(source_row)
-        target_name = workspace_image_name(row)
+        group = (video_groups.get(video_key(row), "video")
+                 if row.get("source_type") == "video_base_frame" else workspace_image_group(row))
+        target_name = workspace_image_name(row, group=group)
         if target_name in seen:
             raise ValueError(f"Duplicate workspace image name: {target_name}")
         seen.add(target_name)
         row["source_image_file"] = source_name
         row["image_file"] = target_name
-        row["workspace_image_group"] = workspace_image_group(row)
+        row["workspace_image_group"] = group
         rows.append(row)
     return rows
 
@@ -285,8 +286,8 @@ def camera_grouping_summary(manifest_rows: Sequence[Dict[str, str]]) -> Dict[str
         "single_camera": not use_folder_groups,
         "single_camera_per_folder": use_folder_groups,
         "explanation": (
-            "Checkpoint photos, videos and extra photos are separated by source; "
-            "extra photo groups also separate decoded resolutions. Shared intrinsics "
+            "Video clips have separate camera groups; "
+            "groups also separate known decoded resolutions. Shared intrinsics "
             "within a group assume a common camera/lens setting."
             if use_folder_groups
             else "All current inputs belong to one capture-source group."
@@ -355,8 +356,9 @@ def copy_metadata(reconstruction_dir: Path, workspace_dir: Path) -> List[str]:
     for name in METADATA_FILES:
         source = reconstruction_dir / name
         if not source.exists():
-            if name in {"wifi_localization_model.json", "wifi_localization_eval.csv", "wifi_signal_grid.csv", "wifi_signal_boundary.csv"}:
-                (metadata_dir / name).unlink(missing_ok=True)
+            # The current export is authoritative, including when sensor modes
+            # change in a workspace that has only been prepared, not reconstructed.
+            (metadata_dir / name).unlink(missing_ok=True)
             continue
         shutil.copy2(source, metadata_dir / name)
         copied.append(name)
@@ -369,94 +371,14 @@ def write_image_list(workspace_dir: Path, image_names: Sequence[str]) -> None:
             handle.write(f"{image_name}\n")
 
 
-def circular_slot_distance(slot_a: int, slot_b: int, slot_count: int) -> int:
-    diff = abs(slot_a - slot_b)
-    return min(diff, max(0, slot_count - diff))
-
-
-def anchor_slot_count(rows: Sequence[Dict[str, str]]) -> int:
-    counts = [safe_int(row.get("anchor_slot_count")) for row in rows if safe_int(row.get("anchor_slot_count")) > 0]
-    if counts:
-        return max(counts)
-    return max((safe_int(row.get("image_slot")) for row in rows), default=len(rows))
-
-
-def point_distance(row_a: Dict[str, str], row_b: Dict[str, str]) -> float:
-    ax = safe_float(row_a.get("pdr_x"))
-    ay = safe_float(row_a.get("pdr_y"))
-    bx = safe_float(row_b.get("pdr_x"))
-    by = safe_float(row_b.get("pdr_y"))
-    if any(math.isnan(value) for value in (ax, ay, bx, by)):
-        return math.inf
-    return math.hypot(ax - bx, ay - by)
-
-
-def trajectory_coordinate(row: Dict[str, str]) -> Optional[Tuple[str, float]]:
-    contour_id = str(row.get("trajectory_contour_id", "")).strip()
-    distance_m = safe_float(row.get("trajectory_contour_distance_m"))
-    if not contour_id or not math.isfinite(distance_m):
-        return None
-    return contour_id, distance_m
-
-
-def trajectory_distance(row_a: Dict[str, str], row_b: Dict[str, str]) -> float:
-    left = trajectory_coordinate(row_a)
-    right = trajectory_coordinate(row_b)
-    if left is None or right is None or left[0] != right[0]:
-        return math.inf
-    return abs(left[1] - right[1])
-
-
 def bounded_score(value: Optional[float], scale: float) -> float:
     if value is None or scale <= 0 or math.isnan(value) or math.isinf(value):
         return 1.0
     return 1.0 / (1.0 + max(0.0, value) / scale)
 
 
-def row_point_index(row: Dict[str, str]) -> int:
-    return safe_int(row.get("global_point_index") or row.get("nearest_global_point_index"), -1)
-
-
-def row_slot(row: Dict[str, str]) -> int:
-    return safe_int(row.get("image_slot"), -1)
-
-
 def row_video_sequence(row: Dict[str, str]) -> int:
     return safe_int(row.get("video_sequence_index"), -1)
-
-
-def pair_point_gap(row_a: Dict[str, str], row_b: Dict[str, str]) -> Optional[int]:
-    point_a = row_point_index(row_a)
-    point_b = row_point_index(row_b)
-    if point_a < 0 or point_b < 0:
-        return None
-    return abs(point_a - point_b)
-
-
-def pair_slot_gap(
-    row_a: Dict[str, str], row_b: Dict[str, str], fallback_slot_count: int = 0,
-) -> Optional[float]:
-    slot_a = row_slot(row_a)
-    slot_b = row_slot(row_b)
-    if slot_a <= 0 or slot_b <= 0:
-        return None
-    count_a = safe_int(row_a.get("anchor_slot_count"))
-    count_b = safe_int(row_b.get("anchor_slot_count"))
-    if count_a >= slot_a and count_b >= slot_b:
-        # Compare circular view fractions when stops have different counts.
-        # This remains a pairing heuristic, not a measured camera heading.
-        difference = abs((slot_a - 1) * count_b - (slot_b - 1) * count_a)
-        return min(difference, count_a * count_b - difference) / min(count_a, count_b)
-    slot_count = max(
-        count_a,
-        count_b,
-        fallback_slot_count,
-        slot_a,
-        slot_b,
-    )
-    if slot_count <= 0:
-        return abs(slot_a - slot_b)
-    return circular_slot_distance(slot_a, slot_b, slot_count)
 
 
 def pair_video_sequence_gap(row_a: Dict[str, str], row_b: Dict[str, str]) -> Optional[int]:
@@ -467,563 +389,119 @@ def pair_video_sequence_gap(row_a: Dict[str, str], row_b: Dict[str, str]) -> Opt
     return abs(sequence_a - sequence_b)
 
 
-def source_pair_weight(row_a: Dict[str, str], row_b: Dict[str, str]) -> float:
-    source_a = row_a.get("source_type", "")
-    source_b = row_b.get("source_type", "")
-    return SOURCE_PAIR_WEIGHTS.get((source_a, source_b), SOURCE_PAIR_WEIGHTS.get((source_b, source_a), 0.75))
-
-
-def score_match_edge(
-    row_a: Dict[str, str],
-    row_b: Dict[str, str],
-    reason: str,
-    pdr_distance: float,
-    trajectory_distance_m: float,
-    point_window: int,
-    slot_window: int,
-    max_pdr_distance_m: float,
-    video_frame_window: int,
-    visual_only: bool,
-) -> Dict[str, Any]:
-    point_gap = pair_point_gap(row_a, row_b)
-    slot_gap = pair_slot_gap(row_a, row_b)
-    video_gap = pair_video_sequence_gap(row_a, row_b)
-    pdr_score = 1.0 if visual_only else bounded_score(pdr_distance, max_pdr_distance_m)
-    trajectory_score = 1.0 if visual_only else bounded_score(trajectory_distance_m, max_pdr_distance_m)
-    slot_score = bounded_score(float(slot_gap) if slot_gap is not None else None, max(1.0, float(slot_window)))
-    point_score = bounded_score(float(point_gap) if point_gap is not None else None, max(1.0, float(point_window + 1)))
-    video_score = bounded_score(float(video_gap) if video_gap is not None else None, max(1.0, float(video_frame_window)))
-
-    if reason == "same_wifi_point_nearby_slots":
-        combined = 0.20 * pdr_score + 0.20 * trajectory_score + 0.40 * slot_score + 0.20 * point_score
-    elif reason == "nearby_trajectory_points":
-        combined = 0.10 * pdr_score + 0.65 * trajectory_score + 0.15 * slot_score + 0.10 * point_score
-    elif reason == "video_sequence":
-        combined = 0.20 * pdr_score + 0.25 * trajectory_score + 0.15 * point_score + 0.40 * video_score
-    elif reason in {"video_to_wifi_anchor", "video_to_trajectory_anchor"}:
-        combined = 0.20 * pdr_score + 0.25 * trajectory_score + 0.35 * point_score + 0.20 * video_score
-    else:
-        combined = 0.30 * pdr_score + 0.35 * trajectory_score + 0.20 * slot_score + 0.15 * point_score
-
-    reason_weight = REASON_BASE_WEIGHTS.get(reason, 0.60)
-    pair_weight = source_pair_weight(row_a, row_b)
-    edge_weight = max(0.01, min(1.0, reason_weight * pair_weight * combined))
-    return {
-        "edge_weight": round(edge_weight, 6),
-        "reason_weight": round(reason_weight, 6),
-        "source_pair_weight": round(pair_weight, 6),
-        "pdr_score": round(pdr_score, 6),
-        "trajectory_score": round(trajectory_score, 6),
-        "slot_score": round(slot_score, 6),
-        "point_score": round(point_score, 6),
-        "video_score": round(video_score, 6),
-        "point_gap": "" if point_gap is None else point_gap,
-        "slot_gap": "" if slot_gap is None else slot_gap,
-        "video_sequence_gap": "" if video_gap is None else video_gap,
-        "edge_weight_basis": "reason_source_pdr_trajectory_slot_point_video",
-    }
-
-
 def is_video_frame_row(row: Dict[str, str]) -> bool:
     return row.get("source_type") == "video_base_frame" or bool(row.get("video_sequence_index"))
 
 
-def select_evenly_spaced(rows: Sequence[Dict[str, str]], limit: int) -> List[Dict[str, str]]:
-    if limit <= 0 or len(rows) <= limit:
-        return list(rows)
-    selected: List[Dict[str, str]] = []
-    used: set[int] = set()
-    for idx in range(limit):
-        pos = round(idx * (len(rows) - 1) / max(1, limit - 1))
-        if pos not in used:
-            selected.append(rows[pos])
-            used.add(pos)
-    return selected
+VIDEO_MATCH_TIME_OFFSETS_S = (1.0, 2.0, 4.0, 8.0, 16.0)
+
+
+def video_sequence_pair_indices(
+    sequence_rows: Sequence[Dict[str, str]], frame_window: int,
+) -> Tuple[List[Tuple[int, int]], Dict[str, Any]]:
+    """Preserve local continuity and add bounded, wider-baseline candidates.
+
+    Timestamps refer to the decoded video, not a sensor clock. Sampling more
+    densely must not shrink every matching baseline to the next few frames.
+    These are candidates only; COLMAP still performs SIFT geometric verification.
+    """
+    window = max(1, frame_window)
+    count = len(sequence_rows)
+    local_pairs = {
+        (index, other)
+        for index in range(count)
+        for other in range(index + 1, min(count, index + window + 1))
+    }
+    pairs = set(local_pairs)
+    times = [safe_float(row.get("video_time_s")) for row in sequence_rows]
+    usable_times = (
+        bool(times) and all(math.isfinite(value) and value >= 0 for value in times)
+        and all(left < right for left, right in zip(times, times[1:]))
+    )
+    fallback_offsets = [window * multiplier for multiplier in (2, 4, 8)]
+    for index in range(count):
+        if usable_times:
+            for offset in VIDEO_MATCH_TIME_OFFSETS_S:
+                target = times[index] + offset
+                insertion = bisect_left(times, target, lo=index + 1)
+                neighbors = [
+                    other for other in (insertion - 1, insertion)
+                    if index < other < count
+                ]
+                if not neighbors:
+                    continue
+                closest = min(neighbors, key=lambda other: abs(times[other] - target))
+                # Do not call a distant frame across a capture gap a 1s neighbor.
+                if abs(times[closest] - target) <= max(0.1, offset * 0.35):
+                    pairs.add((index, closest))
+        else:
+            for offset in fallback_offsets:
+                if index + offset < count:
+                    pairs.add((index, index + offset))
+    return sorted(pairs), {
+        "mode": "decoded_video_time" if usable_times else "frame_rank_fallback",
+        "frame_count": count,
+        "local_pair_count": len(local_pairs),
+        "additional_multiscale_pair_count": len(pairs) - len(local_pairs),
+        "pair_count": len(pairs),
+        "time_offsets_s": list(VIDEO_MATCH_TIME_OFFSETS_S) if usable_times else [],
+        "fallback_rank_offsets": [] if usable_times else fallback_offsets,
+        "requires_colmap_geometric_verification": True,
+    }
 
 
 def build_constrained_match_pairs(
     manifest_rows: Sequence[Dict[str, str]],
-    point_window: int,
-    slot_window: int,
-    max_pdr_distance_m: float,
     video_frame_window: int,
-    video_anchor_point_window: int,
-    video_anchor_limit: int,
     visual_only: bool = False,
 ) -> Tuple[List[Tuple[str, str]], List[Dict[str, Any]], Dict[str, Any]]:
+    """Propose local and multiscale video neighbors; sensors are added separately."""
     video_frame_window = max(1, video_frame_window)
-    video_anchor_point_window = max(0, video_anchor_point_window)
-    video_anchor_limit = max(0, video_anchor_limit)
-    rows = [
-        row
-        for row in manifest_rows
-        if row.get("image_file")
-        and row.get("global_point_index")
-        and row.get("image_slot")
-        and not is_video_frame_row(row)
-    ]
-    rows.sort(key=lambda row: (safe_int(row.get("global_point_index")), safe_int(row.get("image_slot"))))
-
-    by_point: Dict[int, List[Dict[str, str]]] = {}
-    for row in rows:
-        by_point.setdefault(safe_int(row.get("global_point_index")), []).append(row)
-    for point_rows in by_point.values():
-        point_rows.sort(key=lambda row: safe_int(row.get("image_slot")))
-
-    pairs: Dict[Tuple[str, str], str] = {}
-
-    def add_pair(row_a: Dict[str, str], row_b: Dict[str, str], reason: str) -> None:
-        image_a = row_a.get("image_file", "")
-        image_b = row_b.get("image_file", "")
-        if not image_a or not image_b or image_a == image_b:
-            return
-        key = tuple(sorted((image_a, image_b)))
-        existing_reason = pairs.get(key)
-        if existing_reason is None or REASON_BASE_WEIGHTS.get(reason, 0.0) > REASON_BASE_WEIGHTS.get(existing_reason, 0.0):
-            pairs[key] = reason
-
-    for point, point_rows in by_point.items():
-        slot_count = anchor_slot_count(point_rows)
-        for idx, row_a in enumerate(point_rows):
-            for row_b in point_rows[idx + 1 :]:
-                distance = circular_slot_distance(
-                    safe_int(row_a.get("image_slot")),
-                    safe_int(row_b.get("image_slot")),
-                    slot_count,
-                )
-                if distance <= slot_window:
-                    add_pair(row_a, row_b, "same_wifi_point_nearby_slots")
-
-    points = sorted(by_point)
-    point_row_by_id = {point: by_point[point][0] for point in points if by_point[point]}
-
-    def row_xy(row: Dict[str, str]) -> Optional[Tuple[float, float]]:
-        x = safe_float(row.get("pdr_x"))
-        y = safe_float(row.get("pdr_y"))
-        if math.isnan(x) or math.isnan(y) or math.isinf(x) or math.isinf(y):
-            return None
-        return x, y
-
-    contour_point_count = sum(trajectory_coordinate(row) is not None for row in point_row_by_id.values())
-    trajectory_constraint_available = not visual_only and contour_point_count > 0
-    pdr_cell_size = max(1e-6, max_pdr_distance_m)
-    pdr_grid: Dict[Tuple[int, int], List[int]] = {}
-    if not visual_only and max_pdr_distance_m > 0:
-        for point, row in point_row_by_id.items():
-            if trajectory_coordinate(row) is not None:
-                continue
-            xy = row_xy(row)
-            if xy is None:
-                continue
-            cell = (math.floor(xy[0] / pdr_cell_size), math.floor(xy[1] / pdr_cell_size))
-            pdr_grid.setdefault(cell, []).append(point)
-
-    def nearby_trajectory_points(row: Dict[str, str]) -> List[int]:
-        if not trajectory_constraint_available or max_pdr_distance_m <= 0:
-            return []
-        coordinate = trajectory_coordinate(row)
-        if coordinate is None:
-            return []
-        contour_id, route_distance_m = coordinate
-        return [
-            point
-            for point, point_row in point_row_by_id.items()
-            if point != safe_int(row.get("global_point_index"), -1)
-            and (other := trajectory_coordinate(point_row)) is not None
-            and other[0] == contour_id
-            and abs(other[1] - route_distance_m) <= max_pdr_distance_m
-        ]
-
-    def trajectory_topology_points(row: Dict[str, str], neighbor_depth: int) -> List[int]:
-        """Return bounded predecessor/successor anchors on the same route contour.
-
-        P2 should preserve route topology even when sparse WiFi checkpoints are
-        farther apart than the metric matching radius. The contour id already
-        scopes the route to one session, so video rows need not carry a copied
-        session name to use this constraint.
-        """
-        if not trajectory_constraint_available:
-            return []
-        coordinate = trajectory_coordinate(row)
-        if coordinate is None:
-            return []
-        contour_id, route_distance_m = coordinate
-        self_point = safe_int(row.get("global_point_index"), -1)
-        before: List[Tuple[float, int]] = []
-        after: List[Tuple[float, int]] = []
-        exact: List[int] = []
-        for point, point_row in point_row_by_id.items():
-            if point == self_point:
-                continue
-            other = trajectory_coordinate(point_row)
-            if other is None or other[0] != contour_id:
-                continue
-            delta = other[1] - route_distance_m
-            if abs(delta) <= 1e-9:
-                exact.append(point)
-            elif delta < 0:
-                before.append((abs(delta), point))
-            else:
-                after.append((abs(delta), point))
-        depth = max(1, neighbor_depth)
-        before.sort()
-        after.sort()
-        return sorted(set(exact + [point for _distance, point in before[:depth]] + [point for _distance, point in after[:depth]]))
-
-    def nearby_pdr_points(row: Dict[str, str]) -> List[int]:
-        if visual_only or trajectory_coordinate(row) is not None or max_pdr_distance_m <= 0:
-            return []
-        xy = row_xy(row)
-        if xy is None:
-            return []
-        base_cell = (math.floor(xy[0] / pdr_cell_size), math.floor(xy[1] / pdr_cell_size))
-        nearby: List[int] = []
-        for dx in (-1, 0, 1):
-            for dy in (-1, 0, 1):
-                for point in pdr_grid.get((base_cell[0] + dx, base_cell[1] + dy), []):
-                    point_row = point_row_by_id.get(point)
-                    if point_row is not None and point_distance(row, point_row) <= max_pdr_distance_m:
-                        nearby.append(point)
-        return nearby
-
-    candidate_point_reasons: Dict[Tuple[int, int], str] = {}
-
-    def add_candidate(point_a: int, point_b: int, reason: str) -> None:
-        if point_a == point_b:
-            return
-        left, right = sorted((point_a, point_b))
-        row_a = point_row_by_id.get(left)
-        row_b = point_row_by_id.get(right)
-        if row_a is None or row_b is None or row_a.get("session") != row_b.get("session"):
-            return
-        if not visual_only and reason not in P2_CONTOUR_REASONS:
-            # Missing metadata cannot override a known contour or join two breaks.
-            if trajectory_coordinate(row_a) is not None or trajectory_coordinate(row_b) is not None:
-                return
-        key = (left, right)
-        current_reason = candidate_point_reasons.get(key)
-        if current_reason is None or REASON_BASE_WEIGHTS.get(reason, 0.0) > REASON_BASE_WEIGHTS.get(current_reason, 0.0):
-            candidate_point_reasons[key] = reason
-
-    for left_index, point_a in enumerate(points):
-        if not visual_only and trajectory_coordinate(point_row_by_id[point_a]) is not None:
-            anchor_row = point_row_by_id[point_a]
-            for point_b in trajectory_topology_points(anchor_row, point_window):
-                add_candidate(point_a, point_b, "trajectory_contour_neighbors")
-            for point_b in nearby_trajectory_points(anchor_row):
-                add_candidate(point_a, point_b, "nearby_trajectory_points")
-        else:
-            for point_b in points[left_index + 1 :]:
-                if point_b - point_a > point_window:
-                    break
-                add_candidate(point_a, point_b, "nearby_wifi_points")
-            for point_b in nearby_pdr_points(point_row_by_id[point_a]):
-                add_candidate(point_a, point_b, "nearby_pdr_points")
-
-    for (point_a, point_b), reason in sorted(candidate_point_reasons.items()):
-        rows_a = by_point[point_a]
-        rows_b = by_point[point_b]
-        slot_count = anchor_slot_count(rows_a + rows_b)
-        for row_a in rows_a:
-            for row_b in rows_b:
-                slot_gap = pair_slot_gap(row_a, row_b, slot_count)
-                if slot_gap is not None and slot_gap <= slot_window:
-                    add_pair(row_a, row_b, reason)
-
-    video_rows = [row for row in manifest_rows if row.get("image_file") and is_video_frame_row(row)]
     by_video: Dict[str, List[Dict[str, str]]] = {}
-    for row in video_rows:
-        by_video.setdefault(row.get("video_name", "video"), []).append(row)
-    for video_name, sequence_rows in by_video.items():
-        sequence_rows.sort(
-            key=lambda row: (
-                safe_int(row.get("video_sequence_index")),
-                safe_int(row.get("video_frame_index")),
-                row.get("image_file", ""),
-            )
-        )
-        for idx, row_a in enumerate(sequence_rows):
-            upper = min(len(sequence_rows), idx + max(1, video_frame_window) + 1)
-            for row_b in sequence_rows[idx + 1 : upper]:
-                add_pair(row_a, row_b, "video_sequence")
-
-    for video_row in video_rows:
-        if video_row.get("trajectory_position_source") != "synchronized_video_sensor_timestamp":
-            continue
-        candidate_points: set[int] = set()
-        used_trajectory_candidates = False
-        if trajectory_constraint_available and not visual_only:
-            trajectory_points = set(nearby_trajectory_points(video_row))
-            trajectory_points.update(trajectory_topology_points(video_row, video_anchor_point_window))
-            if trajectory_points:
-                candidate_points.update(trajectory_points)
-                used_trajectory_candidates = True
-
-        if not candidate_points and not trajectory_constraint_available:
-            for field in ("nearest_global_point_index", "left_global_point_index", "right_global_point_index"):
-                point = safe_int(video_row.get(field), -1)
-                if point < 0:
-                    continue
-                for neighbor in range(point - video_anchor_point_window, point + video_anchor_point_window + 1):
-                    if neighbor in by_point:
-                        candidate_points.add(neighbor)
-
-        if not candidate_points and not visual_only:
-            if trajectory_constraint_available:
-                candidate_points.update(nearby_trajectory_points(video_row))
-            else:
-                candidate_points.update(nearby_pdr_points(video_row))
-
-        candidate_anchor_rows: List[Dict[str, str]] = []
-        for point in sorted(candidate_points):
-            candidate_anchor_rows.extend(by_point.get(point, []))
-        candidate_anchor_rows.sort(
-            key=lambda row: (
-                trajectory_distance(video_row, row),
-                point_distance(video_row, row),
-                safe_int(row.get("global_point_index")),
-                safe_int(row.get("image_slot")),
-            )
-        )
-        for anchor_row in select_evenly_spaced(candidate_anchor_rows, video_anchor_limit):
-            add_pair(
-                video_row,
-                anchor_row,
-                "video_to_trajectory_anchor" if used_trajectory_candidates else "video_to_wifi_anchor",
-            )
-
-    sorted_pairs = sorted(pairs)
-    row_by_image = {
-        row.get("image_file", ""): row
-        for row in manifest_rows
-        if row.get("image_file")
-    }
-    edge_rows: List[Dict[str, Any]] = []
-    for image_a, image_b in sorted_pairs:
-        row_a = row_by_image.get(image_a, {})
-        row_b = row_by_image.get(image_b, {})
-        reason = pairs[(image_a, image_b)]
-        pdr_distance = point_distance(row_a, row_b)
-        route_distance_m = trajectory_distance(row_a, row_b)
-        edge_scores = score_match_edge(
-            row_a=row_a,
-            row_b=row_b,
-            reason=reason,
-            pdr_distance=pdr_distance,
-            trajectory_distance_m=route_distance_m,
-            point_window=point_window,
-            slot_window=slot_window,
-            max_pdr_distance_m=max_pdr_distance_m,
-            video_frame_window=video_frame_window,
-            visual_only=visual_only,
-        )
-        edge_rows.append(
-            {
-                "image_a": image_a,
-                "image_b": image_b,
-                "reason": reason,
-                "source_type_a": row_a.get("source_type", ""),
-                "source_type_b": row_b.get("source_type", ""),
-                "global_point_index_a": row_a.get("global_point_index") or row_a.get("nearest_global_point_index", ""),
-                "global_point_index_b": row_b.get("global_point_index") or row_b.get("nearest_global_point_index", ""),
-                "image_slot_a": row_a.get("image_slot", ""),
-                "image_slot_b": row_b.get("image_slot", ""),
-                "anchor_slot_count_a": row_a.get("anchor_slot_count", ""),
-                "anchor_slot_count_b": row_b.get("anchor_slot_count", ""),
-                "video_sequence_index_a": row_a.get("video_sequence_index", ""),
-                "video_sequence_index_b": row_b.get("video_sequence_index", ""),
-                "pdr_distance_m": "" if visual_only or math.isinf(pdr_distance) else round(pdr_distance, 6),
-                "trajectory_contour_id_a": row_a.get("trajectory_contour_id", ""),
-                "trajectory_contour_id_b": row_b.get("trajectory_contour_id", ""),
-                "trajectory_distance_m": "" if visual_only or math.isinf(route_distance_m) else round(route_distance_m, 6),
-                **edge_scores,
-            }
-        )
-    summary = {
-        "point_count": len(by_point),
-        "image_count": len(rows),
-        "video_frame_count": len(video_rows),
-        "video_frames_with_trajectory_contour": sum(
-            1 for row in video_rows if trajectory_coordinate(row) is not None
-        ),
-        "video_frames_without_trajectory_contour": sum(
-            1 for row in video_rows if trajectory_coordinate(row) is None
-        ),
-        "video_trajectory_note": (
-            "Video frames use interpolated positions along the observed PDR contour "
-            "only as soft matching evidence; they are excluded from PDR model alignment."
-        ),
-        "pair_count": len(sorted_pairs),
-        "visual_only": visual_only,
-        "point_window": point_window,
-        "slot_window": slot_window,
-        "max_pdr_distance_m": None if visual_only else max_pdr_distance_m,
-        "max_trajectory_distance_m": None if visual_only else max_pdr_distance_m,
-        "trajectory_constraint_available": trajectory_constraint_available,
-        "trajectory_constraint_mode": (
-            "visual_order_only" if visual_only else
-            "partial_ordered_contour" if 0 < contour_point_count < len(point_row_by_id) else
-            "ordered_contour" if trajectory_constraint_available else "legacy_pdr_proximity"
-        ),
-        "anchor_points_with_contour": contour_point_count,
-        "anchor_points_without_contour": len(point_row_by_id) - contour_point_count,
-        "p2_count_semantics": "Candidate edges constructed from contour metadata, not incremental edges or measured reconstruction improvement.",
-        "trajectory_topology_neighbor_depth": max(1, point_window) if trajectory_constraint_available else 0,
-        "video_frame_window": video_frame_window,
-        "video_anchor_point_window": video_anchor_point_window,
-        "video_anchor_limit": video_anchor_limit,
-        "candidate_point_pair_count": len(candidate_point_reasons),
-        "p2_contour_edge_count": 0,
-        "reason_counts": {},
-        "weighted_graph": True,
-        "edge_weight": {"min": None, "mean": None, "max": None},
-        "weight_by_reason": {},
-    }
-    weights: List[float] = []
-    weights_by_reason: Dict[str, List[float]] = {}
-    for row in edge_rows:
-        reason = str(row.get("reason", "unknown"))
-        summary["reason_counts"][reason] = summary["reason_counts"].get(reason, 0) + 1
-        if reason in P2_CONTOUR_REASONS:
-            summary["p2_contour_edge_count"] += 1
-        weight = safe_float(row.get("edge_weight"), math.nan)
-        if math.isnan(weight):
-            continue
-        weights.append(weight)
-        weights_by_reason.setdefault(reason, []).append(weight)
-    if weights:
-        summary["edge_weight"] = {
-            "min": round(min(weights), 6),
-            "mean": round(sum(weights) / len(weights), 6),
-            "max": round(max(weights), 6),
-        }
-    for reason, reason_weights in sorted(weights_by_reason.items()):
-        summary["weight_by_reason"][reason] = {
-            "count": len(reason_weights),
-            "min": round(min(reason_weights), 6),
-            "mean": round(sum(reason_weights) / len(reason_weights), 6),
-            "max": round(max(reason_weights), 6),
-        }
-    return sorted_pairs, edge_rows, summary
+    for row in manifest_rows:
+        workspace_image_group(row)
+        if row.get("image_file"):
+            by_video.setdefault(row["video_name"], []).append(row)
+    pairs, edges, clips = set(), [], []
+    for video_name, rows in sorted(by_video.items()):
+        rows.sort(key=lambda row: (safe_int(row.get("video_sequence_index")),
+                                  safe_int(row.get("video_frame_index")), row["image_file"]))
+        indices, timing = video_sequence_pair_indices(rows, video_frame_window)
+        clips.append({"video_name": video_name, **timing})
+        for a, b in indices:
+            left, right = rows[a], rows[b]
+            pair = tuple(sorted((left["image_file"], right["image_file"])))
+            if pair[0] == pair[1] or pair in pairs:
+                continue
+            pairs.add(pair)
+            gap = pair_video_sequence_gap(left, right)
+            score = bounded_score(float(gap) if gap is not None else None, float(video_frame_window))
+            edges.append({"image_a": pair[0], "image_b": pair[1], "reason": "video_sequence",
+                          "edge_weight": round(max(.01, .70 * .82 * (.60 + .40 * score)), 6),
+                          "video_score": score, "video_sequence_gap": gap,
+                          "source_type_a": "video_base_frame", "source_type_b": "video_base_frame",
+                          "video_sequence_index_a": left.get("video_sequence_index", ""),
+                          "video_sequence_index_b": right.get("video_sequence_index", ""),
+                          "edge_weight_basis": "video_temporal_neighbors_require_colmap_geometry"})
+    weights = [row["edge_weight"] for row in edges]
+    summary = {"image_count": len(manifest_rows), "video_frame_count": len(manifest_rows),
+               "pair_count": len(pairs), "visual_only": visual_only,
+               "candidate_basis": "video_order_and_appearance_retrieval",
+               "camera_orientation_from_phone": False, "video_frame_window": video_frame_window,
+               "reason_counts": {"video_sequence": len(pairs)}, "weighted_graph": True,
+               "video_sequence_pairing": {"policy": "local_neighbors_plus_bounded_multiscale_video_time",
+                   "clips": clips, "pair_budget_per_frame": video_frame_window + len(VIDEO_MATCH_TIME_OFFSETS_S),
+                   "requires_colmap_geometric_verification": True},
+               "edge_weight": {"min": min(weights) if weights else None,
+                               "max": max(weights) if weights else None,
+                               "mean": sum(weights) / len(weights) if weights else None}}
+    return sorted(pairs), sorted(edges, key=lambda row: (row["image_a"], row["image_b"])), summary
 
 
 def write_match_pairs(workspace_dir: Path, pairs: Sequence[Tuple[str, str]]) -> None:
     with (workspace_dir / "match_pairs.txt").open("w", encoding="utf-8") as handle:
         for image_a, image_b in pairs:
             handle.write(f"{image_a} {image_b}\n")
-
-
-def balanced_checkpoint_pairs(left, right, existing, budget):
-    """Spend a bounded RF pair budget across all photos at both stops.
-
-    Existing edges are excluded before allocation. Degree balancing prevents a
-    fixed representative subset from monopolizing every neighboring stop.
-    A stable hash breaks ties without equating capture-slot numbers.
-    """
-    left_names = sorted({row["image_file"] for row in left})
-    right_names = sorted({row["image_file"] for row in right})
-    candidates = {}
-    for a in left_names:
-        for b in right_names:
-            pair = tuple(sorted((a, b)))
-            if a != b and pair not in existing:
-                candidates[pair] = hashlib.blake2b(json.dumps(pair).encode("utf-8"), digest_size=8).digest()
-    degrees = dict.fromkeys(left_names + right_names, 0)
-    selected = []
-    for _ in range(min(max(0, budget), len(candidates))):
-        pair = min(candidates, key=lambda p: (
-            -(int(degrees[p[0]] == 0) + int(degrees[p[1]] == 0)),
-            max(degrees[p[0]], degrees[p[1]]), degrees[p[0]] + degrees[p[1]],
-            candidates[p], p,
-        ))
-        del candidates[pair]
-        selected.append(pair)
-        for name in pair:
-            degrees[name] += 1
-    return selected
-
-
-def build_wifi_recovery_edges(
-    manifest_rows: Sequence[Dict[str, str]],
-    existing_pairs: Sequence[Tuple[str, str]],
-    enabled: bool = True,
-    neighbors_per_point: int = 4,
-    images_per_point: int = 8,
-    rssi_similarity_scale_db: float = 12.0,
-) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """Rank RF stops and cover their photos with bounded geometric proposals.
-
-    images_per_point keeps its historical per-stop-pair budget (8 x 8 by
-    default), but no longer restricts which photos may participate.
-    """
-    from wifi_observations import fingerprint_confidence, fingerprint_similarity
-
-    groups: Dict[Tuple[str, str], List[Dict[str, str]]] = {}
-    checkpoint_by_image = {}
-    for row in manifest_rows:
-        if row.get("image_file") and row.get("global_point_index") and not is_video_frame_row(row) and fingerprint_confidence(row) > 0:
-            key = (row.get("session", ""), str(row["global_point_index"]))
-            if row["image_file"] in checkpoint_by_image:
-                raise ValueError("Duplicate WiFi recovery image in manifest")
-            checkpoint_by_image[row["image_file"]] = key
-            groups.setdefault(key, []).append(row)
-    representatives = {key: rows[0] for key, rows in groups.items()}
-    ranked = {}
-    keys = sorted(groups)
-    if enabled and neighbors_per_point > 0 and images_per_point > 0:
-        for index, key_a in enumerate(keys):
-            row_a = representatives[key_a]
-            for key_b in keys[index + 1:]:
-                if not key_a[0] or key_a[0] != key_b[0]:
-                    continue
-                row_b = representatives[key_b]
-                similarity = fingerprint_similarity(row_a, row_b, rssi_similarity_scale_db)
-                if similarity["score"] <= 0:
-                    continue
-                score, rms = similarity["score"], similarity["rssi_rms_db"]
-                shared_count, overlap = similarity["shared_aps"], similarity["ap_overlap"]
-                ranked.setdefault(key_a, []).append((-score, key_b, rms, shared_count, overlap))
-                ranked.setdefault(key_b, []).append((-score, key_a, rms, shared_count, overlap))
-    proposed = {}
-    for key, neighbors in ranked.items():
-        for negative_score, other, rms, shared_count, overlap in sorted(neighbors)[:neighbors_per_point]:
-            proposed[tuple(sorted((key, other)))] = (-negative_score, rms, shared_count, overlap)
-    existing = {tuple(sorted(pair)) for pair in existing_pairs}
-    edges: List[Dict[str, Any]] = []
-    for (key_a, key_b), (score, rms, shared_count, overlap) in sorted(proposed.items()):
-        left, right = groups[key_a], groups[key_b]
-        budget = min(images_per_point, len(left)) * min(images_per_point, len(right))
-        for pair in balanced_checkpoint_pairs(left, right, existing, budget):
-            existing.add(pair)
-            edges.append({
-                    "image_a": pair[0], "image_b": pair[1], "reason": "wifi_fingerprint_recovery",
-                    "edge_weight_basis": "confidence_weighted_wifi_retrieval_requires_geometry",
-                    "edge_weight": round(1.5 * score, 6),
-                    "wifi_retrieval_score": round(score, 6),
-                    "wifi_rssi_rms_db": round(rms, 6), "wifi_shared_ap_count": shared_count,
-                    "wifi_ap_overlap": round(overlap, 6),
-                    "wifi_checkpoint_a": json.dumps(checkpoint_by_image[pair[0]]),
-                    "wifi_checkpoint_b": json.dumps(checkpoint_by_image[pair[1]]),
-                    "wifi_pair_budget": budget,
-            })
-    covered = {row[key] for row in edges for key in ("image_a", "image_b")}
-    summary = {
-        "status": "disabled" if not enabled else "insufficient_fingerprints" if len(groups) < 2 else "evaluated",
-        "valid_checkpoint_count": len(groups), "candidate_checkpoint_pair_count": len(proposed),
-        "candidate_image_pair_count": len(edges), "rssi_similarity_scale_db": rssi_similarity_scale_db,
-        "min_shared_aps": 2, "ranking": "confidence_shared_AP_reliability_overlap_RSSI_decay",
-        "priority_multiplier": 1.5,
-        "neighbors_per_point": neighbors_per_point, "images_per_point": images_per_point,
-        "image_selection": "balanced_all_photos_with_bounded_pair_budget",
-        "pair_budget_per_checkpoint_pair": images_per_point ** 2,
-        "candidate_photo_count": len(covered),
-        "eligible_photo_count": len({row["image_file"] for rows in groups.values() for row in rows}),
-        "photo_coverage_by_checkpoint": [
-            {"session": key[0], "checkpoint": key[1], "eligible": len(rows),
-             "covered": sum(row["image_file"] in covered for row in rows)} for key, rows in sorted(groups.items())],
-        "explanation": "Weighted per-checkpoint RSSI expands and ranks match candidates; geometric verification is required before sparse matching. Scores are retrieval priorities, not COLMAP pose weights.",
-    }
-    return edges, summary
 
 
 def write_named_match_pairs(workspace_dir: Path, filename: str, pairs: Sequence[Tuple[str, str]]) -> None:
@@ -1044,6 +522,8 @@ def select_visually_supported_match_pairs(
     weights. P2 therefore supplies the route-topology candidate graph and P1
     turns evaluated visual evidence into a keep/drop decision. Unevaluated route
     pairs remain candidates; visual recovery always requires geometric evidence.
+    Temporal video candidates are passed to COLMAP even when the smaller ORB
+    preview finds weak support; only COLMAP's SIFT geometry can accept them.
     """
     edge_by_pair = {
         tuple(sorted((str(row.get("image_a", "")), str(row.get("image_b", ""))))): row
@@ -1071,11 +551,13 @@ def select_visually_supported_match_pairs(
         pair_status = "not_evaluated" if similarity is None else str(similarity.get("pair_status", "not_evaluated"))
         selected_pair = True
         selection_reason = "p1_unavailable_kept"
-        if edge.get("reason") in {"visual_recovery", "wifi_fingerprint_recovery"}:
+        if edge.get("reason") in {"visual_recovery", "wifi_fingerprint_recovery", "video_imu_route", "video_wifi_revisit"}:
             selected_pair = p1_available and pair_status == "ok" and decision == "geometry_supported"
             selection_reason = "p1_recovery_geometry_supported" if selected_pair else "p1_recovery_unverified_rejected"
             if not selected_pair:
                 rejected_decision_counts[decision] = rejected_decision_counts.get(decision, 0) + 1
+        elif edge.get("reason") == "video_sequence":
+            selection_reason = "video_sequence_pending_colmap_geometry"
         elif p1_available:
             if similarity is None:
                 selection_reason = "p1_not_evaluated_kept"
@@ -1097,6 +579,8 @@ def select_visually_supported_match_pairs(
                 "image_b": image_b,
                 "reason": edge.get("reason", ""),
                 "edge_weight": edge.get("edge_weight", ""),
+                "sensor_association_mode": edge.get("sensor_association_mode", ""),
+                "sensor_time_uncertainty_s": edge.get("sensor_time_uncertainty_s", ""),
                 "visual_decision": decision,
                 "pair_status": pair_status,
                 "visual_overlap_score": "" if similarity is None else similarity.get("visual_overlap_score", ""),
@@ -1116,12 +600,22 @@ def select_visually_supported_match_pairs(
         "selected_p2_contour_pair_count": sum(row["selected"] for row in selection_rows if row["reason"] in P2_CONTOUR_REASONS),
         "selected_visual_recovery_pair_count": sum(row["selected"] for row in selection_rows if row["reason"] == "visual_recovery"),
         "selected_wifi_recovery_pair_count": sum(row["selected"] for row in selection_rows if row["reason"] == "wifi_fingerprint_recovery"),
+        "selected_video_sequence_pair_count": sum(row["selected"] for row in selection_rows if row["reason"] == "video_sequence"),
+        "selected_video_sensor_pair_count": sum(row["selected"] for row in selection_rows if row["reason"] in {"video_imu_route", "video_wifi_revisit"}),
+        "selected_fuzzy_sensor_pair_count": sum(row["selected"] for row in selection_rows if row.get("sensor_association_mode") == "fuzzy_time_window"),
+        "video_sequence_kept_despite_p1_rejection_count": sum(
+            row["reason"] == "video_sequence" and p1_available
+            and row["pair_status"] == "ok" and row["visual_decision"] not in P1_VISUAL_SUPPORT_DECISIONS
+            for row in selection_rows
+        ),
         "selection_reason_counts": dict(sorted(selection_reason_counts.items())),
         "rejected_visual_decision_counts": dict(sorted(rejected_decision_counts.items())),
         "explanation": (
             "P2 determines the route-contour candidate graph. P1 keeps evaluated "
-            "pairs with visual support and rejects evaluated weak/no-overlap pairs; "
-            "unevaluated route pairs remain candidates. Recovery pairs require geometry, "
+            "route pairs with visual support and rejects evaluated weak/no-overlap route pairs; "
+            "unevaluated route pairs remain candidates. Temporal video pairs are always "
+            "candidates pending COLMAP SIFT geometric verification, not verified matches. "
+            "Recovery pairs require preview geometry, "
             "and an all-rejected graph stays empty instead of restoring rejected pairs."
         ),
     }
@@ -1137,6 +631,8 @@ def write_match_pair_filter(workspace_dir: Path, rows: Sequence[Dict[str, Any]],
             "reason",
             "edge_weight",
             "visual_decision",
+            "sensor_association_mode",
+            "sensor_time_uncertainty_s",
             "pair_status",
             "visual_overlap_score",
             "selected",
@@ -1159,28 +655,39 @@ def write_match_graph_edges(workspace_dir: Path, edge_rows: Sequence[Dict[str, A
             "source_pair_weight",
             "pdr_score",
             "trajectory_score",
-            "slot_score",
             "point_score",
             "video_score",
             "point_gap",
-            "slot_gap",
             "video_sequence_gap",
             "edge_weight_basis",
+            "sensor_association_mode",
+            "sensor_time_uncertainty_s",
+            "sensor_time_uncertainty_a_s",
+            "sensor_time_uncertainty_b_s",
+            "sensor_window_a_start_ms",
+            "sensor_window_a_end_ms",
+            "sensor_window_b_start_ms",
+            "sensor_window_b_end_ms",
+            "video_sensor_fuzzy_source_sha256",
+            "temporal_uncertainty_is_assumed",
+            "trajectory_distance_min_m",
+            "trajectory_distance_max_m",
+            "wifi_scan_a_elapsed_ts",
+            "wifi_scan_b_elapsed_ts",
             "wifi_rssi_rms_db",
             "wifi_retrieval_score",
+            "wifi_fingerprint_score",
+            "wifi_sequence_multiplier",
+            "wifi_sequence_status",
+            "wifi_sequence_direction",
+            "wifi_sequence_neighbor_pairs",
             "wifi_shared_ap_count",
             "wifi_ap_overlap",
-            "wifi_checkpoint_a",
-            "wifi_checkpoint_b",
             "wifi_pair_budget",
             "source_type_a",
             "source_type_b",
             "global_point_index_a",
             "global_point_index_b",
-            "image_slot_a",
-            "image_slot_b",
-            "anchor_slot_count_a",
-            "anchor_slot_count_b",
             "video_sequence_index_a",
             "video_sequence_index_b",
             "pdr_distance_m",
@@ -1190,30 +697,6 @@ def write_match_graph_edges(workspace_dir: Path, edge_rows: Sequence[Dict[str, A
         ],
         edge_rows,
     )
-
-
-def write_pdr_alignment_refs(workspace_dir: Path, manifest_rows: Sequence[Dict[str, str]]) -> int:
-    written = 0
-    seen: set[str] = set()
-    with (workspace_dir / "pdr_alignment_refs.txt").open("w", encoding="utf-8") as handle:
-        for row in sorted(
-            manifest_rows,
-            key=lambda item: (safe_int(item.get("global_point_index")), safe_int(item.get("image_slot"))),
-        ):
-            image_file = row.get("image_file", "")
-            if row.get("source_type") == "video_base_frame":
-                continue
-            if not image_file or image_file in seen:
-                continue
-            x = safe_float(row.get("pdr_x"))
-            y = safe_float(row.get("pdr_y"))
-            z = safe_float(row.get("pdr_z"), 1.5)
-            if any(math.isnan(value) for value in (x, y, z)):
-                continue
-            handle.write(f"{image_file} {x:.6f} {y:.6f} {z:.6f}\n")
-            seen.add(image_file)
-            written += 1
-    return written
 
 
 def remove_pdr_alignment_refs(workspace_dir: Path) -> None:
@@ -1234,6 +717,7 @@ exit /b %errorlevel%
 
 def batch_header(root: Path, workspace_dir: Path, colmap_exe: Path, mode: str = "gui") -> str:
     return f"""@echo off
+rem portable-stage-v1
 setlocal
 set "ROOT={windows_path(root)}"
 set "WORKSPACE={windows_path(workspace_dir)}"
@@ -1275,54 +759,12 @@ def dense_profile_config(dense_profile: str) -> Dict[str, Any]:
     return DENSE_PROFILES[dense_profile]
 
 
-def load_profile_config(load_profile: str) -> Dict[str, Any]:
-    if load_profile not in LOAD_PROFILES:
-        raise ValueError(f"Unknown COLMAP load profile: {load_profile}")
-    return LOAD_PROFILES[load_profile]
-
-
-def resolve_load_settings(
-    load_profile: str,
-    colmap_num_threads: Optional[int],
-    stage_cooldown_s: Optional[int],
-) -> Tuple[str, Dict[str, Any], int, int]:
-    profile_name = load_profile
-    config = load_profile_config(profile_name)
-    default_threads = int(config.get("num_threads") or 0)
-    default_cooldown = int(config.get("stage_cooldown_s") or 0)
-    threads = default_threads if colmap_num_threads is None else max(0, int(colmap_num_threads))
-    cooldown = default_cooldown if stage_cooldown_s is None else max(0, int(stage_cooldown_s))
-    return profile_name, config, threads, cooldown
-
-
 def thread_option(prefix: str, num_threads: int) -> str:
     return f" ^\n  --{prefix}.num_threads {num_threads}" if num_threads > 0 else ""
 
 
 def prefixed_thread_option(prefix: str, num_threads: int) -> List[str]:
     return [f"  --{prefix}.num_threads {num_threads}"] if num_threads > 0 else []
-
-
-def cooldown_block(stage_cooldown_s: int, label: str) -> str:
-    if stage_cooldown_s <= 0:
-        return ""
-    return f"""
-echo [cooldown] Waiting {stage_cooldown_s}s after {label} to reduce sustained peak load...
-timeout /t {stage_cooldown_s} /nobreak >nul
-"""
-
-
-def thread_environment_block(num_threads: int) -> str:
-    if num_threads <= 0:
-        return ""
-    return f"""
-set "OMP_NUM_THREADS={num_threads}"
-set "OPENBLAS_NUM_THREADS={num_threads}"
-set "MKL_NUM_THREADS={num_threads}"
-set "NUMEXPR_NUM_THREADS={num_threads}"
-set "OPENCV_FOR_THREADS_NUM={num_threads}"
-echo [load] Explicit thread cap: {num_threads}
-"""
 
 
 def remove_stale_quality_reports(workspace_dir: Path) -> List[str]:
@@ -1399,22 +841,26 @@ def write_sparse_batch(
     max_num_features: int,
     max_num_matches: int,
     num_threads: int,
-    stage_cooldown_s: int,
-    pdr_capture_mode: str = "auto",
+    ba_gpu: str = 'auto',
+    sparse_strategy: str = 'all',
+    sparse_ba_growth_ratio: float = 1.1,
+    sparse_keyframe_gap_s: float = 1.0,
 ) -> None:
-    if pdr_capture_mode not in {"auto", "stationary", "off"}:
-        raise ValueError("Unknown PDR capture mode")
+    if ba_gpu not in {'auto', 'on', 'off'}:
+        raise ValueError('Unknown GPU BA policy')
+    import math
+    if sparse_strategy not in {'all', 'backbone'}:
+        raise ValueError('Unknown sparse frame strategy')
+    if not math.isfinite(sparse_ba_growth_ratio) or sparse_ba_growth_ratio <= 1:
+        raise ValueError('Sparse BA growth ratio must be finite and greater than 1')
+    if not math.isfinite(sparse_keyframe_gap_s) or sparse_keyframe_gap_s <= 0:
+        raise ValueError('Sparse keyframe gap must be finite and positive')
     matcher_command = "sequential_matcher" if matcher == "sequential" else "exhaustive_matcher"
     single_camera_flag = "1" if single_camera else "0"
     single_camera_per_folder_flag = "1" if single_camera_per_folder else "0"
     gpu_flag = "1" if use_gpu else "0"
     feature_extraction_threads = thread_option("FeatureExtraction", num_threads)
     feature_matching_threads = thread_option("FeatureMatching", num_threads)
-    mapper_threads = thread_option("Mapper", num_threads)
-    after_feature_cooldown = cooldown_block(stage_cooldown_s, "feature extraction")
-    after_matching_cooldown = cooldown_block(stage_cooldown_s, "feature matching")
-    after_mapper_cooldown = cooldown_block(stage_cooldown_s, "sparse mapping")
-    thread_env = thread_environment_block(num_threads)
     constrained_matching_block = f"""echo [2/4] Matching selected route pairs and geometry-supported visual recovery pairs...
 if not exist "%WORKSPACE%\\match_pairs.txt" (
   echo [error] Missing constrained pair list: %WORKSPACE%\\match_pairs.txt
@@ -1428,7 +874,6 @@ if not exist "%WORKSPACE%\\match_pairs.txt" (
   --FeatureMatching.guided_matching 1 ^
   --FeatureMatching.max_num_matches {max_num_matches}{feature_matching_threads}
 if not "%errorlevel%"=="0" exit /b %errorlevel%
-{after_matching_cooldown}
 """
     if matcher == "constrained":
         matching_block = constrained_matching_block
@@ -1441,7 +886,6 @@ echo [2b/4] Adding opt-in exhaustive visual bridge matches outside the P1/P2 pai
   --FeatureMatching.guided_matching 1 ^
   --FeatureMatching.max_num_matches {max_num_matches}{feature_matching_threads}
 if not "%errorlevel%"=="0" exit /b %errorlevel%
-{after_matching_cooldown}
 """
     else:
         matching_block = f"""echo [2/4] Matching features with {matcher_command}...
@@ -1451,7 +895,6 @@ if not "%errorlevel%"=="0" exit /b %errorlevel%
   --FeatureMatching.guided_matching 1 ^
   --FeatureMatching.max_num_matches {max_num_matches}{feature_matching_threads}
 if not "%errorlevel%"=="0" exit /b %errorlevel%
-{after_matching_cooldown}
 """
     feature_limits = ""
     if feature_max_image_size > 0:
@@ -1463,11 +906,11 @@ if not "%errorlevel%"=="0" exit /b %errorlevel%
         mask_option = f' ^\n  --ImageReader.mask_path "{windows_path(mask_dir)}"'
     alignment_disabled = "" if align_to_pdr else " --disabled"
     alignment_block = f"""
-echo [4/4] Validating checkpoint reliability before PDR alignment...
-python "%ROOT%\\pdr_alignment.py" --workspace "%WORKSPACE%" --colmap-exe "%COLMAP_EXE%" --capture-mode {pdr_capture_mode}{alignment_disabled}
+echo [4/4] Recording visual sparse model selection...
+python "%ROOT%\\pdr_alignment.py" --workspace "%WORKSPACE%" --colmap-exe "%COLMAP_EXE%" --capture-mode off{alignment_disabled}
 if not "%errorlevel%"=="0" exit /b %errorlevel%
 """
-    content = batch_header(root, workspace_dir, colmap_exe, "sparse") + f"""{thread_env}
+    content = batch_header(root, workspace_dir, colmap_exe, "sparse") + f"""
 echo [preflight] Checking that sparse reconstruction starts from the current input set...
 python "%ROOT%\\colmap_workspace_check.py" --workspace "%WORKSPACE%" --require-clean-database
 if not "%errorlevel%"=="0" exit /b %errorlevel%
@@ -1490,7 +933,6 @@ echo [1/4] Extracting features...
   --ImageReader.single_camera_per_folder {single_camera_per_folder_flag} ^
   --FeatureExtraction.use_gpu {gpu_flag}{mask_option}{feature_limits}{feature_extraction_threads}
 if not "%errorlevel%"=="0" exit /b %errorlevel%
-{after_feature_cooldown}
 
 {matching_block}
 
@@ -1500,19 +942,27 @@ set "SPARSE_SNAPSHOTS=%WORKSPACE%\\sparse_snapshots\\%FYP_COLMAP_RUN_ID%"
 mkdir "%SPARSE_SNAPSHOTS%"
 if not "%errorlevel%"=="0" exit /b %errorlevel%
 echo [snapshot] Recovery candidates: %SPARSE_SNAPSHOTS%
-"%COLMAP_EXE%" mapper ^
-  --database_path "%DATABASE%" ^
-  --image_path "%IMAGE_PATH%" ^
-  --output_path "%WORKSPACE%\\sparse" ^
-  --Mapper.multiple_models 0{mapper_threads} ^
-  --Mapper.snapshot_path "%SPARSE_SNAPSHOTS%" ^
-  --Mapper.snapshot_frames_freq 50
+python "%ROOT%\\sparse_optimization.py" ^
+  --workspace "%WORKSPACE%" ^
+  --colmap-exe "%COLMAP_EXE%" ^
+  --snapshots "%SPARSE_SNAPSHOTS%" ^
+  --num-threads {num_threads} ^
+  --ba-gpu {ba_gpu} ^
+  --strategy {sparse_strategy} ^
+  --ba-growth-ratio {sparse_ba_growth_ratio} ^
+  --keyframe-gap-s {sparse_keyframe_gap_s}
 if not "%errorlevel%"=="0" exit /b %errorlevel%
-{after_mapper_cooldown}
+python "%ROOT%\\sparse_recovery.py" ^
+  --workspace "%WORKSPACE%" ^
+  --colmap-exe "%COLMAP_EXE%" ^
+  --num-threads {num_threads}
+if not "%errorlevel%"=="0" exit /b %errorlevel%
+echo [sparse-log] mapper complete run=%FYP_COLMAP_RUN_ID%
 
 {alignment_block}
 python "%ROOT%\\colmap_workspace_check.py" --workspace "%WORKSPACE%" --record-sparse-complete
 if not "%errorlevel%"=="0" exit /b %errorlevel%
+echo [report] Generating reconstruction quality report...
 python "%ROOT%\\reconstruction_quality.py" --workspace "%WORKSPACE%" --summary "%WORKSPACE%\\quality_report.json"
 if not "%errorlevel%"=="0" echo [warn] Sparse quality report failed; reconstruction outputs are still available.
 
@@ -1532,11 +982,18 @@ def write_dense_batch(
     run_meshing: bool,
     run_point_cloud_filter: bool,
     num_threads: int,
-    stage_cooldown_s: int,
     scene_completion: str = "off",
     videoscene_max_clips: int = 3,
     videoscene_budget_hours: float = 4.,
+    dense_selection_enabled: bool = False,
+    point_filter_method: str = "observed",
+    point_filter_max_candidates: int = 2000000,
+    point_filter_budget_seconds: float = 120.,
 ) -> None:
+    if point_filter_method not in {"observed", "wifi-density", "connected-density"}:
+        raise ValueError("Unknown point-cloud filter method")
+    if type(point_filter_max_candidates) is not int or not 1 <= point_filter_max_candidates <= 2000000 or not math.isfinite(point_filter_budget_seconds) or point_filter_budget_seconds <= 0:
+        raise ValueError("Invalid point-cloud observation budget")
     if scene_completion not in {"off", "videoscene"}:
         raise ValueError("Unknown scene completion method")
     if scene_completion == "videoscene" and not run_point_cloud_filter:
@@ -1544,23 +1001,21 @@ def write_dense_batch(
     if not 1 <= videoscene_max_clips <= 8 or not math.isfinite(videoscene_budget_hours) or not 0 < videoscene_budget_hours <= 20:
         raise ValueError("Invalid VideoScene completion budget")
     profile = dense_profile_config(dense_profile)
-    point_filter_max_points = int(profile.get("point_filter_max_points", 600000))
+    depth_planner = "dense_keyframes.py" if dense_selection_enabled else "mvs_observations.py"
+    point_filter_max_points = 0 if point_filter_method == "observed" else int(profile.get("point_filter_max_points", 600000))
     cleanup_intermediate_ply = bool(profile.get("cleanup_intermediate_ply", True))
-    after_undistort_cooldown = cooldown_block(stage_cooldown_s, "image undistortion")
-    after_patchmatch_cooldown = cooldown_block(stage_cooldown_s, "PatchMatch stereo")
-    after_fusion_cooldown = cooldown_block(stage_cooldown_s, "stereo fusion")
-    after_postprocess_cooldown = cooldown_block(stage_cooldown_s, "post-processing")
-    thread_env = thread_environment_block(num_threads)
     patch_match_args = [
         '  --workspace_path "%WORKSPACE%\\dense"',
         "  --workspace_format COLMAP",
-        *prefixed_options("PatchMatchStereo", profile["patch_match"]),
+        # COLMAP 3.13 may retain native-size zero-distortion cameras even
+        # after resizing their images. Apply the same cap to MVS calibration.
+        *prefixed_options("PatchMatchStereo", {**profile["patch_match"], "max_image_size": dense_max_image_size}),
     ]
     fusion_args = [
         '  --workspace_path "%WORKSPACE%\\dense"',
         "  --workspace_format COLMAP",
         "  --input_type geometric",
-        *prefixed_options("StereoFusion", profile["fusion"]),
+        *prefixed_options("StereoFusion", {**profile["fusion"], "max_image_size": dense_max_image_size}),
         *prefixed_thread_option("StereoFusion", num_threads),
         *([f'  --StereoFusion.mask_path "{windows_path(mask_dir)}"'] if mask_dir is not None else []),
         '  --output_path "%WORKSPACE%\\dense\\fused.ply"',
@@ -1604,8 +1059,10 @@ python "%ROOT%\\point_cloud_filter.py" ^
   --input "%WORKSPACE%\\dense\\fused.ply" ^
   --output "%WORKSPACE%\\dense\\fused_filtered.ply" ^
   --summary "%WORKSPACE%\\dense\\point_filter_summary.json" ^
-  --method wifi-density ^
+  --method {point_filter_method} ^
   --workspace "%WORKSPACE%" ^
+  --observation-max-candidates {point_filter_max_candidates} ^
+  --observation-budget-seconds {point_filter_budget_seconds} ^
   --max-points {point_filter_max_points}
 if not "%errorlevel%"=="0" (
   echo [error] Point cloud filtering failed; stopping before final promotion. Raw fused.ply is still available.
@@ -1613,7 +1070,6 @@ if not "%errorlevel%"=="0" (
 ) else (
   set "DENSE_POINT_CLOUD=%WORKSPACE%\\dense\\fused_filtered.ply"
 )
-{after_postprocess_cooldown}
 """
     mesh_block = ""
     if run_meshing and profile.get("run_meshing", True):
@@ -1635,14 +1091,13 @@ if not "%errorlevel%"=="0" (
 echo [5/8] Building a Delaunay mesh for robust MeshLab inspection...
 {delaunay_command}
 if not "%errorlevel%"=="0" echo [warn] Delaunay meshing failed; continuing with fused point cloud.
-{after_postprocess_cooldown}
 
 echo [6/8] Building a Poisson mesh for smoother surface inspection...
 {poisson_command}
 if not "%errorlevel%"=="0" echo [warn] Poisson meshing failed; continuing with fused point cloud.
-{after_postprocess_cooldown}
 """
     quality_block = """
+echo [report] Generating reconstruction quality report...
 python "%ROOT%\\reconstruction_quality.py" --workspace "%WORKSPACE%" --summary "%WORKSPACE%\\quality_report.json"
 if not "%errorlevel%"=="0" echo [warn] Final quality report failed; reconstruction outputs are still available.
 """
@@ -1663,17 +1118,16 @@ python "%ROOT%\\finalize_dense_outputs.py" ^
   --dense-dir "%WORKSPACE%\\dense" ^
   --summary "%WORKSPACE%\\dense\\final_output_summary.json" %FINALIZE_KEEP%{raw_replacement}
 if not "%errorlevel%"=="0" exit /b %errorlevel%
-{after_postprocess_cooldown}
 """
-    pdr_note = "Only validated PDR-aligned sparse models are selected." if align_to_pdr else "Visual sparse models are used because visual-only mode is enabled."
+    pdr_note = "Visual sparse models are retained; sensor timing windows do not establish a metric camera transform."
     completion_block = ""
     if scene_completion == "videoscene":
         completion_block = f"""
-echo [VideoScene] Completing supported local holes after observed reconstruction...
-python "%ROOT%\\videoscene_completion.py" --workspace "%WORKSPACE%" --max-clips {videoscene_max_clips} --budget-hours {videoscene_budget_hours}
+echo [7/8] Completing supported local holes with VideoScene...
+python "%ROOT%\\videoscene_completion.py" --workspace "%WORKSPACE%" --max-clips {videoscene_max_clips} --budget-hours {videoscene_budget_hours} --skip-quality-report
 if not "%errorlevel%"=="0" exit /b %errorlevel%
 """
-    content = batch_header(root, workspace_dir, colmap_exe, "dense") + f"""{thread_env}
+    content = batch_header(root, workspace_dir, colmap_exe, "dense") + f"""
 {filter_preflight}{sparse_selector}if not exist "%SPARSE_MODEL%" (
   echo [error] Sparse model not found: %SPARSE_MODEL%
   echo Run run_colmap_sparse.bat first, or check which sparse model folder COLMAP created.
@@ -1698,12 +1152,11 @@ if "%errorlevel%"=="0" goto :undistortion_ready
 echo [1/8] Undistorting images...
 {undistorter_command}
 if not "%errorlevel%"=="0" exit /b %errorlevel%
-python "%ROOT%\\mvs_observations.py" --workspace "%WORKSPACE%" --apply
+python "%ROOT%\\{depth_planner}" --workspace "%WORKSPACE%" --apply
 if not "%errorlevel%"=="0" exit /b %errorlevel%
 python "%ROOT%\\dense_cache.py" checkpoint --workspace "%WORKSPACE%"
 if not "%errorlevel%"=="0" exit /b %errorlevel%
 :undistortion_ready
-{after_undistort_cooldown}
 
 python "%ROOT%\\dense_cache.py" matched --workspace "%WORKSPACE%"
 if not "%errorlevel%"=="0" if not "%errorlevel%"=="1" exit /b %errorlevel%
@@ -1714,14 +1167,12 @@ if not "%errorlevel%"=="0" exit /b %errorlevel%
 :patchmatch_ready
 python "%ROOT%\\dense_cache.py" complete --workspace "%WORKSPACE%"
 if not "%errorlevel%"=="0" exit /b %errorlevel%
-{after_patchmatch_cooldown}
 
 echo [3/8] Fusing dense point cloud...
 {fusion_command}
 if not "%errorlevel%"=="0" exit /b %errorlevel%
 python "%ROOT%\\reconstruction_stages.py" record-fusion --workspace "%WORKSPACE%"
 if not "%errorlevel%"=="0" exit /b %errorlevel%
-{after_fusion_cooldown}
 
 {point_filter_block}{mesh_block}{finalize_block}{completion_block}{quality_block}
 if exist "%WORKSPACE%\\dense\\final.ply" echo [done] Final dense model: %WORKSPACE%\\dense\\final.ply
@@ -1783,6 +1234,7 @@ echo [info] Running COLMAP automatic_reconstructor...
   --quality {quality} ^
   --dense 1
 if not "%errorlevel%"=="0" exit /b %errorlevel%
+echo [sparse-log] mapper complete run=%FYP_COLMAP_RUN_ID%
 
 python "%ROOT%\\colmap_workspace_check.py" --workspace "%WORKSPACE%" --record-sparse-complete
 if not "%errorlevel%"=="0" exit /b %errorlevel%
@@ -1817,7 +1269,6 @@ exit /b %errorlevel%
     write_text(workspace_dir / "reset_colmap_outputs.bat", content)
 
 
-
 @locked_workspace("workspace_dir")
 def prepare_colmap_workspace(
     root: Path,
@@ -1836,18 +1287,16 @@ def prepare_colmap_workspace(
     feature_max_image_size: int = 3200,
     max_num_features: int = 20000,
     max_num_matches: int = 131072,
-    load_profile: str = "max",
     colmap_num_threads: Optional[int] = None,
-    stage_cooldown_s: Optional[int] = None,
+    colmap_ba_gpu: str = 'auto',
+    sparse_strategy: str = 'all',
+    sparse_ba_growth_ratio: float = 1.1,
+    sparse_keyframe_gap_s: float = 1.0,
     dense_profile: str = "complete",
     run_meshing: bool = False,
     run_point_cloud_filter: bool = True,
-    constrained_point_window: int = 2,
-    constrained_slot_window: int = 3,
     constrained_max_pdr_distance_m: float = 12.0,
     constrained_video_frame_window: int = 6,
-    constrained_video_anchor_point_window: int = 2,
-    constrained_video_anchor_limit: int = 24,
     run_image_similarity: bool = True,
     image_similarity_max_pairs: int = 0,
     image_similarity_max_image_size: int = 900,
@@ -1858,11 +1307,34 @@ def prepare_colmap_workspace(
     scene_completion: str = "off",
     videoscene_max_clips: int = 3,
     videoscene_budget_hours: float = 4.,
-    pdr_capture_mode: str = "auto",
     image_similarity_workers: int = 0,
+    dense_max_images: Optional[int] = None,
+    dense_max_source_images: int = 12,
+    dense_coverage_policy: Optional[Dict[str, Any]] = None,
+    point_filter_method: str = "observed",
+    point_filter_max_candidates: int = 2000000,
+    point_filter_budget_seconds: float = 120.,
 ) -> Dict[str, Any]:
-    if pdr_capture_mode not in {"auto", "stationary", "off"}:
-        raise ValueError("Unknown PDR capture mode")
+    if dense_max_images is not None and dense_max_images != 0 and dense_max_images < 3:
+        raise ValueError("Dense view budget must be 0 or at least 3")
+    if not 2 <= dense_max_source_images <= 64:
+        raise ValueError("Dense source view budget must be in [2,64]")
+    selection_settings = None
+    if dense_max_images is not None:
+        selection_settings = {"enabled": True, "max_images": dense_max_images, "max_source_images": dense_max_source_images}
+        if dense_coverage_policy is not None:
+            selection_settings["coverage_policy"] = dict(dense_coverage_policy)
+        from dense_keyframes import selection_config
+        selection_config({"dense_selection_config": selection_settings})
+    elif dense_coverage_policy is not None:
+        raise ValueError("Adaptive dense coverage requires a dense view budget")
+    if point_filter_method not in {"observed", "wifi-density", "connected-density"}:
+        raise ValueError("Unknown point-cloud filter method")
+    if type(point_filter_max_candidates) is not int or not 1 <= point_filter_max_candidates <= 2000000 or not math.isfinite(point_filter_budget_seconds) or point_filter_budget_seconds <= 0:
+        raise ValueError("Invalid point-cloud observation budget")
+    effective_num_threads = 0 if colmap_num_threads is None else int(colmap_num_threads)
+    if effective_num_threads < 0:
+        raise ValueError("COLMAP thread count must be non-negative; use 0 for automatic selection")
     matcher = matcher if matcher in {"constrained", "hybrid", "exhaustive", "sequential"} else "constrained"
     if scene_completion == "videoscene" and not run_point_cloud_filter:
         raise ValueError("VideoScene completion requires point-cloud filtering")
@@ -1883,12 +1355,11 @@ def prepare_colmap_workspace(
     resolved_colmap_exe = find_colmap_exe(root, colmap_dir=colmap_dir, colmap_exe=colmap_exe)
     resolved_mask_dir = resolve_optional_path(root, colmap_mask_dir)
     dense_profile = dense_profile if dense_profile in DENSE_PROFILES else "balanced"
-    profile_config = DENSE_PROFILES[dense_profile]
-    load_profile, load_config, effective_num_threads, effective_stage_cooldown_s = resolve_load_settings(
-        load_profile,
-        colmap_num_threads,
-        stage_cooldown_s,
-    )
+    profile_config = {**DENSE_PROFILES[dense_profile],
+                      "patch_match": {**DENSE_PROFILES[dense_profile]["patch_match"],
+                                      "max_image_size": dense_max_image_size},
+                      "fusion": {**DENSE_PROFILES[dense_profile]["fusion"],
+                                 "max_image_size": dense_max_image_size}}
     effective_run_meshing = run_meshing and bool(profile_config.get("run_meshing", True))
 
     copied_images, image_names, missing_images, removed_stale_workspace_images = copy_images(
@@ -1912,34 +1383,22 @@ def prepare_colmap_workspace(
     )
     mask_summary = mask_dir_summary(resolved_mask_dir, image_names)
     if resolved_mask_dir is not None and (not mask_summary["enabled"] or (image_names and not mask_summary["matched_image_count"])):
-        raise ValueError("No usable mask paths: expected a mask directory containing <relative-image-name>.png, for example anchors/a.jpg.png")
+        raise ValueError("No usable mask paths: expected a mask directory containing <relative-image-name>.png, for example video/a.jpg.png")
     active_mask_dir = resolved_mask_dir if mask_summary.get("enabled") else None
     write_image_list(workspace_dir, image_names)
-    if visual_only:
-        # Checkpoint grouping/order is sensor-derived metadata, even when PDR
-        # distances are ignored. A visual baseline must not use those pairs.
-        match_pairs, match_edge_rows = [], []
-        match_pair_summary = {"reason_counts": {}, "visual_only": True,
-                              "candidate_basis": "appearance_retrieval_only"}
-    else:
-        match_pairs, match_edge_rows, match_pair_summary = build_constrained_match_pairs(
-            manifest_rows=workspace_manifest_rows,
-            point_window=constrained_point_window,
-            slot_window=constrained_slot_window,
-            max_pdr_distance_m=constrained_max_pdr_distance_m,
-            video_frame_window=constrained_video_frame_window,
-            video_anchor_point_window=constrained_video_anchor_point_window,
-            video_anchor_limit=constrained_video_anchor_limit,
-            visual_only=False,
-        )
+    match_pairs, match_edge_rows, match_pair_summary = build_constrained_match_pairs(
+        workspace_manifest_rows, constrained_video_frame_window, visual_only)
+    from video_sensor_matching import build_video_sensor_candidates
+    sensor_edges, video_sensor_summary = build_video_sensor_candidates(
+        workspace_manifest_rows, match_pairs, enabled=not visual_only and run_image_similarity,
+        wifi_enabled=wifi_recovery_enabled, route_distance_m=constrained_max_pdr_distance_m,
+        fuzzy_context_path=workspace_dir / "metadata" / "video_sensor_fuzzy_context.json",
+    )
+    match_edge_rows.extend(sensor_edges)
+    match_pairs = sorted(set(match_pairs) | {(row["image_a"], row["image_b"]) for row in sensor_edges})
+    match_pair_summary["video_sensor_assistance"] = video_sensor_summary
     route_pair_count = len(match_pairs)
     write_named_match_pairs(workspace_dir, "match_pairs_route.txt", match_pairs)
-    wifi_edges, wifi_recovery_summary = build_wifi_recovery_edges(
-        workspace_manifest_rows, match_pairs,
-        enabled=wifi_recovery_enabled and not visual_only and run_image_similarity,
-    )
-    match_edge_rows.extend(wifi_edges)
-    match_pairs = sorted(set(match_pairs) | {(row["image_a"], row["image_b"]) for row in wifi_edges})
     if run_image_similarity:
         try:
             image_similarity_summary = analyze_workspace_image_similarity(
@@ -1996,16 +1455,20 @@ def prepare_colmap_workspace(
         similarity_summary=image_similarity_summary,
     )
     write_match_pairs(workspace_dir, colmap_match_pairs)
-    wifi_recovery_summary.update({
-        "selected_image_pair_count": match_pair_filter_summary["selected_wifi_recovery_pair_count"],
-        "pair_list_used_by_sparse_matcher": matcher in {"constrained", "hybrid"},
-    })
-    write_json(workspace_dir / "wifi_recovery_summary.json", wifi_recovery_summary)
     match_pair_filter_summary.update({
         "matcher": matcher,
         "pair_list_used_by_sparse_matcher": matcher in {"constrained", "hybrid"},
         "pair_gate_enforced": matcher == "constrained",
     })
+    video_sensor_summary.update(
+        selected_pair_count=match_pair_filter_summary["selected_video_sensor_pair_count"],
+        selected_fuzzy_pair_count=match_pair_filter_summary["selected_fuzzy_sensor_pair_count"],
+        pair_list_used_by_sparse_matcher=matcher in {"constrained", "hybrid"},
+    )
+    if video_sensor_summary.get("candidate_pair_count"):
+        print(f"[sensors] Proposed {video_sensor_summary['candidate_pair_count']} sensor pairs; "
+              f"{video_sensor_summary['selected_pair_count']} passed visual geometry "
+              f"({video_sensor_summary['selected_fuzzy_pair_count']} from fuzzy time windows).", flush=True)
     write_match_pair_filter(workspace_dir, match_pair_filter_rows, match_pair_filter_summary)
     match_pair_summary.update(
         {
@@ -2013,7 +1476,7 @@ def prepare_colmap_workspace(
             "pair_count": len(match_pairs),
             "route_candidate_pair_count": route_pair_count,
             "visual_recovery_candidate_pair_count": len(recovery_edges),
-            "wifi_recovery": wifi_recovery_summary,
+            "wifi_recovery": video_sensor_summary,
             "weight_statistics_scope": "route_candidates_only",
             "colmap_pair_count": len(colmap_match_pairs),
             "p1_pair_filter": match_pair_filter_summary,
@@ -2021,8 +1484,6 @@ def prepare_colmap_workspace(
     )
     if recovery_edges:
         match_pair_summary["reason_counts"]["visual_recovery"] = len(recovery_edges)
-    if wifi_edges:
-        match_pair_summary["reason_counts"]["wifi_fingerprint_recovery"] = len(wifi_edges)
     image_similarity_summary["used_for_colmap_pair_selection"] = (
         match_pair_filter_summary.get("status") == "applied" and matcher in {"constrained", "hybrid"}
     )
@@ -2030,12 +1491,8 @@ def prepare_colmap_workspace(
     write_json(workspace_dir / "image_similarity_summary.json", image_similarity_summary)
     if not colmap_match_pairs and matcher in {"constrained", "hybrid"}:
         raise ValueError("No supported match pairs remain. Inspect match_pair_filter_summary.json and image coverage before reconstruction.")
-    align_to_pdr = not visual_only
-    if align_to_pdr:
-        pdr_alignment_ref_count = write_pdr_alignment_refs(workspace_dir, workspace_manifest_rows)
-    else:
-        remove_pdr_alignment_refs(workspace_dir)
-        pdr_alignment_ref_count = 0
+    align_to_pdr = not visual_only  # Also controls optional sensor boundary reporting.
+    remove_pdr_alignment_refs(workspace_dir)
 
     write_sparse_batch(
         root=root,
@@ -2049,11 +1506,13 @@ def prepare_colmap_workspace(
         matcher=matcher,
         align_to_pdr=align_to_pdr,
         feature_max_image_size=feature_max_image_size,
-        pdr_capture_mode=pdr_capture_mode,
         max_num_features=max_num_features,
         max_num_matches=max_num_matches,
         num_threads=effective_num_threads,
-        stage_cooldown_s=effective_stage_cooldown_s,
+        ba_gpu=colmap_ba_gpu,
+        sparse_strategy=sparse_strategy,
+        sparse_ba_growth_ratio=sparse_ba_growth_ratio,
+        sparse_keyframe_gap_s=sparse_keyframe_gap_s,
     )
     write_dense_batch(
         root=root,
@@ -2066,10 +1525,13 @@ def prepare_colmap_workspace(
         run_meshing=run_meshing,
         run_point_cloud_filter=run_point_cloud_filter,
         num_threads=effective_num_threads,
-        stage_cooldown_s=effective_stage_cooldown_s,
         scene_completion=scene_completion,
         videoscene_max_clips=videoscene_max_clips,
         videoscene_budget_hours=videoscene_budget_hours,
+        dense_selection_enabled=dense_max_images is not None,
+        point_filter_method=point_filter_method,
+        point_filter_max_candidates=point_filter_max_candidates,
+        point_filter_budget_seconds=point_filter_budget_seconds,
     )
     write_full_batch(workspace_dir, root=root)
     write_automatic_batch(
@@ -2114,12 +1576,14 @@ def prepare_colmap_workspace(
         "use_gpu": use_gpu,
         "matcher": matcher,
         "visual_only": visual_only,
-        "pdr_alignment_enabled": align_to_pdr and pdr_capture_mode != "off",
-        "pdr_capture_mode": pdr_capture_mode,
-        "pdr_alignment_policy": "weighted_stationary_checkpoint_consensus_and_held_out_validation",
+        "pdr_alignment_enabled": False,
+        "pdr_capture_mode": "off",
+        "pdr_alignment_policy": "visual_geometry_with_soft_sensor_matching",
         "pdr_alignment_decision": "pdr_alignment_decision.json",
         "wifi_recovery_enabled": wifi_recovery_enabled and not visual_only and run_image_similarity,
-        "visual_pairing_mode": "appearance_only" if visual_only else "appearance_plus_route",
+        "visual_pairing_mode": ("video_order_plus_appearance" if visual_only else "video_order_appearance_and_sensor_candidates"),
+        "input_mode": "video_only",
+        "video_sensor_assistance": video_sensor_summary,
         "image_similarity_config": {
             "enabled": run_image_similarity, "max_pairs": image_similarity_max_pairs,
             "max_image_size": image_similarity_max_image_size, "orb_features": image_similarity_orb_features,
@@ -2127,28 +1591,30 @@ def prepare_colmap_workspace(
             "min_visual_score": image_similarity_min_visual_score, "recovery_neighbors": visual_recovery_neighbors,
         },
         "constrained_pairing_config": {
-            "point_window": constrained_point_window, "slot_window": constrained_slot_window,
             "max_pdr_distance_m": constrained_max_pdr_distance_m,
             "video_frame_window": constrained_video_frame_window,
-            "video_anchor_point_window": constrained_video_anchor_point_window,
-            "video_anchor_limit": constrained_video_anchor_limit,
         },
         "feature_max_image_size": feature_max_image_size,
         "max_num_features": max_num_features,
         "max_num_matches": max_num_matches,
-        "load_profile": load_profile,
-        "load_profile_config": load_config,
         "colmap_num_threads": effective_num_threads,
-        "stage_cooldown_s": effective_stage_cooldown_s,
+        "colmap_ba_gpu": colmap_ba_gpu,
+        "sparse_strategy": sparse_strategy,
+        "sparse_ba_growth_ratio": sparse_ba_growth_ratio,
+        "sparse_keyframe_gap_s": sparse_keyframe_gap_s,
+        "execution_backend": "portable_stage_v1",
         "constrained_match_pairs": match_pair_summary,
         "match_graph_edges": "match_graph_edges.csv",
         "image_similarity": image_similarity_summary,
         "image_similarity_edges": "image_similarity_edges.csv",
-        "pdr_alignment_ref_count": pdr_alignment_ref_count,
         "quality": quality,
         "dense_max_image_size": dense_max_image_size,
         "dense_profile": dense_profile,
         "dense_profile_config": profile_config,
+        **({"dense_selection_config": selection_settings} if selection_settings is not None else {}),
+        "point_filter_config": {"method": point_filter_method,
+                                "max_candidates": point_filter_max_candidates,
+                                "budget_seconds": point_filter_budget_seconds},
         "run_meshing": effective_run_meshing,
         "run_point_cloud_filter": run_point_cloud_filter,
         "scene_completion": scene_completion,

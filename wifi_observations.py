@@ -3,12 +3,8 @@
 from __future__ import annotations
 
 import math
-import csv
 import json
-from collections import defaultdict
-from pathlib import Path
-from statistics import median
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 
 MAX_WIFI_AGE_MS = 5000
@@ -51,8 +47,8 @@ def visible_fingerprint(row: Mapping[str, Any]) -> dict[str, float]:
 def valid_fingerprint(row: Mapping[str, Any]) -> bool:
     """Validate the RF measurement at scan time, independently of capture delay.
 
-    Checkpoint association is established by image_mapping. wifi_gap_ms is
-    diagnostic: elapsed time alone does not invalidate a same-location capture.
+    Video association is checked by the video/sensor synchronization layer.
+    Measurement freshness alone does not establish a camera position.
     """
     if row.get("wifi_observation_status") != "fresh":
         return False
@@ -80,23 +76,7 @@ def measurement_gap_ms(row: Mapping[str, Any], target_ms: int) -> float:
 
 def fingerprint_confidence(row: Mapping[str, Any]) -> float:
     """Confidence for retrieval/positioning; strict fresh validity remains separate."""
-    if row.get("wifi_observation_status") == "aggregated_checkpoint":
-        value = finite_number(row.get("wifi_confidence"))
-        if len(visible_fingerprint(row)) >= 2 and math.isfinite(value):
-            return max(0.0, min(1.0, value))
-        return 0.0
     return 1.0 if valid_fingerprint(row) else 0.0
-
-
-def weighted_median(samples: list[tuple[float, float]]) -> float:
-    ordered = sorted(samples)
-    halfway = sum(weight for _, weight in ordered) / 2
-    accumulated = 0.0
-    for value, weight in ordered:
-        accumulated += weight
-        if accumulated >= halfway:
-            return value
-    return ordered[-1][0]
 
 
 def fingerprint_similarity(a: Mapping[str, Any], b: Mapping[str, Any], scale_db: float = 12.0) -> dict:
@@ -132,91 +112,134 @@ def fingerprint_similarity(a: Mapping[str, Any], b: Mapping[str, Any], scale_db:
     return {**result, "score": score, "rssi_rms_db": rms, "decision": "ranked_candidate_requires_visual_geometry"}
 
 
-def aggregate_checkpoint_fingerprints(path: Path, points: list[Any]) -> tuple[dict, dict]:
-    """Deduplicate raw AP observations, then form confidence-weighted point summaries.
+def fingerprint_sequence_context(
+    a: Mapping[str, Any], b: Mapping[str, Any],
+    checkpoints: Iterable[Mapping[str, Any]], *, scale_db: float = 12.0,
+) -> dict:
+    """Bounded retrieval adjustment from independent neighboring RF observations.
 
-    A measurement is owned by one checkpoint only. Uncertain nearest-checkpoint
-    assignment is explicitly weaker than a recorded stationary interval. Cached
-    repeats cannot increase confidence, and missing AP values are never invented.
+    Only an already valid RF pair can receive context. One predecessor and one
+    successor are considered in both traversal directions; missing stops are
+    never bridged. Distinct AP IDs from the same scan are not independent stops.
+    The multiplier is at most +/-15%, halved with only one usable flank, and
+    attenuated by the weakest fingerprint confidence. It is not a pose weight,
+    a physical distance, or evidence that a visual loop has been established.
     """
-    summary = {"unique_measurements": 0, "assigned_measurements": 0,
-               "unassigned_measurements": 0, "aggregated_points": 0,
-               "max_association_gap_ms": 120000,
-               "policy": "unique_AP_timestamp_weighted_median_soft_checkpoint_assignment"}
-    if not path.exists():
-        return {}, {**summary, "status": "missing_raw_observations"}
-    by_session = defaultdict(list)
-    for point in points:
-        by_session[point.session].append(point)
-    unique = {}
-    with path.open(newline="", encoding="utf-8") as handle:
-        for row in csv.DictReader(handle):
-            timestamp = finite_number(row.get("ap_elapsed_ts"))
-            logged = finite_number(row.get("scan_elapsed_ts"))
-            rssi = finite_number(row.get("rssi"))
-            if not row.get("mac") or not row.get("session") or not (
-                math.isfinite(timestamp) and timestamp >= 0 and math.isfinite(logged)
-                and logged >= timestamp and MISSING_RSSI < rssi < 0
-            ):
+    neutral = dict(status="neutral", reason="insufficient_independent_context",
+                   multiplier=1.0, direction=None, support=None,
+                   usable_neighbor_pairs=0, independent_observation_count=0,
+                   neighbor_pairs=[])
+    try:
+        base = fingerprint_similarity(a, b, scale_db)
+    except (TypeError, ValueError):
+        return {**neutral, "reason": "invalid_fingerprint_metadata"}
+    if not math.isfinite(base["score"]) or base["score"] <= 0:
+        return {**neutral, "reason": "no_valid_central_rf_pair"}
+
+    session = a.get("session")
+
+    def point_index(row):
+        value = finite_number(row.get("global_point_index"))
+        return int(value) if math.isfinite(value) and value > 0 and value.is_integer() else None
+
+    def observation(row):
+        if row is None or row.get("session") != session:
+            return None
+        timestamp = finite_number(row.get("point_elapsed_ts"))
+        confidence = fingerprint_confidence(row)
+        visible = visible_fingerprint(row)
+        if not math.isfinite(timestamp) or timestamp < 0 or confidence <= 0:
+            return None
+        try:
+            ids = json.loads(row.get("wifi_measurement_ids") or "[]")
+            if not isinstance(ids, list) or not ids:
+                return None
+            measurements = set()
+            for identity in ids:
+                observed_session, mac, raw_time = identity.rsplit("|", 2)
+                measured = int(raw_time)
+                if observed_session != session or measured < 0 or "ap_" + mac not in visible:
+                    return None
+                measurements.add((mac, measured))
+        except (AttributeError, TypeError, ValueError):
+            return None
+        if len({mac for mac, _ in measurements}) < MIN_WIFI_APS:
+            return None
+        start, end = min(t for _, t in measurements), max(t for _, t in measurements)
+        if (start != finite_number(row.get("wifi_measurement_min_elapsed_ts"))
+                or end != finite_number(row.get("wifi_measurement_max_elapsed_ts"))
+                or max(abs(start - timestamp), abs(end - timestamp)) > 120000):
+            return None
+        return dict(start=start, end=end, confidence=confidence)
+
+    def independent(observations):
+        ordered = sorted(observations, key=lambda item: item["start"])
+        # Conservative scan-level guard: changing AP names cannot turn reused
+        # timestamps, overlapping windows or one scan burst into new evidence.
+        return all(right["start"] - left["end"] > MAX_WIFI_AGE_MS
+                   for left, right in zip(ordered, ordered[1:]))
+
+    left_index, right_index = point_index(a), point_index(b)
+    left_observation, right_observation = observation(a), observation(b)
+    if (left_index is None or right_index is None or left_index == right_index
+            or left_observation is None or right_observation is None
+            or not independent([left_observation, right_observation])):
+        return {**neutral, "reason": "central_observation_independence_unavailable"}
+    by_index = {}
+    for row in checkpoints:
+        if row.get("session") == session and (index := point_index(row)) is not None:
+            # Multiple representatives for a stop make its sequence ambiguous.
+            by_index[index] = None if index in by_index else row
+    if by_index.get(left_index) is None or by_index.get(right_index) is None:
+        return {**neutral, "reason": "ambiguous_checkpoint_order"}
+
+    def neighbor(center, index, offset):
+        row = by_index.get(index + offset)
+        if row is None:
+            return None
+        gap = offset * (finite_number(row.get("point_elapsed_ts"))
+                        - finite_number(center.get("point_elapsed_ts")))
+        return row if math.isfinite(gap) and 0 < gap <= 180000 else None
+
+    def observed_in_order(center, other, offset):
+        gap = other["start"] - center["end"] if offset > 0 else center["start"] - other["end"]
+        return MAX_WIFI_AGE_MS < gap <= 180000
+
+    candidates = []
+    for direction in (1, -1):
+        observations = [left_observation, right_observation]
+        pairs = []
+        for offset in (-1, 1):
+            left = neighbor(a, left_index, offset)
+            right = neighbor(b, right_index, offset * direction)
+            lo, ro = observation(left), observation(right)
+            if (lo is None or ro is None
+                    or not observed_in_order(left_observation, lo, offset)
+                    or not observed_in_order(right_observation, ro, offset * direction)
+                    or not independent([left_observation, right_observation, lo, ro])):
                 continue
-            key = (row["session"], row["mac"], int(timestamp))
-            age = logged - timestamp
-            if key not in unique or age < unique[key][1]:
-                unique[key] = (rssi, age)
-    summary["unique_measurements"] = len(unique)
-    groups = defaultdict(list)
-    for (session, mac, timestamp), (rssi, age) in unique.items():
-        candidates = by_session.get(session, [])
-        if not candidates:
+            try:
+                similarity = fingerprint_similarity(left, right, scale_db)
+            except (TypeError, ValueError):
+                continue
+            if (similarity["decision"] != "ranked_candidate_requires_visual_geometry"
+                    or similarity["shared_aps"] < MIN_WIFI_APS):
+                continue
+            shape = similarity["score"] / math.sqrt(lo["confidence"] * ro["confidence"])
+            if not math.isfinite(shape):
+                continue
+            pairs.append(dict(left_checkpoint=point_index(left), right_checkpoint=point_index(right),
+                              support=max(0.0, min(1.0, shape))))
+            observations.extend((lo, ro))
+        if not pairs or not independent(observations):
             continue
-        stationary = [p for p in candidates if p.stationary_end_elapsed_ts is not None
-                      and p.elapsed_ts <= timestamp < p.stationary_end_elapsed_ts]
-        point = min(stationary or candidates, key=lambda p: abs(p.elapsed_ts - timestamp))
-        gap = abs(point.elapsed_ts - timestamp)
-        if not stationary and gap > summary["max_association_gap_ms"]:
-            continue
-        association = 1.0 if stationary else 0.9 if gap <= MAX_WIFI_AGE_MS else 0.65 * math.exp(-gap / 60000)
-        weight = association * math.exp(-age / 60000)
-        if weight < 1e-6:
-            continue
-        groups[point.global_point_index].append((mac, timestamp, rssi, age, weight, bool(stationary), gap))
-    result = {}
-    for point in points:
-        samples = groups.get(point.global_point_index, [])
-        if not samples:
-            continue
-        per_ap = defaultdict(list)
-        for sample in samples:
-            per_ap[sample[0]].append(sample)
-        row = {}
-        reliability = {}
-        for mac, values in per_ap.items():
-            rssi = weighted_median([(v[2], v[4]) for v in values])
-            mad = median(abs(v[2] - rssi) for v in values)
-            field = f"ap_{mac}"
-            row[field] = round(rssi, 3)
-            reliability[field] = round(sum(v[4] for v in values) / len(values) / (1 + mad / 6), 6)
-        times = [v[1] for v in samples]
-        confidence = sum(reliability.values()) / len(reliability) * min(1.0, len(per_ap) / 6)
-        all_stationary = all(v[5] for v in samples)
-        row.update({
-            "wifi_observation_status": "aggregated_checkpoint",
-            "wifi_confidence": round(confidence, 6),
-            "wifi_measurement_min_elapsed_ts": min(times),
-            "wifi_measurement_max_elapsed_ts": max(times),
-            "wifi_unique_measurement_count": len(samples),
-            "wifi_measurement_ids": json.dumps([f"{point.session}|{v[0]}|{v[1]}" for v in samples]),
-            "wifi_ap_reliability": json.dumps(reliability, sort_keys=True),
-            "wifi_fresh_ap_count": len({v[0] for v in samples if v[3] <= MAX_WIFI_AGE_MS}),
-            "wifi_max_age_ms": max(v[3] for v in samples),
-            "wifi_gap_ms": max(v[6] for v in samples),
-            "wifi_association_basis": "aggregated_stationary" if all_stationary else "aggregated_soft_checkpoint",
-            "wifi_stationary_start_elapsed_ts": point.elapsed_ts if all_stationary else "",
-            "wifi_stationary_end_elapsed_ts": point.stationary_end_elapsed_ts if all_stationary else "",
-            "elapsed_ts": "", "epoch_ts": "", "scan_index": "",
-        })
-        result[point.global_point_index] = row
-        summary["assigned_measurements"] += len(samples)
-    summary["unassigned_measurements"] = len(unique) - summary["assigned_measurements"]
-    summary["aggregated_points"] = sum(fingerprint_confidence(row) > 0 for row in result.values())
-    return result, {**summary, "status": "ok"}
+        support = sum(pair["support"] for pair in pairs) / len(pairs)
+        confidence = min(item["confidence"] for item in observations)
+        multiplier = 1.0 + .15 * (len(pairs) / 2) * confidence * (2 * support - 1)
+        candidates.append(dict(status="applied", reason="independent_neighbor_rf_context",
+                               multiplier=round(multiplier, 6),
+                               direction="forward" if direction == 1 else "reverse",
+                               support=round(support, 6), usable_neighbor_pairs=len(pairs),
+                               independent_observation_count=len(observations), neighbor_pairs=pairs))
+    # Prefer the better-supported traversal; deterministic forward tie-break.
+    return max(candidates, key=lambda item: (item["support"], item["usable_neighbor_pairs"])) if candidates else neutral

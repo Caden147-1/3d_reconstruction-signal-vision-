@@ -14,6 +14,7 @@ import tempfile
 import numpy as np
 
 from ply_io import PLY_TYPES, parse_ply_header, validate_ply
+from progress_output import WorkProgress
 
 
 BLOCK_SIZE = 250000
@@ -54,6 +55,36 @@ def positions(vertices):
     return np.column_stack([vertices[axis] for axis in "xyz"]).astype(np.float64)
 
 
+def sample_original_vertices(input_path: Path, source_count: int, max_candidates: int):
+    """Collect a bounded deterministic sample independent of reader chunk size.
+
+    Unsampled points have no geometry verdict. Keeping original indices allows
+    a conservative caller to retain them while excluding only measured conflicts.
+    """
+    if type(max_candidates) is not int or not 0 <= max_candidates <= 2000000:
+        raise ValueError('Observation candidate budget must be between 0 and 2000000')
+    if source_count <= 0:
+        raise ValueError('An observed surface requires original vertices')
+    stride = max(1, (source_count + max_candidates - 1) // max_candidates) if max_candidates else None
+    samples, indices, offset, dtype = [], [], 0, None
+    with WorkProgress('Sampling original observations', source_count, unit='points') as progress:
+        for chunk in vertex_chunks(input_path):
+            dtype = chunk.dtype
+            if not np.isfinite(positions(chunk)).all():
+                raise ValueError('Non-finite input geometry')
+            if stride is not None:
+                local = np.arange((-offset) % stride, len(chunk), stride, dtype=np.int64)
+                if len(local):
+                    samples.append(chunk[local].copy())
+                    indices.append(local + offset)
+            offset += len(chunk)
+            progress.update(offset)
+    if offset != source_count:
+        raise ValueError('Original point count changed while sampling observations')
+    return (np.concatenate(samples) if samples else np.empty(0, dtype=dtype),
+            np.concatenate(indices) if indices else np.empty(0, dtype=np.int64), stride)
+
+
 def statistics_sample(input_path: Path, source_count: int, max_samples: int = 250000):
     """Copy selected XYZ rows into a bounded buffer; never retain chunk views."""
     if source_count <= 0 or max_samples <= 0:
@@ -61,13 +92,15 @@ def statistics_sample(input_path: Path, source_count: int, max_samples: int = 25
     stride = max(1, (source_count + max_samples - 1) // max_samples)
     sample = np.empty(((source_count + stride - 1) // stride, 3), dtype=np.float64)
     start, count, finite_count = 0, 0, 0
-    for chunk in vertex_chunks(input_path):
-        xyz = positions(chunk)
-        finite_count += int(np.isfinite(xyz).all(1).sum())
-        selected = xyz[(-start) % stride::stride]
-        sample[count:count + len(selected)] = selected
-        count += len(selected)
-        start += len(chunk)
+    with WorkProgress('Measuring cloud statistics', source_count, unit='points') as progress:
+        for chunk in vertex_chunks(input_path):
+            xyz = positions(chunk)
+            finite_count += int(np.isfinite(xyz).all(1).sum())
+            selected = xyz[(-start) % stride::stride]
+            sample[count:count + len(selected)] = selected
+            count += len(selected)
+            start += len(chunk)
+            progress.update(start)
     if start != source_count:
         raise ValueError("Input vertex count changed during statistics sampling")
     return sample[:count][np.isfinite(sample[:count]).all(1)], stride, finite_count
@@ -86,19 +119,25 @@ def connected_core(grid, threshold):
     keys = np.argwhere(grid >= threshold)
     remaining = {tuple(map(int, key)) for key in keys}
     components = []
-    while remaining:
-        seed = remaining.pop()
-        stack, members, weight = [seed], [], 0
-        while stack:
-            key = stack.pop()
-            members.append(key)
-            weight += int(grid[key])
-            for offset in OFFSETS:
-                other = tuple(key[a] + offset[a] for a in range(3))
-                if other in remaining:
-                    remaining.remove(other)
-                    stack.append(other)
-        components.append((weight, members))
+    visited = 0
+    with WorkProgress('Finding connected density surfaces', len(keys), unit='cells') as progress:
+        while remaining:
+            seed = remaining.pop()
+            stack, members, weight = [seed], [], 0
+            while stack:
+                key = stack.pop()
+                members.append(key)
+                weight += int(grid[key])
+                for offset in OFFSETS:
+                    other = tuple(key[a] + offset[a] for a in range(3))
+                    if other in remaining:
+                        remaining.remove(other)
+                        stack.append(other)
+                if len(members) % 4096 == 0:
+                    progress.update(visited + len(members))
+            components.append((weight, members))
+            visited += len(members)
+            progress.update(visited)
     if not components:
         raise ValueError("No density-supported surface component")
     # Lexical tie-break is independent of set traversal order.
@@ -128,12 +167,57 @@ def expand_mask(core, halo):
     return result
 
 
+def observation_rescue_indices(input_path, density_selection, candidate_count,
+                               protect, max_candidates, vertex_keep=None):
+    """Assess a bounded, file-wide sample once; retain exact source indices.
+
+    A skipped candidate is not an observed conflict. Sparse indices also avoid
+    allocating one evidence record per point in a large fused cloud.
+    """
+    if not isinstance(max_candidates, int) or not 1 <= max_candidates <= 2000000:
+        raise ValueError('Observation candidate budget must be between 1 and 2000000')
+    stride = max(1, (candidate_count + max_candidates - 1) // max_candidates)
+    rescued = []
+    source_offset = candidate_offset = assessed = vetoed = 0
+    sample_count = (candidate_count + stride - 1) // stride
+    with WorkProgress('Checking density-rejected observations', sample_count, unit='points') as progress:
+        for chunk in vertex_chunks(input_path):
+            candidates = np.flatnonzero(np.isfinite(positions(chunk)).all(1) & ~density_selection(chunk))
+            selected = candidates[(-candidate_offset) % stride::stride]
+            candidate_offset += len(candidates)
+            for start in range(0, len(selected), 16384):
+                indices = selected[start:start+16384]
+                subset = chunk[indices]
+                supported = np.asarray(protect(subset))
+                if supported.dtype != np.bool_ or supported.shape != (len(subset),):
+                    raise ValueError('Observation protection must return one boolean per original vertex')
+                assessed += len(subset)
+                if vertex_keep is not None and supported.any():
+                    keep = np.asarray(vertex_keep(subset))
+                    if keep.dtype != np.bool_ or keep.shape != supported.shape:
+                        raise ValueError('Vertex evidence must return one boolean per original vertex')
+                    vetoed += int(np.count_nonzero(supported & ~keep))
+                    supported &= keep
+                if supported.any():
+                    rescued.append(indices[supported] + source_offset)
+                progress.update(assessed)
+            source_offset += len(chunk)
+    if candidate_offset != candidate_count or assessed > max_candidates:
+        raise ValueError('Density candidates changed during observation protection')
+    indices = np.concatenate(rescued) if rescued else np.empty(0, dtype=np.int64)
+    return indices, dict(candidate_count=candidate_count, candidate_budget=max_candidates,
+                         sampling_stride=stride, assessed_candidate_count=assessed,
+                         unevaluated_candidate_count=candidate_count-assessed,
+                         rescued_vertex_count=len(indices), cached_conflict_veto_count=vetoed)
+
+
 def filter_connected_cloud(input_path: Path, output_path: Path, summary_path: Path | None,
                            max_points: int = 0, bbox_quantile: float = .001,
                            bbox_padding_ratio: float = .05, cell_ratio: float = .0025,
                            core_quantile: float = .15, support_halo: int = 1,
                            *, spatial_support=None, spatial_penalty: float = 1.,
-                           vertex_keep=None):
+                           vertex_keep=None, vertex_protect=None,
+                           observation_max_candidates: int = 250000):
     if input_path.resolve() == output_path.resolve():
         raise ValueError("Input must be preserved separately from filtered output")
     if not 0 <= bbox_quantile < .2 or not 0 <= bbox_padding_ratio <= 1:
@@ -176,9 +260,13 @@ def filter_connected_cloud(input_path: Path, output_path: Path, summary_path: Pa
         return chunk[mask]
 
     print(f"[filter] Counting all {source_count:,} points in the density grid...", flush=True)
-    for chunk in vertex_chunks(input_path):
-        _, keys = grid_keys(positions(chunk), low, high, cell, shape)
-        np.add.at(grid, tuple(keys.T), 1)
+    with WorkProgress('Counting density-grid observations', source_count, unit='points') as progress:
+        scanned = 0
+        for chunk in vertex_chunks(input_path):
+            _, keys = grid_keys(positions(chunk), low, high, cell, shape)
+            np.add.at(grid, tuple(keys.T), 1)
+            scanned += len(chunk)
+            progress.update(scanned)
     bbox_count = int(grid.sum())
 
     # A point-weighted occupancy percentile avoids treating many empty/sparse
@@ -195,20 +283,51 @@ def filter_connected_cloud(input_path: Path, output_path: Path, summary_path: Pa
     support = expand_mask(core, support_halo)
     density_supported_count = int(grid[support].sum())
 
-    def supported_chunks():
+    def density_selection(chunk):
+        good, keys = grid_keys(positions(chunk), low, high, cell, shape)
+        selected = np.zeros(len(chunk), dtype=bool)
+        selected[good] = support[tuple(keys.T)]
+        return selected
+
+    rescued = np.empty(0, dtype=np.int64)
+    protection = dict(status='not_requested', candidate_count=finite_count-density_supported_count,
+                      assessed_candidate_count=0, unevaluated_candidate_count=finite_count-density_supported_count,
+                      rescued_vertex_count=0)
+    if vertex_protect is not None:
+        rescued, protection = observation_rescue_indices(
+            input_path, density_selection, finite_count-density_supported_count,
+            vertex_protect, observation_max_candidates, vertex_keep)
+        protection['status'] = 'bounded_observation_assessment'
+        print(f"[filter] Observation protection rescued {len(rescued):,} original points; "
+              f"assessed {protection['assessed_candidate_count']:,}/{protection['candidate_count']:,} density rejects.", flush=True)
+
+    def supported_chunks(progress=None):
+        offset = 0
         for chunk in vertex_chunks(input_path):
-            good, keys = grid_keys(positions(chunk), low, high, cell, shape)
-            yield eligible_vertices(chunk[good][support[tuple(keys.T)]])
+            selected = density_selection(chunk)
+            lo, hi = np.searchsorted(rescued, [offset, offset+len(chunk)])
+            selected[rescued[lo:hi]-offset] = True
+            yield eligible_vertices(chunk[selected])
+            offset += len(chunk)
+            if progress is not None:
+                progress.update(offset)
 
     # Apply observation evidence after density selection: a conflict veto must
     # not shift density thresholds and thereby remove other supported surfaces.
-    supported_count = (sum(len(chunk) for chunk in supported_chunks()) if vertex_keep is not None
-                       else density_supported_count)
-    evidence_excluded = density_supported_count - supported_count
+    if vertex_keep is not None:
+        with WorkProgress('Checking retained observation evidence', source_count, unit='points') as progress:
+            supported_count = sum(len(chunk) for chunk in supported_chunks(progress))
+    else:
+        supported_count = density_supported_count + len(rescued)
+    evidence_excluded = density_supported_count + len(rescued) - supported_count
     retained_ratio = supported_count / finite_count if finite_count else 0
     if retained_ratio < .5:
         raise ValueError(f"Density selection retains only {retained_ratio:.1%}; inspect parameters before promotion")
     target = min(max_points, supported_count) if max_points else supported_count
+    protection.update(rescued_before_export_budget_count=len(rescued),
+                      density_rejected_unrescued_count=finite_count-density_supported_count-len(rescued),
+                      published_rescued_vertex_count=len(rescued) if target == supported_count else None,
+                      export_budget_applies_to_rescued_points=target < supported_count)
     print(f"[filter] Supported {supported_count:,}/{source_count:,}; writing {target:,} observed points...", flush=True)
 
     # Random priorities produce a uniform sample *after* geometry selection.
@@ -217,16 +336,17 @@ def filter_connected_cloud(input_path: Path, output_path: Path, summary_path: Pa
     if target < supported_count:
         rng = np.random.default_rng(0)
         selected_keys = np.empty(0)
-        for chunk in supported_chunks():
-            priorities = rng.random(len(chunk))
-            if len(selected_keys) == target:
-                eligible = priorities < selected_keys.max()
-                priorities, chunk = priorities[eligible], chunk[eligible]
-            selected_keys = np.concatenate((selected_keys, priorities))
-            selected = chunk.copy() if selected is None else np.concatenate((selected, chunk))
-            if len(selected_keys) > target:
-                take = np.argpartition(selected_keys, target-1)[:target]
-                selected_keys, selected = selected_keys[take], selected[take]
+        with WorkProgress('Sampling retained observations', source_count, unit='points') as progress:
+            for chunk in supported_chunks(progress):
+                priorities = rng.random(len(chunk))
+                if len(selected_keys) == target:
+                    eligible = priorities < selected_keys.max()
+                    priorities, chunk = priorities[eligible], chunk[eligible]
+                selected_keys = np.concatenate((selected_keys, priorities))
+                selected = chunk.copy() if selected is None else np.concatenate((selected, chunk))
+                if len(selected_keys) > target:
+                    take = np.argpartition(selected_keys, target-1)[:target]
+                    selected_keys, selected = selected_keys[take], selected[take]
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(dir=output_path.parent, prefix="filtered-", suffix=".tmp", delete=False) as handle:
@@ -239,9 +359,11 @@ def filter_connected_cloud(input_path: Path, output_path: Path, summary_path: Pa
             lines.extend(f"property {kind} {name}" for name, kind in header["vertex_properties"])
             handle.write(("\n".join(lines) + "\nend_header\n").encode("ascii"))
             written = 0
-            for chunk in ([selected] if selected is not None else supported_chunks()):
-                chunk.astype(chunk.dtype.newbyteorder("<"), copy=False).tofile(handle)
-                written += len(chunk)
+            with WorkProgress('Writing filtered observations', target, unit='points') as progress:
+                for chunk in ([selected] if selected is not None else supported_chunks()):
+                    chunk.astype(chunk.dtype.newbyteorder("<"), copy=False).tofile(handle)
+                    written += len(chunk)
+                    progress.update(written)
         if written != target:
             raise ValueError("Output count changed during streaming")
         current_stat = input_path.stat()
@@ -273,7 +395,8 @@ def filter_connected_cloud(input_path: Path, output_path: Path, summary_path: Pa
             "grid_shape": shape.tolist(), "core_quantile": core_quantile,
             "minimum_core_cell_points": threshold, "support_halo_cells": support_halo,
             "candidate_count": bbox_count, "kept_count": supported_count,
-            "pre_observation_veto_count": density_supported_count,
+            "pre_observation_veto_count": density_supported_count + len(rescued),
+            "density_only_vertex_count": density_supported_count,
             **component_report,
         },
         "sampling": {
@@ -283,12 +406,16 @@ def filter_connected_cloud(input_path: Path, output_path: Path, summary_path: Pa
         },
         "quality_warning": "",
         "spatial_prior": spatial_report,
+        "observation_protection": protection,
+        "observation_rescued_vertex_count": len(rescued),
         "observation_excluded_vertex_count": evidence_excluded,
         "explanation": (
             "Density is measured on all original points before sampling. Keep the dominant dense "
             "26-connected component and a bounded neighborhood of observed detail. Voxels only select "
             "original vertices; positions, colors and normals are unchanged. No route-boundary crop, "
-            "surface interpolation or synthetic completion is applied. This heuristic can remove weak "
+            "surface interpolation or synthetic completion is applied. When requested, a bounded assessment "
+            "rescues original rejected vertices supported by calibrated observations. Unevaluated/unknown "
+            "points retain the density decision and are not labelled observed conflicts. This heuristic can remove weak "
             "real surfaces and cannot repair misregistered geometry or missing observations."
         ),
     }

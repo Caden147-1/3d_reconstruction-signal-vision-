@@ -112,27 +112,26 @@ def completed_empty_attempt(workspace: Path, final: dict | None, binding: dict, 
     if final is None:
         return False
     receipt = read_record(workspace / "dense/videoscene_summary.json")
-    if receipt.get('status') == 'hypotheses_only':
-        for path_key, identity_key in (('generated_source','generated_identity'), ('hypothesis_preview','hypothesis_preview_identity')):
-            path = Path(receipt.get(path_key, '')).resolve()
-            if (not path.is_relative_to((workspace/'dense').resolve()) or
-                    not receipt.get(identity_key) or file_identity(path) != receipt[identity_key]):
-                return False
     expected_code = {name: file_identity(ROOT / name) for name in
                      ("videoscene_completion.py", "videoscene_geometry.py", "videoscene_conditioning.py", "videoscene_runner.py", "mvs_observations.py")}
     config = receipt.get("effective_config", {})
-    return (receipt.get("status") in {"no_supported_holes", "no_geometry_passed", "hypotheses_only"}
+    return (receipt.get("status") in {"no_endpoint_pairs", "no_eligible_pairs", "no_observed_overlap",
+                                      "no_supported_holes", "no_geometry_passed", "no_observed_geometry_passed"}
             and receipt.get("inference_requested") is True
             and receipt.get("input_final_identity") == final.get("final_identity")
             and receipt.get("reconstruction_binding") == binding
             and receipt.get("completion_code_identity") == expected_code
             and config.get("max_clips") == effective["max_clips"]
             and config.get("budget_hours") == effective["budget_hours"]
+            and config.get("merge_generated") is True
+            and config.get("geometry_policy") == "two_original_depth_maps_v1"
             and config.get("prior_conditioning") == "endpoints" and config.get("seed") == 20260915)
 
 
 def filter_stage(workspace: Path, binding: dict, run_dir: Path, settings: dict) -> dict:
     """Validate cached MVS; filter a bound source and atomically publish a candidate."""
+    from runner_migration import effective_execution_settings
+    settings = effective_execution_settings(workspace, settings)
     if verified_context(workspace, verify_maps=True) != binding:
         raise ValueError("Reconstruction binding changed before filtering")
     dense = checked_dense_path(workspace)
@@ -146,7 +145,12 @@ def filter_stage(workspace: Path, binding: dict, run_dir: Path, settings: dict) 
             executable = workspace / executable
         command = [str(executable), "stereo_fusion", "--workspace_path", str(dense),
                    "--workspace_format", "COLMAP", "--input_type", "geometric"]
-        for key, value in settings.get("dense_profile_config", {}).get("fusion", {}).items():
+        # Match the original dense runner's resolution cap. Zero-distortion
+        # COLMAP cameras may still carry native dimensions after undistortion,
+        # so omitting this cap when re-fusing cached maps changes calibration.
+        fusion_settings = {**settings.get("dense_profile_config", {}).get("fusion", {}),
+                           "max_image_size": settings.get("dense_max_image_size", 2000)}
+        for key, value in fusion_settings.items():
             command.extend(["--StereoFusion."+key, str(value)])
         if settings.get("colmap_num_threads", 0) > 0:
             command.extend(["--StereoFusion.num_threads", str(settings["colmap_num_threads"])])
@@ -166,9 +170,15 @@ def filter_stage(workspace: Path, binding: dict, run_dir: Path, settings: dict) 
     filtered = run_dir / "fused_filtered.ply"
     filter_summary = run_dir / "point_filter_summary.json"
     max_points = int(settings.get("dense_profile_config", {}).get("point_filter_max_points", 0))
+    filter_config = settings.get("point_filter_config", {})
+    filter_method = filter_config.get("method", "wifi-density")
+    if filter_method == "observed":
+        max_points = 0
     run_command([sys.executable, str(ROOT / "point_cloud_filter.py"), "--input", str(source),
                  "--output", str(filtered), "--summary", str(filter_summary),
-                 "--method", "wifi-density", "--workspace", str(workspace),
+                 "--method", filter_method, "--workspace", str(workspace),
+                 "--observation-max-candidates", str(filter_config.get("max_candidates", 250000)),
+                 "--observation-budget-seconds", str(filter_config.get("budget_seconds", 120.)),
                  "--max-points", str(max_points)])
     count = validate_ply(filtered).get("vertex", 0)
     if count <= 0 or file_identity(source) != source_identity:
@@ -243,7 +253,8 @@ def run_stage(workspace: Path, mode: str, *, dry_run: bool = False,
     if mode == "filter" or (mode == "resume" and final is None):
         stages.append("filter")
     if mode == "completion" or (mode == "resume" and settings.get("scene_completion") == "videoscene"
-                                and (final is None or final.get("source_kind") != "videoscene_completed_point_cloud")):
+                                and (final is None or final.get("source_kind") != "videoscene_completed_point_cloud"
+                                     or final.get("completion_policy") != "two_original_depth_maps_v1")):
         stages.append("completion")
     stages.append("report")
     effective = {"max_clips": int(max_clips if max_clips is not None else settings.get("videoscene_max_clips", 3)),
@@ -274,7 +285,7 @@ def run_stage(workspace: Path, mode: str, *, dry_run: bool = False,
             elif stage == "completion":
                 from videoscene_completion import main as complete
                 code = complete(["--workspace", str(workspace), "--max-clips", str(effective["max_clips"]),
-                                 "--budget-hours", str(effective["budget_hours"])])
+                                 "--budget-hours", str(effective["budget_hours"])], refresh_report=False)
                 if code:
                     raise RuntimeError(f"VideoScene completion exited with code {code}")
             else:
@@ -283,6 +294,8 @@ def run_stage(workspace: Path, mode: str, *, dry_run: bool = False,
             write_provenance(receipt_path, receipt)
         receipt.update(status="completed", final_identity=file_identity(dense / "final.ply"))
         write_provenance(receipt_path, receipt)
+        from generated_input_cleanup import cleanup_after_success
+        cleanup_after_success(workspace)
         return 0
     except BaseException as error:
         receipt.update(status="interrupted" if isinstance(error, KeyboardInterrupt) else "failed", error=str(error))

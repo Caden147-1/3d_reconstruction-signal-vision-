@@ -1,6 +1,8 @@
 """Post-reconstruction VideoScene proposals, fixed-pose MVS, and gated PLY merge."""
 
 import argparse
+from collections import Counter, defaultdict
+from contextlib import closing
 import csv
 import itertools
 import json
@@ -24,9 +26,12 @@ from videoscene_conditioning import condition_holes
 from videoscene_runner import readiness, CODE_REVISION, isolated_python, runtime_readiness, runtime_preflight
 from workspace_lock import WorkspaceBusyError, workspace_lock
 from process_control import managed_process
+from mvs_observations import DepthStore, read_model
 
 
 MVS_INDICES = tuple(range(0, 49, 6))
+MAX_EXAMINED_PAIRS = 24
+VIDEO_NEIGHBOR_WINDOW = 6
 
 
 def run_command(command, cwd, deadline, log):
@@ -46,6 +51,15 @@ def route_compatible(first, second, metadata, visual_only):
     if visual_only:
         return True
     a, b = metadata.get(first["name"], {}), metadata.get(second["name"], {})
+    # Unbound video frames have visual poses but no phone trajectory. Their
+    # own frame order can propose neighbors without inventing sensor alignment.
+    if (a.get("source_type") == b.get("source_type") == "video_base_frame"
+            and a.get("video_name") and a["video_name"] == b.get("video_name")):
+        try:
+            gap = abs(int(a["video_sequence_index"]) - int(b["video_sequence_index"]))
+            return 0 < gap <= VIDEO_NEIGHBOR_WINDOW
+        except (KeyError, TypeError, ValueError):
+            return False
     contour = a.get("trajectory_contour_id")
     if not contour or contour != b.get("trajectory_contour_id") or not a.get("session") or a.get("session") != b.get("session"):
         return False
@@ -93,8 +107,32 @@ def hole_cells(mask, expected, view, cell_size):
     return y, x, cells
 
 
+def shortlist_pairs(ranked, metadata, limit=MAX_EXAMINED_PAIRS):
+    """Share the rendering budget across capture regions, in quality order."""
+    groups = defaultdict(list)
+    for item in ranked:
+        first, last = item[1][3:5]
+        a, b = (metadata.get(v["name"], {}) for v in (first, last))
+        if all(row.get("session") and row.get("global_point_index") for row in (a, b)):
+            key = ("checkpoints", tuple(sorted((row["session"], row["global_point_index"]) for row in (a, b))))
+        elif a.get("video_name") and a["video_name"] == b.get("video_name"):
+            key = ("video", a["video_name"], int(a["video_sequence_index"]) // VIDEO_NEIGHBOR_WINDOW)
+        else:
+            key = ("views", first["name"], last["name"])
+        groups[(item[2]["baseline_regime"], key)].append(item)
+    ordered = {}
+    for regime in ("short", "extended"):
+        buckets = [rows for (tier, _), rows in groups.items() if tier == regime]
+        ordered[regime] = [item for row in itertools.zip_longest(*buckets) for item in row if item is not None]
+    # Reserve up to one third of the existing budget for wider views; fill any
+    # unused slots from short pairs. Do not repeatedly examine one capture stop.
+    short_count = min(len(ordered["short"]), limit-min(len(ordered["extended"]), limit//3))
+    chosen = ordered["short"][:short_count] + ordered["extended"][:limit-short_count]
+    return chosen + ordered["short"][short_count:short_count+limit-len(chosen)]
+
+
 def prepare_jobs(workspace, cloud, run, executable, deadline, max_clips, prior_conditioning="endpoints"):
-    from mvs_observations import read_model, pair_depth_support
+    from mvs_observations import pair_depth_support
 
     model = run / "observed_model"
     model.mkdir()
@@ -104,11 +142,21 @@ def prepare_jobs(workspace, cloud, run, executable, deadline, max_clips, prior_c
     with (workspace / "metadata/images_manifest.csv").open(newline="", encoding="utf-8") as handle:
         metadata = {row["image_file"].replace("\\", "/"): row for row in csv.DictReader(handle)}
     summary = read_record(workspace / "colmap_workspace_summary.json")
+    observed_files = read_record(workspace / "dense" / CACHE_RECORD).get("outputs", {}).get("files", {})
+    registered_view_count = len(views)
+    if summary.get("dense_selection_config", {}).get("enabled"):
+        # The calibrated model intentionally retains every sparse camera. Only
+        # selected cameras have authenticated MVS maps and can anchor completion.
+        # Prune these before the quadratic pair search and shared-track checks.
+        views = [view for view in views if all(
+            f"stereo/{folder}/{view['name']}.geometric.bin" in observed_files
+            for folder in ("depth_maps", "normal_maps"))]
     pairs = candidate_pairs(views, metadata, bool(summary.get("visual_only")))
     calibrated, sparse_points = read_model(workspace / 'dense/sparse')
     by_name = {v['name']: v for v in calibrated}
     supported_pairs = []
     rejected_pairs = []
+    accepted_pairs = []
     for pair in pairs:
         first, last = pair[3], pair[4]
         a, b = metadata.get(first['name'], {}), metadata.get(last['name'], {})
@@ -116,34 +164,77 @@ def prepare_jobs(workspace, cloud, run, executable, deadline, max_clips, prior_c
                          and a.get('session') == b.get('session')
                          and a.get('global_point_index') == b.get('global_point_index'))
         evidence = pair_depth_support(by_name[first['name']], by_name[last['name']], sparse_points)
-        if same_stop or not evidence['usable']:
-            rejected_pairs.append(dict(first=first['name'], last=last['name'], same_checkpoint=same_stop, **evidence))
+        has_depth = all(f"stereo/{folder}/{view['name']}.geometric.bin" in observed_files
+                        for view in (first, last) for folder in ("depth_maps", "normal_maps"))
+        record = dict(first=first['name'], last=last['name'], same_checkpoint=same_stop,
+                      observed_endpoint_maps=has_depth, **evidence)
+        # A checkpoint is an association label, not proof of zero camera motion.
+        # Real shared-track parallax and authenticated MVS maps remain required.
+        if not evidence['usable'] or not has_depth:
+            record["reason"] = "insufficient_track_parallax" if not evidence['usable'] else "missing_observed_maps"
+            rejected_pairs.append(record)
         else:
             supported_pairs.append(pair)
+            accepted_pairs.append(record)
     write_provenance(run / 'endpoint_geometry.json', dict(candidate_count=len(pairs),
-                     accepted_count=len(supported_pairs), rejected=rejected_pairs))
+                     accepted_count=len(supported_pairs), accepted=accepted_pairs, rejected=rejected_pairs))
+    selection = dict(policy=geometry.SELECTION_POLICY, candidate_pairs=len(pairs),
+                     registered_view_count=registered_view_count, endpoint_view_count=len(views),
+                     route_pairs=len(supported_pairs), eligible_pairs=0, examined_pair_cap=MAX_EXAMINED_PAIRS,
+                     endpoint_rejections=dict(Counter(r["reason"] for r in rejected_pairs)),
+                     sample_candidates=[], sample_rejections={}, examined=[], jobs=[])
     pairs = supported_pairs
     if not pairs:
-        write_provenance(run / 'selection.json', dict(route_pairs=0, jobs=[],
-                         reason='no_cross_checkpoint_endpoints_with_reliable_parallax'))
+        selection.update(status="no_endpoint_pairs", reason="No endpoint pair has usable parallax and original depth/normal maps.")
+        write_provenance(run / 'selection.json', selection)
         return []
     with cloud.open("rb") as handle:
         point_count = parse_ply_header(handle)["vertex_count"]
     sample, _, _ = statistics_sample(cloud, point_count, max_samples=10000)
     ranked = []
     for pair in pairs:
-        middle = geometry.interpolate_views(pair[3], pair[4], 3)[1]
-        _, z, visible = geometry.project(sample, middle)
-        if visible.sum() < 100:
-            continue
-        ratio = pair[-1] / float(np.median(z[visible]))
-        if .025 <= ratio <= .18:
-            ranked.append((abs(ratio-.08), pair))
+        support = geometry.pair_sampling_support(sample, pair[3], pair[4], pair[-1])
+        selection["sample_candidates"].append(dict(first=pair[1], last=pair[2], **support))
+        if support["eligible"]:
+            score = (support["baseline_regime"] != "short", abs(support["baseline_depth_ratio"]-.08), -support["common_projection_ratio"])
+            ranked.append((score, pair, support))
     ranked.sort(key=lambda item: (item[0], item[1][1], item[1][2]))
+    selection["eligible_pairs"] = len(ranked)
+    selection["sample_rejections"] = dict(Counter(row["reject_reason"] for row in selection["sample_candidates"]
+                                                  if not row["eligible"]))
+    print(f"[VideoScene] View selection: {len(pairs)} geometry-supported pairs -> {len(ranked)} eligible; "
+          f"rejected: {selection['sample_rejections']}", flush=True)
+    if not ranked:
+        selection.update(status="no_eligible_pairs", reason="View-pair visibility, overlap or baseline limits rejected all candidates; holes were not examined.")
+        write_provenance(run / 'selection.json', selection)
+        return []
     # Sampling only shortlists baselines. Rank actual, full-cloud gap coverage
     # before spending inference time; reuse calibrated endpoint projections.
     jobs, report, candidates, examined, endpoint_cache = [], [], [], [], {}
-    cell_size = max(float(np.median([p[-1] for _, p in ranked]))*.25, 1e-6) if ranked else 1.
+    cell_size = max(float(np.median([p[-1] for _, p, _ in ranked]))*.25, 1e-6)
+
+    # View-frustum overlap alone can count occluded surfaces. Check authenticated
+    # real depth before paying for full-cloud renders or diffusion inference.
+    observed_pairs = []
+    with closing(DepthStore(workspace / "dense", expected=observed_files, max_open=6)) as store:
+        for item in shortlist_pairs(ranked, metadata):
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Completion observed-overlap budget exhausted")
+            _, pair, support = item
+            real_views = [by_name[name] for name in pair[1:3]]
+            _, stats = geometry.observed_depth_support(sample, real_views, [store.get(v) for v in real_views])
+            overlap = stats["two_observed_views"] / max(*stats["support_by_observed_view"], 1)
+            required = geometry.SELECTION_POLICY["extended_observed_overlap" if support["baseline_regime"] == "extended" else "minimum_observed_overlap"]
+            record = dict(first=pair[1], last=pair[2], baseline_ratio=support["baseline_depth_ratio"],
+                          sample_projection_overlap=support["common_projection_ratio"], baseline_tier=support["baseline_regime"],
+                          observed_overlap=overlap, observed_support=stats)
+            examined.append(record)
+            if stats["accepted_points"] < geometry.SELECTION_POLICY["minimum_projected_points"] or overlap < required:
+                record["status"] = "insufficient_original_depth_overlap"
+            else:
+                observed_pairs.append((item, record))
+        store.snapshot.verify_unchanged()
+    print(f"[VideoScene] Original-depth overlap: {len(observed_pairs)}/{len(examined)} shortlisted pairs passed.", flush=True)
 
     def render(view):
         if time.monotonic() >= deadline:
@@ -157,20 +248,21 @@ def prepare_jobs(workspace, cloud, run, executable, deadline, max_clips, prior_c
             endpoint_cache[view["name"]] = render(view)
         return endpoint_cache[view["name"]]
 
-    for _, (_, _, _, first, last, baseline) in ranked[:24]:
+    for (_, (_, _, _, first, last, baseline), support), record in observed_pairs:
         triplet = geometry.interpolate_views(first, last, 3)
         middle = triplet[1]
         rendered = render(middle)
         depth, mask = rendered[1:3]
         known = np.isfinite(depth)
-        record = {"first": first["name"], "last": last["name"], "local_hole_pixels": int(mask.sum())}
-        examined.append(record)
+        record["local_hole_pixels"] = int(mask.sum())
         if known.mean() < .35:
             record["status"] = "insufficient_observed_coverage"
             continue
         median = float(np.median(depth[known]))
-        if not .025 <= baseline / median <= .18 or mask.sum() < 100:
-            record["status"] = "insufficient_local_support_or_baseline"
+        # Baseline was checked against the same shared surface at both endpoints.
+        # Do not reapply a different ratio based on unrelated full-image depths.
+        if mask.sum() < 100:
+            record["status"] = "insufficient_local_hole_pixels"
             continue
         checks = [endpoint(first), rendered, endpoint(last)]
         checked = geometry.supported_holes(triplet, np.stack([v[1] for v in checks]),
@@ -188,7 +280,9 @@ def prepare_jobs(workspace, cloud, run, executable, deadline, max_clips, prior_c
     covered = set()
     while candidates and len(jobs) < max_clips:
         scores = [sum(cell not in covered for cell in c["cells"]) for c in candidates]
-        index = max(range(len(candidates)), key=lambda i: scores[i])
+        index = max(range(len(candidates)), key=lambda i: (
+            scores[i] >= max(100, .35*len(candidates[i]["cells"])),
+            candidates[i]["record"]["baseline_tier"] == "short", scores[i]))
         candidate = candidates.pop(index)
         if scores[index] < max(100, .35*len(candidate["cells"])):
             candidate["record"]["status"] = "overlaps_selected_region"
@@ -254,9 +348,9 @@ def prepare_jobs(workspace, cloud, run, executable, deadline, max_clips, prior_c
                    "median_depth": candidate["median"], "hole_pixels": int(masks[4].sum()), "frames": 49,
                    "hole_pixels_by_view": masks.sum(axis=(1, 2)).tolist(),
                    "hole_policy": "two_axis_boundary_prior_with_multiview_and_endpoint_support",
-                   "selection_policy": "novel_supported_gap_coverage_not_baseline_only",
+                   "selection_policy": geometry.SELECTION_POLICY,
                    "prior_conditioning": prior_conditioning,
-                   "sensor_role": "same_contour_local_pair_selection_only",
+                   "sensor_role": "route_or_video_order_candidates_only_not_camera_poses",
                    "camera_policy": "interpolated_fixed_colmap_poses_not_sensor_pose_seeds"}
         write_provenance(job / "job.json", payload)
         if conditioning:
@@ -269,9 +363,13 @@ def prepare_jobs(workspace, cloud, run, executable, deadline, max_clips, prior_c
         report.append(payload)
         covered.update(new_cells)
         candidate["record"]["status"] = "selected"
-    write_provenance(run / "selection.json", {"route_pairs": len(pairs), "eligible_pairs": len(ranked),
-                     "examined_pair_cap": 24, "coverage_cell_size_scene_units": cell_size,
-                     "examined": examined, "jobs": report})
+    selection.update(status="prepared" if jobs else "no_supported_holes" if observed_pairs else "no_observed_overlap",
+                     reason=("Prepared locally supported gaps." if jobs else "No supported gaps within the examined candidate regions."
+                             if observed_pairs else "No shortlisted pair passed original-depth overlap; holes were not examined."),
+                     hole_regions_examined=len(observed_pairs),
+                     coverage_cell_size_scene_units=cell_size, examined=examined, jobs=report,
+                     region_outcomes=dict(Counter(row["status"] for row in examined)))
+    write_provenance(run / "selection.json", selection)
     return jobs
 
 
@@ -283,11 +381,11 @@ def triangulate_fixed_views(mvs, views, executable, deadline, log):
     params = ",".join(str(v) for v in (k[0, 0], k[1, 1], k[0, 2], k[1, 2]))
     run_command([executable, "feature_extractor", "--database_path", database, "--image_path", mvs / "images",
                  "--ImageReader.camera_model", "PINHOLE", "--ImageReader.single_camera", 1,
-                 "--ImageReader.camera_params", params, "--FeatureExtraction.num_threads", 4,
+                 "--ImageReader.camera_params", params, "--FeatureExtraction.num_threads", -1,
                  "--SiftExtraction.max_image_size", 720, "--SiftExtraction.max_num_features", 4096], mvs, deadline, log)
     run_command([executable, "exhaustive_matcher", "--database_path", database,
                  "--FeatureMatching.guided_matching", 1, "--FeatureMatching.max_num_matches", 16384,
-                 "--FeatureMatching.num_threads", 4], mvs, deadline, log)
+                 "--FeatureMatching.num_threads", -1], mvs, deadline, log)
     connection = sqlite3.connect(database.resolve().as_uri()+"?mode=ro", uri=True)
     try:
         records = {name: (iid, cid) for iid, cid, name in connection.execute("SELECT image_id,camera_id,name FROM images")}
@@ -298,7 +396,7 @@ def triangulate_fixed_views(mvs, views, executable, deadline, log):
     run_command([executable, "point_triangulator", "--database_path", database, "--image_path", mvs / "images",
                  "--input_path", mvs / "fixed_poses", "--output_path", mvs / "sparse",
                  "--refine_intrinsics", 0, "--Mapper.fix_existing_frames", 1,
-                 "--Mapper.ba_refine_sensor_from_rig", 0, "--Mapper.num_threads", 4], mvs, deadline, log)
+                 "--Mapper.ba_refine_sensor_from_rig", 0, "--Mapper.num_threads", -1], mvs, deadline, log)
     if inspect_sparse_model(mvs / "sparse")["point_count"] < 20:
         raise ValueError("Insufficient fixed-pose visual tracks for completion fusion")
     check = mvs / "pose_check"
@@ -312,7 +410,7 @@ def triangulate_fixed_views(mvs, views, executable, deadline, log):
             raise ValueError("Completion triangulation changed the fixed camera calibration")
 
 
-def reconstruct_job(job, executable, deadline):
+def reconstruct_job(job, executable, deadline, observation_store, observed_views):
     with np.load(job / "geometry.npz", allow_pickle=False) as data:
         depths, masks, expected = data["depth"], data["mask"], data["expected"]
         views = [dict(K=k, R=r, C=c) for k, r, c in zip(data["K"], data["R"], data["C"])]
@@ -361,9 +459,14 @@ def reconstruct_job(job, executable, deadline):
     raw = mvs / "fused.ply"
     run_command([executable, "stereo_fusion", "--workspace_path", mvs, "--input_type", "geometric",
                  "--StereoFusion.min_num_pixels", 3, "--StereoFusion.max_reproj_error", 1,
-                 "--StereoFusion.max_depth_error", .01, "--StereoFusion.num_threads", 4,
+                 "--StereoFusion.max_depth_error", .01, "--StereoFusion.num_threads", -1,
                  "--StereoFusion.cache_size", 2, "--output_path", raw], job, deadline, job / "mvs.log")
-    selected = []
+    endpoint_names = [read_record(job / "job.json")[key] for key in ("first", "last")]
+    real_views = [observed_views[name] for name in endpoint_names]
+    real_maps = [observation_store.get(view) for view in real_views]
+    selected, hypotheses = [], []
+    observed_stats = dict(candidate_points=0, support_by_observed_view=[0, 0], two_observed_views=0,
+                          insufficient_parallax=0, free_space_conflicts=0, accepted_points=0)
     totals = dict.fromkeys(("raw_points", "three_hole_views", "any_hole_views", "three_supported_views",
                            "eligible_target_points", "endpoint_supported", "rejected_endpoint_support",
                            "rejected_free_space", "free_space_conflicts", "accepted_points"), 0)
@@ -374,31 +477,49 @@ def reconstruct_job(job, executable, deadline):
         keep, stats = geometry.gate_points(positions(chunk), views, depths, masks, expected, diagnostics=True)
         for key, value in stats.items():
             totals[key] = totals.get(key, 0) + value
-        selected.append(chunk[keep])
+        proposed = chunk[keep]
+        hypotheses.append(geometry.label_source(proposed, 1))
+        measured, stats = geometry.observed_depth_support(positions(proposed), real_views, real_maps)
+        for key, value in stats.items():
+            if isinstance(value, list):
+                observed_stats[key] = [a+b for a, b in zip(observed_stats[key], value)]
+            else:
+                observed_stats[key] += value
+        accepted = proposed[measured]
+        selected.append(geometry.label_source(accepted, 1))
         for i, view in enumerate(views):
-            pixels, z, good = geometry.project(positions(chunk[keep]), view)
+            pixels, z, good = geometry.project(positions(accepted), view)
             ids = np.flatnonzero(good)
             x, y = pixels[good].T
             supported = masks[i, y, x] & (np.abs(z[ids]-expected[i, y, x]) < .15*expected[i, y, x])
             coverage[i, y[supported], x[supported]] = True
     count = sum(map(len, selected))
+    proposal_count = sum(map(len, hypotheses))
+    observation_store.snapshot.verify_unchanged()
+    with raw.open("rb") as handle:
+        properties = parse_ply_header(handle)["vertex_properties"] + [("source_id", "uchar")]
+    if proposal_count:
+        geometry.write_vertices(job / "hypotheses.ply", properties, hypotheses, proposal_count)
     target_pixels = masks.sum(axis=(1, 2))
     covered_pixels = coverage.sum(axis=(1, 2))
     fraction = float(covered_pixels.sum() / max(int(target_pixels.sum()), 1))
-    write_provenance(job / "geometry_validation.json", {**totals,
+    evidence = {f"stereo/{folder}/{name}.geometric.bin": observation_store.snapshot.identity(
+                    observation_store.dense / "stereo" / folder / (name+".geometric.bin"))
+                for name in endpoint_names for folder in ("depth_maps", "normal_maps")}
+    write_provenance(job / "geometry_validation.json", {**totals, "accepted_points": count,
+                     "prior_accepted_points": proposal_count, "observed_support": observed_stats,
+                     "observed_views": endpoint_names, "observed_map_identities": evidence,
                      "eligible_for_merge": count >= 100,
                      "target_pixels_by_view": target_pixels.tolist(), "covered_pixels_by_view": covered_pixels.tolist(),
                      "target_projection_coverage": fraction, "low_coverage": fraction < .1,
-                     "policy": "fixed_pose_mvs_one_hole_three_supported_views_both_endpoints_and_observed_free_space_check",
+                     "policy": "fixed_pose_mvs_hole_gate_then_two_original_depth_maps_3pct_and_2deg_parallax",
                      "coverage_interpretation": "Projected accepted point pixels, not completed surface area",
-                     "interpretation": "Consistency checks do not establish real-world truth"})
-    print(f"[VideoScene] Accepted {count:,}/{totals['raw_points']:,} local MVS points; target projection coverage {fraction:.1%}.", flush=True)
+                     "interpretation": "Generated proposals require real-image geometric depth support; internal consistency is not independent survey accuracy."})
+    print(f"[VideoScene] {count:,}/{proposal_count:,} proposals passed original-image depth validation; target coverage {fraction:.1%}.", flush=True)
     if fraction < .1:
         print("[VideoScene warning] Low target coverage; successful inference does not imply effective hole completion.", flush=True)
     if count < 100:
         return None
-    with raw.open("rb") as handle:
-        properties = parse_ply_header(handle)["vertex_properties"]
     output = job / "accepted.ply"
     geometry.write_vertices(output, properties, selected, count)
     return output
@@ -437,13 +558,18 @@ def complete(args):
         dense = checked_dense_path(workspace)
         dense.mkdir(exist_ok=True)
         status_path = dense / "videoscene_summary.json"
+        promote = not getattr(args, "hypotheses_only", False)
         payload = {"status": "started", "model": "VideoScene", "generated_points": 0, "promoted": False,
+                   "inference_attempted": False, "inference_completed_clips": 0,
                    "prior_conditioning": args.prior_conditioning,
                    "effective_config": {"scene_completion": "videoscene", "max_clips": args.max_clips,
                                         "budget_hours": args.budget_hours, "seed": args.seed,
-                                        "merge_generated": bool(getattr(args, 'merge_generated', False)),
+                                        "merge_generated": promote,
+                                        "geometry_policy": "two_original_depth_maps_v1",
+                                        "selection_policy": geometry.SELECTION_POLICY,
                                         "prior_conditioning": args.prior_conditioning}}
         write_provenance(status_path, payload)
+        observations = None
         try:
             if not args.prepare_only:
                 missing = readiness(repo, python)
@@ -485,24 +611,37 @@ def complete(args):
             deadline = time.monotonic() + args.budget_hours*3600
             jobs = prepare_jobs(workspace, cloud, run, executable, deadline, args.max_clips, args.prior_conditioning)
             payload["clip_count"] = len(jobs)
+            selection = read_record(run / "selection.json")
+            payload["selection"] = {key: selection.get(key) for key in
+                                    ("status", "reason", "candidate_pairs", "route_pairs", "eligible_pairs",
+                                     "endpoint_rejections", "sample_rejections", "hole_regions_examined", "region_outcomes")}
             if not jobs or args.prepare_only:
-                payload["status"] = "prepared_not_generated" if jobs else "no_supported_holes"
+                payload["status"] = "prepared_not_generated" if jobs else selection["status"]
                 write_provenance(status_path, payload)
-                print("[VideoScene] " + payload["status"] + "; final.ply unchanged.", flush=True)
+                print(f"[VideoScene] {payload['status']}: {selection['reason']} Inference not run; final.ply unchanged.", flush=True)
                 return 0
+            expected = cache.get("outputs", {}).get("files")
+            if not expected:
+                raise ValueError("Completion requires authenticated original MVS observation maps")
+            observations = DepthStore(dense, expected=expected, max_open=6)
+            observed_views = {view["name"]: view for view in read_model(dense / "sparse", observations.snapshot)[0]}
             additions = []
             for index, job in enumerate(jobs):
                 print(f"[VideoScene] Inferring clip {index+1}/{len(jobs)} with sequential CPU offload...", flush=True)
+                payload["inference_attempted"] = True
+                write_provenance(status_path, payload)
                 run_command([python, Path(__file__).with_name("videoscene_runner.py"), "--repo", repo, "--job", job,
                              "--seed", args.seed+index], run, deadline, job / "inference.log")
-                accepted = reconstruct_job(job, executable, deadline)
+                payload["inference_completed_clips"] += 1
+                accepted = reconstruct_job(job, executable, deadline, observations, observed_views)
                 if accepted:
                     additions.append(accepted)
             payload["clip_validation"] = [read_record(job / "geometry_validation.json") for job in jobs]
+            payload["hypothesis_points"] = sum(report.get("prior_accepted_points", 0) for report in payload["clip_validation"])
             if not additions:
-                payload["status"] = "no_geometry_passed"
+                payload["status"] = "no_observed_geometry_passed" if payload["hypothesis_points"] else "no_geometry_passed"
                 write_provenance(status_path, payload)
-                print("[VideoScene] No generated geometry passed validation; final.ply unchanged.", flush=True)
+                print("[VideoScene] No additions passed original-image depth validation; proposals retained, final.ply unchanged.", flush=True)
                 return 0
             with additions[0].open("rb") as handle:
                 properties = parse_ply_header(handle)["vertex_properties"]
@@ -520,12 +659,13 @@ def complete(args):
                 raise ValueError("Observed backup differs from the reconstruction snapshot")
             staged = run / "completed.ply"
             geometry.merge_clouds(observed, merged_additions, staged)
+            observations.snapshot.verify_unchanged()
             if reconstruction_binding(dense) != binding or cache_identity(workspace) != binding["cache_identity"]:
                 raise ValueError("MVS inputs/cameras changed during completion; final.ply unchanged")
             if time.monotonic() >= deadline:
                 raise TimeoutError("Completion budget exhausted before promotion; final.ply unchanged")
             final_identity = file_identity(staged)
-            if not getattr(args, 'merge_generated', False):
+            if not promote:
                 payload.update(status="hypotheses_only", generated_points=count, observed_points=observed_count,
                                generated_source=str(merged_additions), generated_identity=file_identity(merged_additions),
                                hypothesis_preview=str(staged), hypothesis_preview_identity=final_identity,
@@ -535,51 +675,52 @@ def complete(args):
                 return 0
             output_summary = {**original_summary, "source_kind": "videoscene_completed_point_cloud",
                               "observed_source": str(observed), "observed_identity": source_identity,
-                              "source": str(observed), "output": str(dense / "final.ply"),
+                              "source": str(staged), "output": str(dense / "final.ply"),
                               "generated_source": str(merged_additions), "generated_vertex_count": count,
                               "generated_identity": file_identity(merged_additions),
                               "observed_vertex_count": observed_count,
                               "vertex_count": validate_ply(staged)["vertex"], "final_identity": final_identity,
-                              "explanation": "Observed geometry preserved; appended VideoScene hypotheses are not measured wireless/visual structure."}
-            # Record the intended promotion before the atomic PLY replacement.
+                              "completion_policy": "two_original_depth_maps_v1",
+                              "source_id_labels": {"0": "observed_visual_reconstruction", "1": "videoscene_generated_depth_validated"},
+                              "explanation": "Observed geometry preserved; generated additions pass two real-image MVS depth checks but retain synthetic provenance."}
             write_provenance(run / "promotion.json", output_summary)
             if file_identity(dense / "final.ply") != original_summary["final_identity"]:
                 raise ValueError("Final PLY changed during completion; refusing to overwrite external edits")
-            previous_final = run / "previous_final.ply"
-            shutil.copy2(dense / "final.ply", previous_final)
+            from finalize_dense_outputs import commit_final
+            commit_final(staged, dense / "final.ply", dense / "final_output_summary.json", output_summary)
+            payload.update(status="completed", generated_points=count, observed_points=observed_count,
+                           generated_fraction=count/observed_count, promoted=True, code_revision=CODE_REVISION,
+                           generated_source=str(merged_additions), generated_identity=output_summary["generated_identity"],
+                           completed_candidate=str(staged), completed_identity=final_identity)
             try:
-                staged.replace(dense / "final.ply")
-                write_provenance(dense / "final_output_summary.json", output_summary)
-                payload.update(status="completed", generated_points=count, observed_points=observed_count,
-                               generated_fraction=count/observed_count, promoted=True, code_revision=CODE_REVISION)
                 write_provenance(status_path, payload)
-            except (OSError, ValueError, KeyboardInterrupt):
-                payload.update(status="failed", generated_points=0, promoted=False)
-                try:
-                    previous_final.replace(dense / "final.ply")
-                    write_provenance(dense / "final_output_summary.json", original_summary)
-                except OSError as rollback_error:
-                    payload.update(promoted=None, rollback_error=str(rollback_error), recovery_backup=str(previous_final))
-                    raise OSError("Completion rollback could not be committed; inspect final/backup hashes before retrying") from rollback_error
-                raise
-            try:
-                previous_final.unlink(missing_ok=True)
-            except OSError:
-                print(f"[VideoScene warning] Completed successfully; redundant rollback backup retained: {previous_final}", flush=True)
-            print(f"[VideoScene] Appended {count:,} synthetic points; completed result: {dense / 'final.ply'}", flush=True)
+            except OSError as exc:
+                # PLY and its authoritative final receipt were committed together.
+                print(f"[VideoScene warning] Final committed; completion status could not be saved: {exc}", flush=True)
+            print(f"[VideoScene] Appended {count:,} depth-validated generated points: {dense / 'final.ply'}", flush=True)
             print(f"[VideoScene] Before-completion backup: {observed}", flush=True)
             return 0
         except (OSError, ValueError, KeyError, subprocess.SubprocessError, KeyboardInterrupt) as exc:
             payload.update(status="failed", error=str(exc))
+            if payload.get("input_final_identity") and not payload.get("promoted"):
+                try:
+                    unchanged = file_identity(dense / "final.ply") == payload["input_final_identity"]
+                except (OSError, ValueError):
+                    unchanged = False
+                if not unchanged:
+                    payload.update(promoted=None, recovery_required=True)
             try:
                 write_provenance(status_path, payload)
             except OSError as status_error:
                 print(f"[VideoScene error] Could not persist failure status: {status_error}", flush=True)
             print(f"[VideoScene error] {exc}. See videoscene_summary.json; no fallback model was used.", flush=True)
             return 2
+        finally:
+            if observations is not None:
+                observations.close()
 
 
-def main(argv=None):
+def main(argv=None, *, refresh_report=True):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workspace", type=Path, default=Path(__file__).resolve().parent / "colmap_workspace")
     parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parent / "VideoScene")
@@ -591,14 +732,16 @@ def main(argv=None):
     parser.add_argument("--seed", type=int, default=20260915)
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--prepare-only", action="store_true")
-    parser.add_argument("--merge-generated", action="store_true",
-                        help="Explicitly append generated hypotheses to final.ply; by default save separate hypothesis layers.")
+    parser.add_argument("--hypotheses-only", action="store_true",
+                        help="Save completion candidates separately without publishing final.ply")
+    parser.add_argument("--skip-quality-report", action="store_true",
+                        help="For pipeline runners that refresh the quality report in the following stage")
     args = parser.parse_args(argv)
     if not 1 <= args.max_clips <= 8 or not math.isfinite(args.budget_hours) or not 0 < args.budget_hours <= 20:
         parser.error("Use 1..8 local clips and a finite completion budget in (0,20] hours")
     try:
         result = complete(args)
-        if result == 0 and not args.check:
+        if result == 0 and not args.check and refresh_report and not args.skip_quality_report:
             from reconstruction_quality import refresh_quality_report
             try:
                 refresh_quality_report(args.workspace.resolve())

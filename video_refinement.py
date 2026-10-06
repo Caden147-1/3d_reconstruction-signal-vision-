@@ -7,11 +7,16 @@ import time
 import uuid
 
 import cv2
+from frame_io import read_frame
+from video_decode import open_video
+from progress_output import WorkProgress
+from gpu_image_ops import laplacian_variance
 
 
 class NativeFrameRefiner:
     def __init__(self, processed: Path, window_s=0., budget_hours=8., *,
-                 coverage_search=False, blur_threshold=0.):
+                 coverage_search=False, blur_threshold=0., decode_threads=0,
+                 decode_hardware='auto', decode_device=-1):
         if not math.isfinite(window_s) or not 0 <= window_s <= 2:
             raise ValueError("Refinement window must be finite and in [0,2]")
         if not math.isfinite(budget_hours) or not 0 < budget_hours <= 20:
@@ -19,6 +24,9 @@ class NativeFrameRefiner:
         if not math.isfinite(blur_threshold):
             raise ValueError("Blur threshold must be finite")
         self.window_s = window_s
+        self.decode_threads = decode_threads
+        self.decode_hardware = decode_hardware
+        self.decode_device = decode_device
         self.coverage_search = bool(coverage_search)
         self.blur_threshold = max(0., float(blur_threshold))
         self.started = time.monotonic()
@@ -39,96 +47,130 @@ class NativeFrameRefiner:
         radius = min(self.window_s, interval * .45)
         fallback_radius = min(2., interval * .45) if self.coverage_search else radius
         budget_exhausted = False
-        capture = cv2.VideoCapture(str(video))
+        decoder = {}
+        capture = open_video(video, self.decode_threads, hardware=self.decode_hardware,
+                             device=self.decode_device, diagnostics=decoder)
+        fps = capture.get(cv2.CAP_PROP_FPS)
+        previous_decode_time = None
         try:
-            for position, path in enumerate(frames):
-                if time.monotonic() >= self.deadline:
-                    result.extend(frames[position:])
-                    budget_exhausted = True
-                    break
-                original = cv2.imread(str(path))
-                original_gray = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
-                if original is None or original_gray is None:
-                    result.append(path)
-                    continue
-                stamp = timestamps.get(path.name, {})
-                center = float(stamp.get("video_time_s", position * interval))
-                if not math.isfinite(center) or center < 0:
-                    result.append(path)
-                    continue
-                original_score = float(cv2.Laplacian(original_gray, cv2.CV_64F).var())
-                # Retain the sampled image unless a saved native candidate is
-                # actually sharper. Comparing after JPEG encoding also matches
-                # the downstream blur gate, which reads the saved grayscale.
-                best = (original_score, None, center, stamp.get("video_raw_frame_index"), original_score)
-                seen = set()
-                attempted = set()
+            with WorkProgress(f"Video: sharper native frames ({video.name})", len(frames), "frames") as progress:
+                for position, path in enumerate(progress.iterate(frames)):
+                    if time.monotonic() >= self.deadline:
+                        result.extend(frames[position:])
+                        budget_exhausted = True
+                        break
+                    original_gray = read_frame(path, cv2.IMREAD_GRAYSCALE)
+                    if original_gray is None:
+                        result.append(path)
+                        continue
+                    stamp = timestamps.get(path.name, {})
+                    center = float(stamp.get("video_time_s", position * interval))
+                    if not math.isfinite(center) or center < 0:
+                        result.append(path)
+                        continue
+                    original_score = laplacian_variance(original_gray)
+                    # Retain the sampled image unless a saved native candidate is
+                    # actually sharper. Comparing after JPEG encoding also matches
+                    # the downstream blur gate, which reads the saved grayscale.
+                    best = (original_score, None, center, stamp.get("video_raw_frame_index"), original_score,
+                            stamp.get("video_time_source", "resampled_time_grid_not_sensor_sync"))
+                    seen = set()
+                    attempted = set()
 
-                def search(deltas, limit):
-                    nonlocal best, budget_exhausted
-                    for delta in deltas:
-                        if time.monotonic() >= self.deadline:
-                            budget_exhausted = True
-                            return
-                        target = max(0., center + delta)
-                        target_key = round(target, 9)
-                        if target_key in attempted or not capture.isOpened():
-                            continue
-                        attempted.add(target_key)
-                        capture.set(cv2.CAP_PROP_POS_MSEC, target * 1000)
-                        ok, image = capture.read()
-                        actual = capture.get(cv2.CAP_PROP_POS_MSEC) / 1000
-                        decoded_position = capture.get(cv2.CAP_PROP_POS_FRAMES)
-                        if not math.isfinite(decoded_position):
-                            continue
-                        raw_index = int(round(decoded_position)) - 1
-                        if (not ok or image is None or image.shape != original.shape or
-                            not math.isfinite(actual) or actual < 0 or abs(actual - center) > limit + 1e-6 or
-                            raw_index in seen or raw_index in selected_indices or raw_index < 0):
-                            continue
-                        seen.add(raw_index)
-                        ok, encoded = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 95])
-                        if not ok:
-                            continue
-                        gray = cv2.imdecode(encoded, cv2.IMREAD_GRAYSCALE)
-                        if gray is None:
-                            continue
-                        score = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-                        if score > best[0]:
-                            native_score = float(cv2.Laplacian(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY), cv2.CV_64F).var())
-                            best = score, encoded.tobytes(), actual, raw_index, native_score
+                    def search(deltas, limit):
+                        nonlocal best, budget_exhausted, previous_decode_time
+                        # Decode candidates in time order. Repeated seeks into a
+                        # 4K long-GOP clip otherwise decode the same GOP five times.
+                        for delta in sorted(deltas):
+                            if time.monotonic() >= self.deadline:
+                                budget_exhausted = True
+                                return
+                            target = max(0., center + delta)
+                            target_key = round(target, 9)
+                            if target_key in attempted or not capture.isOpened():
+                                continue
+                            attempted.add(target_key)
+                            if (previous_decode_time is None or target <= previous_decode_time or
+                                target - previous_decode_time > 2.):
+                                capture.set(cv2.CAP_PROP_POS_MSEC, target * 1000)
+                                previous_decode_time = None
+                            actual, raw_index, time_source = None, -1, "opencv_decoded_timestamp"
+                            while time.monotonic() < self.deadline and capture.grab():
+                                decoded_position = capture.get(cv2.CAP_PROP_POS_FRAMES)
+                                if not math.isfinite(decoded_position):
+                                    break
+                                raw_index = int(round(decoded_position)) - 1
+                                actual = capture.get(cv2.CAP_PROP_POS_MSEC) / 1000
+                                time_source = "opencv_decoded_timestamp"
+                                if (not math.isfinite(actual) or actual < 0 or
+                                    (raw_index > 0 and actual == 0) or
+                                    (previous_decode_time is not None and actual <= previous_decode_time)):
+                                    if not math.isfinite(fps) or fps <= 0:
+                                        actual = None
+                                        break
+                                    actual = raw_index / fps
+                                    time_source = "opencv_frame_index_fps_estimate"
+                                previous_decode_time = actual
+                                if actual + 1e-6 >= target:
+                                    break
+                            else:
+                                actual = None
+                            if actual is None:
+                                continue
+                            if (abs(actual - center) > limit + 1e-6 or
+                                raw_index in seen or raw_index in selected_indices or raw_index < 0):
+                                continue
+                            ok, image = capture.retrieve()
+                            if not ok or image is None or image.shape[:2] != original_gray.shape:
+                                continue
+                            seen.add(raw_index)
+                            ok, encoded = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                            if not ok:
+                                continue
+                            gray = cv2.imdecode(encoded, cv2.IMREAD_GRAYSCALE)
+                            if gray is None:
+                                continue
+                            score = laplacian_variance(gray)
+                            if score > best[0]:
+                                native_score = laplacian_variance(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY))
+                                best = score, encoded.tobytes(), actual, raw_index, native_score, time_source
 
-                search((0., -radius / 2, radius / 2, -radius, radius), radius)
-                initial_score = best[0]
-                expand = (self.coverage_search and initial_score < self.blur_threshold and
-                          fallback_radius > radius + 1e-6 and not budget_exhausted)
-                if expand:
-                    # Eight additional native seeks at most; adjacent sampling
-                    # bins never overlap. This recovers missed sharp moments,
-                    # without accepting a frame below the existing blur floor.
-                    search((sign * fallback_radius * fraction
-                            for fraction in (.25, .5, .75, 1.) for sign in (-1, 1)), fallback_radius)
-                if best[1] is None:
-                    result.append(path)
-                else:
-                    destination = folder / path.name
-                    destination.write_bytes(best[1])
-                    timestamps[path.name] = {"video_time_s": best[2], "video_time_source": "opencv_decoded_timestamp",
-                                             "video_raw_frame_index": best[3]}
-                    result.append(destination)
-                if best[3] is not None and best[3] != "":
-                    selected_indices.add(int(best[3]))
-                records.append({"frame": path.name, "sample_time_s": center, "selected_time_s": best[2],
-                                "raw_frame_index": best[3], "candidate_count": len(seen),
-                                "attempted_candidate_count": len(attempted), "native_blur_score": best[4],
-                                "original_blur_score": original_score, "selected_blur_score": best[0],
-                                "selected_original": best[1] is None,
-                                "coverage_search_triggered": expand,
-                                "coverage_search_recovered": bool(expand and best[0] >= self.blur_threshold),
-                                "passes_blur_threshold": best[0] >= self.blur_threshold})
+                    search((0., -radius / 2, radius / 2, -radius, radius), radius)
+                    initial_score = best[0]
+                    expand = (self.coverage_search and initial_score < self.blur_threshold and
+                              fallback_radius > radius + 1e-6 and not budget_exhausted)
+                    if expand:
+                        # Eight additional native seeks at most; adjacent sampling
+                        # bins never overlap. This recovers missed sharp moments,
+                        # without accepting a frame below the existing blur floor.
+                        search((sign * fallback_radius * fraction
+                                for fraction in (.25, .5, .75, 1.) for sign in (-1, 1)), fallback_radius)
+                    if best[1] is None:
+                        result.append(path)
+                    else:
+                        destination = folder / path.name
+                        destination.write_bytes(best[1])
+                        timestamps[path.name] = {"video_time_s": best[2], "video_time_source": best[5],
+                                                 "video_raw_frame_index": best[3]}
+                        result.append(destination)
+                    if best[3] is not None and best[3] != "":
+                        selected_indices.add(int(best[3]))
+                    records.append({"frame": path.name, "sample_time_s": center, "selected_time_s": best[2],
+                                    "raw_frame_index": best[3], "candidate_count": len(seen),
+                                    "video_time_source": best[5],
+                                    "attempted_candidate_count": len(attempted), "native_blur_score": best[4],
+                                    "original_blur_score": original_score, "selected_blur_score": best[0],
+                                    "selected_original": best[1] is None,
+                                    "coverage_search_triggered": expand,
+                                    "coverage_search_recovered": bool(expand and best[0] >= self.blur_threshold),
+                                    "passes_blur_threshold": best[0] >= self.blur_threshold})
+
+                if budget_exhausted:
+                    progress.close("budget exhausted")
         finally:
             capture.release()
         self.refinements.append({"video": str(video), "input_frame_count": len(frames),
+                                 "decoder": decoder,
                                  "initial_search_radius_s": radius, "coverage_search_radius_s": fallback_radius,
                                  "candidate_limit_per_frame": 13 if self.coverage_search else 5,
                                  "budget_exhausted": budget_exhausted, "frames": records})
@@ -140,6 +182,7 @@ class NativeFrameRefiner:
 
     def summary(self):
         value = {"method": "native_frame_selection", "refine_window_s": self.window_s,
+                 "decode_policy": "ascending candidates with sequential decode between nearby targets",
                  "coverage_search": self.coverage_search, "blur_threshold": self.blur_threshold,
                  "coverage_search_max_radius_s": 2. if self.coverage_search else None,
                  "coverage_search_radius_policy": "min(2 seconds, 0.45 * sampling interval), only below blur threshold" if self.coverage_search else "disabled",

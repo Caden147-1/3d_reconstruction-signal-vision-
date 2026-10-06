@@ -59,6 +59,9 @@ def load_fingerprints(path: Path) -> Tuple[List[str], List[Dict[str, Any]]]:
     ap_fields = [field for field in fields if field.startswith("ap_")]
     fingerprints: List[Dict[str, Any]] = []
     for row in rows:
+        # Handheld phone yaw cannot supply spatial labels for the camera map.
+        if row.get("pdr_heading_policy") != "phone-aligned" or row.get("pdr_position_status") != "phone_aligned_assumption":
+            continue
         x = safe_float(row.get("pdr_x"))
         y = safe_float(row.get("pdr_y"))
         confidence = fingerprint_confidence(row)
@@ -417,14 +420,17 @@ def run_wifi_positioning_pipeline(
 ) -> Dict[str, Any]:
     ap_fields, fingerprints = load_fingerprints(fingerprint_path)
     if not ap_fields or not fingerprints:
+        _, input_rows = read_csv(fingerprint_path)
+        radio_count = sum(fingerprint_confidence(row) > 0 for row in input_rows)
         for filename in (
             "wifi_localization_model.json", "wifi_localization_eval.csv",
             "wifi_signal_grid.csv", "wifi_signal_boundary.csv",
         ):
             (output_dir / filename).unlink(missing_ok=True)
         summary = {
-            "status": "no_valid_fingerprints" if fingerprint_path.exists() else "missing_input",
-            "explanation": "No usable fresh or confidence-weighted checkpoint fingerprints; stale generated localization outputs were removed.",
+            "status": ("no_usable_position_labels" if radio_count else "no_valid_fingerprints") if fingerprint_path.exists() else "missing_input",
+            "explanation": "WiFi coordinate localization requires explicitly usable position labels. Handheld/legacy phone-yaw XY is excluded; RF fingerprints remain available for visual match retrieval. Stale coordinate localization outputs were removed.",
+            "radio_fingerprint_count": radio_count,
             "fingerprint_path": str(fingerprint_path),
             "ap_count": len(ap_fields),
             "fingerprint_count": len(fingerprints),

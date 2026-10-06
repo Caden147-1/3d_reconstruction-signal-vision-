@@ -2,7 +2,7 @@
 """Validate that a COLMAP workspace still matches its current input manifest.
 
 The check is intentionally read-only. It prevents a dense run from silently
-using a database or sparse model created before new photo/video inputs were
+using a database or sparse model created before new video inputs were
 prepared.
 """
 
@@ -27,6 +27,10 @@ ALIGNMENT_RECORD = "pdr_alignment_decision.json"
 SPARSE_RUNNERS = {"run_colmap_sparse.bat", "run_colmap_automatic.bat"}
 REQUIRED_MODEL_FILES = ("cameras", "images", "points3D")
 OPTIONAL_MODEL_FILES = ("frames", "rigs")
+VIDEO_PIPELINE_CODE = ("video_sparse_mapper.py", "video_intrinsics.py")
+RESOURCE_PIPELINE_CODE = (*VIDEO_PIPELINE_CODE, "compute_resources.py", "portable_stage.py", "process_control.py")
+OPTIMIZED_PIPELINE_CODE = (*RESOURCE_PIPELINE_CODE, "sparse_optimization.py")
+RECOVERY_PIPELINE_CODE = (*OPTIMIZED_PIPELINE_CODE, "sparse_recovery.py", "sparse_quality.py")
 FileIdentityReader = Callable[[Path], Dict[str, Any] | None]
 
 
@@ -65,6 +69,23 @@ def sparse_input_identity(workspace: Path, runner: str) -> Dict[str, Any]:
         files[f"images/{name}"] = identity
     for name in ("image_list.txt", "match_pairs.txt", "pdr_alignment_refs.txt", "metadata/images_manifest.csv", runner):
         files[name] = file_identity(workspace / name)
+    runner_text = (workspace / runner).read_text(encoding="utf-8")
+    if any(name in runner_text for name in ("sparse_optimization.py", "compute_resources.py", "video_sparse_mapper.py")):
+        dependencies = (RECOVERY_PIPELINE_CODE if "sparse_recovery.py" in runner_text else
+                        OPTIMIZED_PIPELINE_CODE if "sparse_optimization.py" in runner_text else
+                        RESOURCE_PIPELINE_CODE if "compute_resources.py" in runner_text else VIDEO_PIPELINE_CODE)
+        for name in dependencies:
+            files["pipeline_code/" + name] = file_identity(Path(__file__).resolve().parent / name)
+    elif (workspace / "sparse_import/source_sparse_run_provenance.json").is_file():
+        # Imported models archive their implementation bytes; their stub never
+        # executes the current implementation or substitutes its newer hashes.
+        for name in RECOVERY_PIPELINE_CODE:
+            archived = workspace / "pipeline_code" / name
+            if archived.exists():
+                files["pipeline_code/" + name] = file_identity(archived)
+    if 'rem portable-stage-v1' in runner_text.splitlines():
+        for name in ('portable_stage.py', 'process_control.py'):
+            files['pipeline_code/' + name] = file_identity(Path(__file__).resolve().parent / name)
     summary_path = workspace / "colmap_workspace_summary.json"
     summary = json.loads(summary_path.read_text(encoding="utf-8")) if summary_path.exists() else {}
     mask = summary.get("colmap_mask", {})
@@ -87,7 +108,7 @@ def sparse_output_identity(workspace: Path) -> Dict[str, Any]:
     # Only an empty WAL is equivalent to no WAL; any content remains hashed.
     if files["database.db-wal"] is not None and files["database.db-wal"]["size"] == 0:
         files["database.db-wal"] = None
-    for name in (ALIGNMENT_RECORD, "pdr_alignment_reviewed_refs.txt"):
+    for name in (ALIGNMENT_RECORD, "pdr_alignment_reviewed_refs.txt", "video_intrinsics_summary.json", "sparse_optimization.json", "sparse_backbone_images.txt", "sparse_recovery_summary.json"):
         if (workspace / name).exists():
             files[name] = file_identity(workspace / name)
     for folder in ("sparse", "sparse_pdr_aligned", "sparse_pose_prior"):
@@ -110,7 +131,18 @@ def inspect_provenance(workspace: Path) -> Dict[str, Any]:
         recorded = json.loads(receipt.read_text(encoding="utf-8"))
         if recorded["schema_version"] != 1 or recorded["status"] != "complete":
             raise ValueError("Unsupported or incomplete provenance record")
+        if recorded.get("provenance_kind"):
+            from sparse_reuse import verify_import_record
+            verify_import_record(workspace, recorded)
+        if (workspace / "sparse_import_pending.json").exists():
+            return {"status": "incomplete_import", "error": "Sparse artifact import has not completed verification."}
         current_inputs = sparse_input_identity(workspace, recorded["inputs"]["runner"])
+        # A performance-only runner migration preserves historical model proof.
+        # New runs still snapshot the real current runner in sparse_input_identity.
+        from runner_migration import compatible_runner_identity
+        runner = recorded["inputs"]["runner"]
+        current_inputs["files"][runner] = compatible_runner_identity(
+            workspace, runner, recorded["inputs"]["files"].get(runner))
         if current_inputs != recorded["inputs"]:
             return {"status": "input_mismatch", "error": "Image bytes, masks, matching pairs, pose references, manifest or sparse runner changed."}
         current_outputs = sparse_output_identity(workspace)
@@ -149,7 +181,10 @@ def begin_sparse_run(workspace: Path, runner: str = "run_colmap_sparse.bat") -> 
     if failures:
         raise ValueError("; ".join(failures))
     inputs = sparse_input_identity(workspace, runner)
-    write_provenance(workspace / PENDING_NAME, {"schema_version": 1, "inputs": inputs})
+    from reconstruction_run_diagnostics import begin_run_log
+    write_provenance(workspace / PENDING_NAME, {
+        "schema_version": 1, "inputs": inputs, "run_log": begin_run_log(workspace),
+    })
 
 
 def complete_sparse_run(workspace: Path) -> None:
@@ -157,12 +192,14 @@ def complete_sparse_run(workspace: Path) -> None:
     if pending["schema_version"] != 1 or sparse_input_identity(workspace, pending["inputs"]["runner"]) != pending["inputs"]:
         raise ValueError("Sparse inputs changed during reconstruction; refusing to certify the result")
     failures = validation_failures(inspect_workspace(workspace), require_database_coverage=True,
-                                   require_sparse_model=True, require_provenance=False)
+                                   require_sparse_model=True, require_provenance=False, require_dense_readiness=False)
     if failures:
         raise ValueError("; ".join(failures))
+    from reconstruction_run_diagnostics import complete_run_log
     write_provenance(workspace / PROVENANCE_NAME, {
         "schema_version": 1, "status": "complete", "inputs": pending["inputs"],
         "outputs": sparse_output_identity(workspace),
+        "run_log": complete_run_log(workspace, pending.get("run_log", {})),
     })
     (workspace / PENDING_NAME).unlink()
 
@@ -462,6 +499,8 @@ def source_coverage(
 
 
 def inspect_workspace(workspace: Path) -> Dict[str, Any]:
+    from sparse_quality import assess_sparse_quality, summarize_coverage
+
     workspace = workspace.resolve()
     image_list = read_image_list(workspace / "image_list.txt")
     expected = set(image_list)
@@ -475,18 +514,29 @@ def inspect_workspace(workspace: Path) -> Dict[str, Any]:
     database_names, database_error = read_database_names(workspace / "database.db")
     selected_model = dense_input_model(workspace)
     sparse_names: Set[str] = set()
+    sparse_point_count = 0
     sparse_error = ""
     if selected_model is not None:
         try:
-            sparse_names = inspect_sparse_model(selected_model)["names"]
+            sparse_info = inspect_sparse_model(selected_model)
+            sparse_names = sparse_info["names"]
+            sparse_point_count = sparse_info["point_count"]
         except (OSError, ValueError, struct.error) as exc:
             sparse_error = str(exc)
+    manifest = workspace / "metadata" / "images_manifest.csv"
+    metadata = {}
+    if manifest.exists():
+        with manifest.open(encoding="utf-8-sig", newline="") as stream:
+            metadata = {row["image_file"]: row for row in csv.DictReader(stream)}
+    coverage = summarize_coverage(expected, sparse_names, metadata)
     return {
         "workspace": str(workspace),
         "input": {
             "listed_count": len(image_list),
             "unique_listed_count": len(expected),
             "directory_file_count": len(actual),
+            "missing_count": len(expected - actual),
+            "extra_count": len(actual - expected),
             "missing_files": sorted(expected - actual)[:20],
             "extra_files": sorted(actual - expected)[:20],
             "duplicate_list_entries": len(image_list) - len(expected),
@@ -496,6 +546,8 @@ def inspect_workspace(workspace: Path) -> Dict[str, Any]:
             "exists": (workspace / "database.db").exists(),
             "error": database_error,
             "image_count": len(database_names),
+            "missing_count": len(expected - database_names),
+            "extra_count": len(database_names - expected),
             "missing_names": sorted(expected - database_names)[:20],
             "extra_names": sorted(database_names - expected)[:20],
             "source_coverage": source_coverage(expected, source_by_name, database_names),
@@ -505,12 +557,33 @@ def inspect_workspace(workspace: Path) -> Dict[str, Any]:
             "exists": selected_model is not None,
             "error": sparse_error,
             "registered_image_count": len(sparse_names),
+            "point_count": sparse_point_count,
+            "missing_count": len(expected - sparse_names),
+            "extra_count": len(sparse_names - expected),
             "missing_names": sorted(expected - sparse_names)[:20],
             "extra_names": sorted(sparse_names - expected)[:20],
             "source_coverage": source_coverage(expected, source_by_name, sparse_names),
+            "quality": assess_sparse_quality(coverage, metadata),
         },
         "provenance": inspect_provenance(workspace),
     }
+
+
+def dense_readiness_failures(report: Dict[str, Any]) -> List[str]:
+    """Reject poor camera coverage before expensive dense reconstruction."""
+    from sparse_quality import assess_sparse_quality
+
+    sparse = report.get("dense_input_sparse", {})
+    if not sparse.get("exists") or sparse.get("error"):
+        return []  # Missing/invalid models are reported by the structural checks.
+    registered = sparse.get("registered_image_count", 0)
+    expected = report.get("input", {}).get("unique_listed_count", 0)
+    quality = sparse.get("quality")
+    if quality is None:
+        quality = assess_sparse_quality({"input_images": expected, "registered_images": registered}, {})
+    return ["Sparse coverage is not ready for dense reconstruction: " + failure +
+            ". Inspect sparse_recovery_summary.json and the mapper log; more depth maps cannot restore missing camera poses."
+            for failure in quality["failures"]]
 
 
 def validation_failures(
@@ -520,6 +593,7 @@ def validation_failures(
     require_database_coverage: bool = False,
     require_sparse_model: bool = False,
     require_provenance: bool = True,
+    require_dense_readiness: bool = True,
 ) -> List[str]:
     failures: List[str] = []
     input_info = report["input"]
@@ -549,6 +623,8 @@ def validation_failures(
             failures.append("the dense input sparse model has fewer than two registered images")
         elif sparse.get("extra_names"):
             failures.append("the dense input sparse model contains images outside the current image list")
+        if require_dense_readiness:
+            failures.extend(dense_readiness_failures(report))
         if require_provenance and report.get("provenance", {}).get("status") != "verified":
             failures.append("sparse input provenance is not verified: " + report.get("provenance", {}).get("error", "missing run record"))
     return failures
@@ -562,19 +638,19 @@ def print_summary(report: Dict[str, Any]) -> None:
     print(
         "[coverage] input: "
         f"listed={input_info['listed_count']}, files={input_info['directory_file_count']}, "
-        f"missing={len(input_info['missing_files'])}, extra={len(input_info['extra_files'])}",
+        f"missing={input_info['missing_count']}, extra={input_info['extra_count']}",
         flush=True,
     )
     database_state = "missing" if not database["exists"] else str(database["image_count"])
     print(
         "[coverage] database: "
-        f"images={database_state}, missing={len(database['missing_names'])}, extra={len(database['extra_names'])}",
+        f"images={database_state}, missing={database['missing_count']}, extra={database['extra_count']}",
         flush=True,
     )
     if sparse["exists"]:
         print(
             "[coverage] dense sparse input: "
-            f"registered={sparse['registered_image_count']}, path={sparse['path']}",
+            f"registered={sparse['registered_image_count']}, points={sparse.get('point_count', 'unknown')}, path={sparse['path']}",
             flush=True,
         )
     for source, values in database["source_coverage"].items():
@@ -582,6 +658,9 @@ def print_summary(report: Dict[str, Any]) -> None:
             f"[coverage] database {source}: {values['present_count']}/{values['expected_count']}",
             flush=True,
         )
+    if not sparse["exists"]:
+        print("[coverage] Sparse registration has not been produced yet.", flush=True)
+        return
     for source, values in sparse["source_coverage"].items():
         if values["expected_count"] and values["present_count"] < values["expected_count"]:
             print(

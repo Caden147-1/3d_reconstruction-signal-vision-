@@ -19,8 +19,8 @@ import numpy as np
 from dense_surface_filter import statistics_sample
 from mvs_observations import read_model
 from ply_io import validate_ply
-from reconstruction_diagnostics import stationary_group_center
-from reconstruction_evaluation import Snapshot
+from video_sensor_fusion import has_valid_video_sensor_sync
+from reconstruction_metrics import Snapshot
 from wifi_observations import fingerprint_confidence, fingerprint_similarity, visible_fingerprint
 from workspace_lock import WorkspaceBusyError, locked_workspace
 
@@ -82,30 +82,36 @@ def fit_planes(points, threshold, max_planes=6, iterations=256, min_support=300)
     return planes
 
 
-def checkpoint_anchors(rows, views):
-    """One RF observation and one robust camera center per capture stop."""
+def sensor_anchors(rows, views):
+    """Use one explicitly synchronized video camera per independent RF scan.
+
+    Fuzzy time windows cannot assign an RF measurement to one camera position.
+    Repeated frames observing the same scan do not multiply its weight.
+    """
     by_name = {v['name']: v for v in views}
-    grouped = defaultdict(list)
+    scans = {}
     for row in rows:
-        if row.get('source_type') == 'wifi_anchor_photo' and row.get('image_file') in by_name:
-            grouped[(row['session'], row['global_point_index'])].append(row)
-    anchors = []
-    for (session, point), group in sorted(grouped.items()):
-        row = group[0]
+        if (row.get('source_type') != 'video_base_frame' or not has_valid_video_sensor_sync(row)
+                or row.get('image_file') not in by_name or not row.get('wifi_elapsed_ts')):
+            continue
         confidence = fingerprint_confidence(row)
         if confidence <= 0:
             continue
-        center, _, scatter = stationary_group_center([by_name[r['image_file']]['C'] for r in group])
-        anchors.append(dict(session=session, checkpoint=point, center=center,
-                            scatter=scatter, confidence=confidence, fingerprint=row))
-    return anchors
+        key = row['session'], str(row['wifi_elapsed_ts'])
+        gap = abs(float(row['sensor_elapsed_ts']) - float(row['wifi_elapsed_ts']))
+        if key not in scans or gap < scans[key][0]:
+            scans[key] = (gap, row, confidence)
+    return [dict(session=key[0], checkpoint=key[1],
+                 center=by_name[row['image_file']]['C'], scatter=0.,
+                 confidence=confidence, fingerprint=row)
+            for key, (_, row, confidence) in sorted(scans.items())]
 
 
 def relative_frame(anchors):
     """Fit a capture plane; it is a floor proxy, not a gravity measurement."""
     centers = np.array([a['center'] for a in anchors])
     if len(centers) < 3:
-        raise ValueError('Need at least three registered WiFi checkpoints')
+        raise ValueError('Need at least three explicitly synchronized WiFi video positions')
     origin = np.median(centers, axis=0)
     _, singular, axes = np.linalg.svd(centers - origin, full_matrices=False)
     if singular[1] <= max(singular[0] * 1e-3, 1e-9):
@@ -209,7 +215,7 @@ def density_boundary_prior(workspace, snapshot, *, mode='radio', seed=0):
         return None, dict(status='unavailable', reason='missing_wifi_manifest')
     views, _ = read_model(workspace / 'dense/sparse', snapshot)
     with manifest.open(encoding='utf-8-sig', newline='') as handle:
-        anchors = checkpoint_anchors(list(csv.DictReader(handle)), views)
+        anchors = sensor_anchors(list(csv.DictReader(handle)), views)
     try:
         origin, axes, xy, spacing, tilt = relative_frame(anchors)
     except ValueError as error:
@@ -404,7 +410,7 @@ def estimate_boundary(workspace, *, wifi_weight=.5, grid_size=96):
     if snapshot.identity(manifest) is None:
         raise ValueError('Workspace image/WiFi manifest is missing')
     with manifest.open(encoding='utf-8-sig', newline='') as handle:
-        anchors = checkpoint_anchors(list(csv.DictReader(handle)), views)
+        anchors = sensor_anchors(list(csv.DictReader(handle)), views)
     origin, axes, xy, spacing, tilt = relative_frame(anchors)
     confidence = np.array([a['confidence'] / (1 + (a['scatter'] / spacing)**2) for a in anchors])
     links = radio_links(anchors, xy, spacing)
@@ -463,7 +469,7 @@ def estimate_boundary(workspace, *, wifi_weight=.5, grid_size=96):
         points=local[::max(1, (len(local)+9999)//10000), :2].round(5).tolist())
     payload['code_identity'] = {name: snapshot.identity(Path(__file__).with_name(name)) for name in
                               ('wifi_boundary.py', 'wifi_observations.py',
-                               'reconstruction_diagnostics.py', 'mvs_observations.py')}
+                               'video_sensor_fusion.py', 'mvs_observations.py')}
     payload['inputs'] = {str(p): identity for p, (identity, _) in snapshot.files.items()}
     snapshot.verify_unchanged()
     if verified_context(workspace) != binding:

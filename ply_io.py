@@ -209,12 +209,6 @@ def xyz_indices(properties: Sequence[PlyProperty]) -> Tuple[int, int, int]:
         raise ValueError("PLY vertex properties must include x, y, z") from exc
 
 
-def color_indices(properties: Sequence[PlyProperty]) -> Tuple[int, int, int] | None:
-    names = [name for name, _kind in properties]
-    for triplet in (("red", "green", "blue"), ("r", "g", "b")):
-        if all(name in names for name in triplet):
-            return names.index(triplet[0]), names.index(triplet[1]), names.index(triplet[2])
-    return None
 
 
 def row_xyz(row: PlyRow, indices: Tuple[int, int, int]) -> Tuple[float, float, float]:

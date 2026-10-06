@@ -1,6 +1,6 @@
 """Read calibrated COLMAP observations without changing the reconstruction.
 
-Only undistorted pinhole models are accepted. Image IDs are never treated as
+Only undistorted perspective models are accepted. Image IDs are never treated as
 array indices. Depth and normal maps use COLMAP's planar, Fortran-order layout.
 """
 from __future__ import annotations
@@ -12,7 +12,28 @@ import struct
 import numpy as np
 
 from colmap_workspace_check import CAMERA_MODELS, contained_path, read_exact
-from reconstruction_evaluation import Snapshot
+from reconstruction_metrics import Snapshot
+
+
+def undistorted_intrinsics(kind, params):
+    """Accept perspective distortion models only when distortion is exactly zero.
+
+    COLMAP 3.13 keeps the original model name for IsUndistorted() cameras.
+    Zero-coefficient fisheye models are not perspective pinhole projections.
+    """
+    layouts = {"SIMPLE_PINHOLE": (3, 3), "PINHOLE": (4, 4),
+               "SIMPLE_RADIAL": (4, 3), "RADIAL": (5, 3),
+               "OPENCV": (8, 4), "FULL_OPENCV": (12, 4)}
+    count, intrinsic_count = layouts.get(kind, (0, 0))
+    p = np.asarray(params, dtype=float)
+    if (not count or p.shape != (count,) or not np.isfinite(p).all()
+            or np.any(p[intrinsic_count:] != 0)):
+        raise ValueError(f"Undistorted perspective camera required; got {kind} with parameters {p.tolist()}. "
+                         "Run image_undistorter for cameras with nonzero distortion.")
+    if intrinsic_count == 3:
+        f, cx, cy = p[:3]
+        return f, f, cx, cy
+    return tuple(p[:4])
 
 
 def rotation(q):
@@ -86,13 +107,7 @@ def read_model(model: Path, snapshot=None):
     views = []
     for iid, q, t, cid, name, ids in images:
         kind, w, h, params = cameras[cid]
-        if kind == "SIMPLE_PINHOLE" and len(params) == 3:
-            fx, cx, cy = params
-            fy = fx
-        elif kind == "PINHOLE" and len(params) == 4:
-            fx, fy, cx, cy = params
-        else:
-            raise ValueError("Observation analysis requires undistorted PINHOLE cameras")
+        fx, fy, cx, cy = undistorted_intrinsics(kind, params)
         k = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1.]])
         r, t = rotation(q), np.asarray(t)
         if min(w, h, fx, fy) <= 0 or not np.isfinite(k).all() or not np.isfinite(t).all():

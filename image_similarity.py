@@ -7,18 +7,91 @@ also have visual support. It does not remove pairs from COLMAP by itself.
 
 from __future__ import annotations
 
-import argparse
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextlib import contextmanager
 import csv
 import json
 import math
-import os
 import statistics
 import threading
 from dataclasses import dataclass
 from heapq import nsmallest
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, TypeVar
+
+from progress_output import WorkProgress
+
+
+_CV_THREAD_SETTINGS_LOCK = threading.RLock()
+_Input = TypeVar("_Input")
+_Output = TypeVar("_Output")
+
+
+@contextmanager
+def opencv_worker_budget(cv2: Any, workers: int):
+    """Use one native OpenCV thread per outer worker, restoring caller state.
+
+    OpenCV's thread budget is process-wide. Hold this lock until our pool joins
+    so simultaneous similarity analyses cannot change each other's allocation.
+    """
+    with _CV_THREAD_SETTINGS_LOCK:
+        previous_threads = cv2.getNumThreads()
+        try:
+            # A single outer worker is also an explicit one-CPU allocation.
+            # Leaving OpenCV's default pool enabled would silently exceed it.
+            cv2.setNumThreads(1)
+            yield
+        finally:
+            cv2.setNumThreads(previous_threads)
+
+
+def bounded_parallel_map(
+    function: Callable[[_Input], _Output],
+    items: Sequence[_Input],
+    workers: int,
+    thread_name: str,
+    progress: Optional[WorkProgress] = None,
+) -> List[_Output]:
+    """Keep at most one in-flight task per worker and return input order.
+
+    Unlike Executor.map, this does not enqueue the entire pair graph. Observe
+    all completed tasks before refilling; any exception stops new submissions.
+    """
+    if not items:
+        return []
+    if workers <= 1:
+        serial_results = []
+        for item in items:
+            serial_results.append(function(item))
+            if progress is not None:
+                progress.update(len(serial_results))
+        return serial_results
+    results: Dict[int, _Output] = {}
+    remaining = iter(enumerate(items))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix=thread_name) as pool:
+        pending = {}
+
+        def replenish() -> None:
+            while len(pending) < workers:
+                entry = next(remaining, None)
+                if entry is None:
+                    break
+                index, item = entry
+                pending[pool.submit(function, item)] = index
+
+        try:
+            replenish()
+            while pending:
+                completed, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for future in completed:
+                    results[pending.pop(future)] = future.result()
+                    if progress is not None:
+                        progress.update(len(results))
+                replenish()
+        finally:
+            for future in pending:
+                future.cancel()
+    return [results[index] for index in range(len(items))]
 
 
 IMAGE_SIMILARITY_FIELDS = [
@@ -139,28 +212,18 @@ def select_rows(rows: Sequence[Dict[str, str]], max_pairs: int) -> List[Dict[str
         key=lambda row: safe_float(row.get("edge_weight"), 0.0),
         reverse=True,
     )
-    # Reserve a quarter of a bounded verification budget for RF proposals.
-    # The remaining slots still compete on priority, and geometry is unchanged.
-    wifi = [row for row in ranked if row.get("reason") == "wifi_fingerprint_recovery"]
-    reserved = []
-    checkpoint_uses, image_uses = {}, {}
-    def checkpoint_keys(row):
-        return [row.get("wifi_checkpoint_" + side) or "image:" + row.get("image_" + side, "") for side in ("a", "b")]
-    # Share the reserved budget across stops before repeating already covered
-    # stops. Within that coverage level, prefer underused photos and RF score.
+    # Reserve a bounded share for RF proposals, balancing video frame coverage.
+    wifi = [row for row in ranked if row.get("reason") in {"wifi_fingerprint_recovery", "video_wifi_revisit"}]
+    reserved, image_uses = [], {}
     for _ in range(min(len(wifi), max(1, max_pairs // 4))):
         def priority(row):
-            uses = [checkpoint_uses.get(key, 0) for key in checkpoint_keys(row)]
-            images = [image_uses.get(row.get("image_" + side, ""), 0) for side in ("a", "b")]
+            uses = [image_uses.get(row.get("image_" + side, ""), 0) for side in ("a", "b")]
             weight = safe_float(row.get("edge_weight"), 0.0)
-            return (sum(use > 0 for use in uses), max(uses), sum(uses),
-                    sum(use > 0 for use in images), sum(images),
+            return (sum(use > 0 for use in uses), sum(uses),
                     -weight if math.isfinite(weight) else 0.0, row.get("image_a", ""), row.get("image_b", ""))
         chosen = min(wifi, key=priority)
         wifi.remove(chosen)
         reserved.append(chosen)
-        for key in checkpoint_keys(chosen):
-            checkpoint_uses[key] = checkpoint_uses.get(key, 0) + 1
         for side in ("a", "b"):
             name = chosen.get("image_" + side, "")
             image_uses[name] = image_uses.get(name, 0) + 1
@@ -219,7 +282,8 @@ def read_image_features(
     if not path.exists():
         return ImageFeatures(image_name=image_name, status="missing", notes=str(path))
 
-    image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    from frame_io import read_frame
+    image = read_frame(path, cv2.IMREAD_COLOR)
     if image is None:
         return ImageFeatures(image_name=image_name, status="unreadable", notes=str(path))
 
@@ -250,20 +314,18 @@ def prepare_image_features(
     """Read each image once with bounded concurrency and stable cache order.
 
     OpenCV releases the GIL while reading and extracting ORB features. Each
-    worker owns its ORB object; no OpenCV thread or RNG settings are changed.
-    Pair verification remains sequential so its RANSAC seed is unaffected.
+    worker owns its ORB object. Inner OpenCV parallelism is disabled while the
+    outer pool runs, then the caller's thread setting is restored.
     Set feature_workers=1 for the serial path, or 0 for automatic selection.
-    Machines with at least 16 logical CPUs use up to eight workers; others four.
-    Explicit worker counts are limited to eight concurrent image decodes.
+    Automatic selection uses the available CPU allocation, bounded by task count.
     """
-    if not isinstance(config.feature_workers, int) or not 0 <= config.feature_workers <= 8:
-        raise ValueError("feature_workers must be an integer from 0 to 8 (0=auto, 1=serial)")
+    from compute_resources import worker_count
+    workers = worker_count(config.feature_workers)
     names = list(dict.fromkeys(image_names))
     if not names:
         return {}
-    cpus = os.cpu_count() or 1
-    auto_workers = 8 if cpus >= 16 else min(4, cpus)
-    workers = min(len(names), config.feature_workers or auto_workers)
+    workers = min(len(names), workers)
+    print(f"[resources] Image feature workers={workers}; pending tasks are bounded to this budget.", flush=True)
     worker_state = threading.local()
 
     def read_one(name: str) -> ImageFeatures:
@@ -271,35 +333,10 @@ def prepare_image_features(
             worker_state.orb = cv2.ORB_create(nfeatures=max(100, config.orb_features))
         return read_image_features(name, images_dir, cv2, worker_state.orb, config)
 
-    if workers == 1:
-        return {name: read_one(name) for name in names}
-
-    # Keep at most one pending image per worker instead of queuing the entire
-    # dataset. Refill as images finish so a slow decode cannot idle other workers.
-    features: Dict[str, ImageFeatures] = {}
-    remaining = iter(names)
-    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="image-features") as pool:
-        pending = {}
-        for _ in range(workers):
-            name = next(remaining)
-            pending[pool.submit(read_one, name)] = name
-        try:
-            while pending:
-                completed, _ = wait(pending, return_when=FIRST_COMPLETED)
-                # Observe every completed result before submitting more work;
-                # a failure behind a slow image must stop replenishing the pool.
-                for future in completed:
-                    name = pending.pop(future)
-                    features[name] = future.result()
-                while len(pending) < workers:
-                    name = next(remaining, None)
-                    if name is None:
-                        break
-                    pending[pool.submit(read_one, name)] = name
-        finally:
-            for future in pending:
-                future.cancel()
-    return {name: features[name] for name in names}
+    with opencv_worker_budget(cv2, workers), WorkProgress(
+            "Visual matching: diagnostic features", len(names), "images") as progress:
+        features = bounded_parallel_map(read_one, names, workers, "image-features", progress)
+    return dict(zip(names, features))
 
 
 def pair_hist_correlation(cv2: Any, features_a: ImageFeatures, features_b: ImageFeatures) -> Optional[float]:
@@ -346,6 +383,8 @@ def fundamental_inliers(
     try:
         # Pair verification must not depend on which sensor-derived candidates
         # happened to be evaluated before this pair in another experiment arm.
+        # OpenCV keeps its RNG in thread-local storage; seed on the same worker
+        # that invokes RANSAC so scheduling cannot change a pair's result.
         cv2.setRNGSeed(0)
         matrix, mask = cv2.findFundamentalMat(src, dst, cv2.FM_RANSAC, 3.0, 0.99)
     except cv2.error:
@@ -486,6 +525,30 @@ def analyze_pair(
     }
 
 
+def analyze_pairs(
+    rows: Sequence[Dict[str, str]],
+    feature_cache: Dict[str, ImageFeatures],
+    cv2: Any,
+    np: Any,
+    config: SimilarityConfig,
+) -> List[Dict[str, Any]]:
+    """Verify independent pairs concurrently with deterministic input order."""
+    if not rows:
+        return []
+    from compute_resources import worker_count
+    workers = worker_count(config.feature_workers, tasks=len(rows))
+    print(f"[resources] Pair verification workers={workers}; pairs={len(rows)}.", flush=True)
+
+    def verify(row: Dict[str, str]) -> Dict[str, Any]:
+        return analyze_pair(
+            row, feature_cache[row["image_a"]], feature_cache[row["image_b"]], cv2, np, config,
+        )
+
+    with opencv_worker_budget(cv2, workers), WorkProgress(
+            "Visual matching: pair verification", len(rows), "pairs") as progress:
+        return bounded_parallel_map(verify, rows, workers, "image-pairs", progress)
+
+
 def count_by(rows: Sequence[Dict[str, Any]], field: str) -> Dict[str, int]:
     counts: Dict[str, int] = {}
     for row in rows:
@@ -568,7 +631,12 @@ def recovery_candidates(
     cv2: Any,
     neighbors: int,
 ) -> List[Dict[str, Any]]:
-    """Use a fixed visual top-k pool, then omit pairs already in the route graph."""
+    """Spend visual top-k slots on new pairs outside the existing video graph.
+
+    Adjacent frames often dominate appearance scores. Exclude their existing
+    pairs before ranking so they cannot consume the entire revisit budget.
+    These are proposals only; analyze_pair still verifies their geometry.
+    """
     if neighbors <= 0:
         return []
     valid = [f for f in features if f.status == "ok" and f.keypoint_count >= 15]
@@ -577,16 +645,15 @@ def recovery_candidates(
         ranked: List[Tuple[float, str]] = []
         for right in valid:
             pair = tuple(sorted((left.image_name, right.image_name)))
-            if left is right:
+            if left is right or pair in existing_pairs:
                 continue
             _distance, hash_similarity = pair_dhash(left, right)
             correlation = pair_hist_correlation(cv2, left, right)
             score = 0.5 * (hash_similarity or 0.0) + 0.5 * max(0.0, correlation or 0.0)
             ranked.append((score, right.image_name))
-        for score, name in sorted(ranked, key=lambda item: (-item[0], item[1]))[:neighbors]:
+        for score, name in nsmallest(neighbors, ranked, key=lambda item: (-item[0], item[1])):
             pair = tuple(sorted((left.image_name, name)))
-            if pair not in existing_pairs:
-                candidates[pair] = score
+            candidates[pair] = score
     return [
         {"image_a": a, "image_b": b, "reason": "visual_recovery", "edge_weight": score}
         for (a, b), score in sorted(candidates.items())
@@ -716,8 +783,7 @@ def analyze_image_similarity_edges(
         [row[key] for row in selected_rows for key in ("image_a", "image_b")],
         images_dir, cv2, config,
     )
-    rows = [analyze_pair(row, feature_cache[row["image_a"]], feature_cache[row["image_b"]], cv2, np, config)
-            for row in selected_rows]
+    rows = analyze_pairs(selected_rows, feature_cache, cv2, np, config)
 
     recovery_rows: List[Dict[str, Any]] = []
     if recovery_image_names is not None and config.recovery_neighbors > 0:
@@ -733,10 +799,7 @@ def analyze_image_similarity_edges(
             cv2,
             config.recovery_neighbors,
         )
-        for row in recovery_edges:
-            recovery_rows.append(analyze_pair(
-                row, feature_cache[row["image_a"]], feature_cache[row["image_b"]], cv2, np, config,
-            ))
+        recovery_rows = analyze_pairs(recovery_edges, feature_cache, cv2, np, config)
     rows.extend(recovery_rows)
     targeted_edges = []
     targeted_rows = []
@@ -749,10 +812,7 @@ def analyze_image_similarity_edges(
             list(feature_cache.values()), evaluated, cv2, config.recovery_neighbors,
             weak_names, references, recovery_metadata, config.wifi_recovery_enabled,
         )
-        for row in targeted_edges:
-            result = analyze_pair(row, feature_cache[row["image_a"]], feature_cache[row["image_b"]], cv2, np, config)
-            result.update(recovery_target=row["recovery_target"], wifi_retrieval_score=row["wifi_retrieval_score"])
-            targeted_rows.append(result)
+        targeted_rows = analyze_pairs(targeted_edges, feature_cache, cv2, np, config)
         rows.extend(targeted_rows)
     write_csv_rows(output_csv, IMAGE_SIMILARITY_FIELDS, rows)
     summary = build_summary(
@@ -773,7 +833,7 @@ def analyze_image_similarity_edges(
             "max_pairs_scope": "route_and_wifi_candidates; visual recovery uses a separate per-image neighbor budget",
             "wifi_budget_reservation_fraction": 0.25,
             "wifi_budget_allocation": ("all_candidates" if config.max_pairs <= 0 or len(edge_rows) <= config.max_pairs
-                                       else "checkpoint_and_photo_coverage_then_RF_priority"),
+                                       else "video_frame_coverage_then_RF_priority"),
             "targeted_recovery": {
                 "target_image_count": len(weak_names),
                 "candidate_pair_count": len(targeted_rows),
@@ -787,7 +847,7 @@ def analyze_image_similarity_edges(
                 "candidate_pair_count": len(recovery_rows),
                 "geometry_supported_pair_count": sum(row["visual_decision"] == "geometry_supported" for row in recovery_rows),
                 "neighbors_per_image": config.recovery_neighbors,
-                "explanation": "Appearance retrieves candidates outside route/slot windows; only geometry-supported candidates can be added to the COLMAP list.",
+                "explanation": "Appearance top-k excludes existing video/sensor pairs before ranking; only geometry-supported new candidates can be added to the COLMAP list.",
             },
             "image_status_counts": count_by(
                 [
@@ -836,48 +896,3 @@ def analyze_workspace_image_similarity(
         recovery_image_names=recovery_image_names,
         recovery_metadata=recovery_metadata,
     )
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--workspace", type=Path, default=Path("colmap_workspace"))
-    parser.add_argument("--images-dir", type=Path)
-    parser.add_argument("--match-graph", type=Path)
-    parser.add_argument("--output", type=Path)
-    parser.add_argument("--summary", type=Path)
-    parser.add_argument("--max-pairs", type=int, default=0, help="Analyze all pairs by default; set a positive sample cap.")
-    parser.add_argument("--max-image-size", type=int, default=900)
-    parser.add_argument("--orb-features", type=int, default=1500)
-    parser.add_argument("--feature-workers", type=int, choices=range(9), default=0,
-                        help="Concurrent image feature readers (0=auto, up to 8 on 16+ logical CPUs; 1=serial; maximum 8).")
-    parser.add_argument("--min-visual-score", type=float, default=0.22)
-    return parser.parse_args()
-
-
-def main() -> int:
-    args = parse_args()
-    workspace_dir = args.workspace.resolve()
-    images_dir = args.images_dir.resolve() if args.images_dir else workspace_dir / "images"
-    match_graph = args.match_graph.resolve() if args.match_graph else workspace_dir / "match_graph_edges.csv"
-    output = args.output.resolve() if args.output else workspace_dir / "image_similarity_edges.csv"
-    summary_path = args.summary.resolve() if args.summary else workspace_dir / "image_similarity_summary.json"
-    _fields, edge_rows = read_csv(match_graph)
-    summary = analyze_image_similarity_edges(
-        images_dir=images_dir,
-        edge_rows=edge_rows,
-        output_csv=output,
-        summary_path=summary_path,
-        config=SimilarityConfig(
-            max_pairs=args.max_pairs,
-            max_image_size=args.max_image_size,
-            orb_features=args.orb_features,
-            feature_workers=args.feature_workers,
-            min_visual_score=args.min_visual_score,
-        ),
-    )
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
-    return 0 if summary.get("status") in {"ok", "skipped"} else 1
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

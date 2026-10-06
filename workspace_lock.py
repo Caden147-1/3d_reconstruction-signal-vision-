@@ -66,6 +66,31 @@ def inherited_lock_held(workspace):
     return False
 
 
+def workspace_activity(workspace):
+    """Probe the OS lock without changing its owner record or trusting a stale PID."""
+    key = lock_key(workspace)
+    path = Path(key) / ".pipeline.lock"
+    try:
+        with path.open("r+b", buffering=0) as handle:
+            with _mutex:
+                active = key in _owners
+            if not active:
+                try:
+                    kernel_lock(handle)
+                except OSError:
+                    active = True
+                else:
+                    kernel_lock(handle, unlock=True)
+            handle.seek(1)
+            try:
+                owner = json.loads(handle.read().decode("utf-8"))
+            except (ValueError, UnicodeError):
+                owner = {}
+            return {"active": active, "owner": owner}
+    except FileNotFoundError:
+        return {"active": False, "owner": {}}
+
+
 @contextmanager
 def workspace_lock(workspace):
     key = lock_key(workspace)

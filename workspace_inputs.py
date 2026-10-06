@@ -9,6 +9,8 @@ RECONSTRUCTION_OUTPUTS = (
     "pdr_alignment_decision.json", "pdr_alignment_reviewed_refs.txt",
     "sparse_pdr_aligned.pending",
     "sparse", "sparse_pdr_aligned", "sparse_pose_prior", "automatic",
+    "sparse_backbone", "sparse_backbone_images.txt", "sparse_optimization.json",
+    "sparse_recovery", "sparse_recovery_summary.json",
     "dense", "stereo", "final.ply", "final_output_summary.json",
     "meshed-poisson.ply", "meshed-delaunay.ply", "fused_filtered.ply",
     "point_filter_summary.json",
