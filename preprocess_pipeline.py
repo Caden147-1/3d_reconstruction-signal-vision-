@@ -1483,7 +1483,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.set_defaults(skip_colmap_meshing=True)
     parser.add_argument("--keep-generated-inputs", action="store_true", help="Keep main.py's generated video frames and exported image copies after successful reconstruction.")
     parser.add_argument('--skip-startup-cleanup', action='store_true',
-                        help='Keep historical reconstruction caches at startup; current selected outputs still follow the normal fresh-run policy.')
+                        help='Keep intermediate data in other output directories at startup; selected outputs still follow the normal fresh-run policy.')
     parser.add_argument("--skip-point-cloud-filter", action="store_true", help="Skip the filtered fused point cloud post-processing output.")
     parser.add_argument("--point-filter-method", choices=("observed", "wifi-density", "connected-density"), default="observed",
                         help="Observed preserves unknown/weak surfaces and removes only verified conflicts; density methods are legacy alternatives.")

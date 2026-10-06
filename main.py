@@ -153,6 +153,7 @@ def reset_stopped_outputs(args):
         free_after = shutil.disk_usage(root).free
         result = {
             'status': 'completed', 'scope': 'selected_stopped_run_outputs', 'directories': measurements,
+            'timestamp_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
             'removed_files': sum(item['files'] for item in measurements),
             'removed_logical_bytes': sum(item['logical_bytes'] for item in measurements),
             'free_bytes_before': free_before, 'free_bytes_after': free_after,
@@ -279,14 +280,6 @@ def main() -> int:
         workspace = resolve_colmap_workspace(args).resolve()
         if workspace_activity(workspace)['active']:
             return follow_active_run(workspace)
-        if not args.skip_startup_cleanup:
-            from startup_cleanup import cleanup_project
-            inputs = [(args.root.resolve() / value).absolute() for key, value in vars(args).items()
-                      if isinstance(value, Path) and key not in {'root', 'output', 'reconstruction_output', 'colmap_workspace'}]
-            try:
-                cleanup_project(args.root, protected=[*paths, *inputs])
-            except (OSError, ValueError) as exc:
-                print(f'[cleanup] Startup cleanup deferred: {exc}', flush=True)
         with workspace_lock(workspace), ExitStack() as stack:
             for path in sorted(paths[:2]):
                 stack.enter_context(workspace_lock(path))
@@ -345,7 +338,20 @@ def run_locked_pipeline(argv, args) -> int:
             print(f"[error] {exc}. Existing results were not reset.", flush=True)
             return 2
         print(f"[preflight] COLMAP {capabilities['version']}: CUDA build and required command options verified.", flush=True)
-    reset_stopped_outputs(args)
+    # Preflight and selected-output locks must succeed before removing any
+    # intermediate data. Log both phases in the new run's console output.
+    from startup_cleanup import cleanup_project, record_startup_cleanup
+    other_cleanup = None
+    if not args.skip_startup_cleanup:
+        inputs = [(args.root.resolve() / value).absolute() for key, value in vars(args).items()
+                  if isinstance(value, Path) and key not in {'root', 'output', 'reconstruction_output', 'colmap_workspace'}]
+        try:
+            other_cleanup = cleanup_project(args.root, protected=[*output_paths(args), *inputs])
+        except (OSError, ValueError) as exc:
+            print(f'[cleanup] Startup cleanup deferred: {exc}', flush=True)
+            other_cleanup = {'status': 'deferred', 'removed_files': 0, 'removed_logical_bytes': 0, 'error': str(exc)}
+    selected_cleanup = reset_stopped_outputs(args)
+    record_startup_cleanup(args.root, other_cleanup, selected_cleanup)
     tracking = None
     if run_after_preprocess and not args.keep_generated_inputs:
         from generated_input_cleanup import prepare_tracking

@@ -13,9 +13,12 @@ from colmap_workspace_check import write_provenance
 from workspace_lock import WorkspaceBusyError, workspace_lock
 
 IMAGES = {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff'}
-MODEL_FILES = {name + suffix for name in ('cameras', 'images', 'points3D', 'frames', 'rigs')
+MODEL_FILES = {name + suffix for name in ('cameras', 'images', 'points3d', 'frames', 'rigs')
                for suffix in ('.bin', '.txt')}
-SKIP = {'.git', '.venv', '.agents', '.codex', 'video', 'pic', 'checkpoints', 'node_modules', '__pycache__'}
+SKIP = {'.git', '.venv', '.agents', '.codex', 'checkpoints', 'weights', 'node_modules'}
+FINAL_NAMES = {'final.ply', 'meshed-poisson.ply', 'meshed-delaunay.ply'}
+CODE_SUFFIXES = {'.py', '.bat', '.ps1', '.sh', '.exe', '.dll', '.so'}
+TEMP_SUFFIXES = {'.bin', '.npy', '.npz', '.raw', '.pyc', '.tmp', '.db', '.sqlite', '.sqlite3', '.vis'}
 
 
 def intersects(path, protected):
@@ -51,138 +54,161 @@ def files_in(root, folder):
     return files
 
 
-def discover(root, protected):
-    scopes = [root/'generated', root/'experiments', root/'processed']
-    scopes += [path for path in root.glob('colmap_workspace*') if path.is_dir()]
-    scopes += [path for path in root.glob('processed_*') if path.is_dir()]
-    workspaces, processed = [], []
-    pending = [path for path in scopes if path.is_dir() and not intersects(path, protected)]
-    # The generated root contains protected current outputs; visit its siblings.
-    for scope in (root/'generated', root/'experiments'):
-        if scope.is_dir() and scope not in pending and not any(scope == p or scope.is_relative_to(p) for p in protected):
-            checked_path(root, scope)
-            pending.extend(p for p in scope.iterdir() if p.is_dir() and not intersects(p, protected))
-    seen = set()
-    while pending:
-        folder = pending.pop()
-        if folder in seen or intersects(folder, protected) or folder.name in SKIP or folder.name.startswith('.') or folder.suffix == '.sess':
-            continue
-        seen.add(folder)
-        try:
-            checked_path(root, folder)
-        except ValueError:
-            continue
-        if ((folder/'colmap_workspace_summary.json').is_file() or
-                ((folder/'database.db').is_file() and (folder/'images').is_dir()) or
-                (folder/'sparse_optimization.json').is_file()):
-            workspaces.append(folder)
-            continue
-        if (folder/'video_frames_summary.json').is_file():
-            processed.append(folder)
-            continue
-        pending.extend(p for p in folder.iterdir() if p.is_dir())
-    return sorted(workspaces), sorted(processed)
-
-
 def cleanup_plan(root, protected):
-    workspaces, processed = discover(root, protected)
+    """Identify generated data, including stopped partial runs and old archives.
+
+    Scripts, reports, captures and final exports are not disposable intermediates.
+    Lock inodes are retained, including inside an otherwise empty old directory.
+    """
     targets, skipped = [], []
-    def add(folder, owner, kind, allowed):
-        if not folder.is_dir() or intersects(folder, protected):
+    scopes = [root/name for name in ('generated', 'experiments', 'processed', 'reconstruction_dataset', '__pycache__')]
+    for pattern in ('colmap_workspace*', 'processed_*', 'reconstruction_dataset_*'):
+        scopes.extend(root.glob(pattern))
+    # Discover custom main outputs by their ownership record, without traversing
+    # arbitrary source directories or treating every .bin as a generated file.
+    scopes.extend(path for path in root.iterdir() if path.is_dir() and (path/'.main_output_owner.json').is_file())
+    seen = set()
+
+    def walk(folder, owner, kind, archive=False):
+        if folder in seen or any(folder == p or folder.is_relative_to(p) for p in protected):
+            return
+        if folder.name in SKIP or folder.suffix.lower() == '.sess' or (folder.name.startswith('.') and folder.name != '.storage_cleanup'):
             return
         try:
-            files = files_in(root, folder)
-            if not files or not all(allowed(path) for path in files):
-                return
-            targets.append({'path': str(folder.relative_to(root)), 'owner': str(owner.relative_to(root)),
-                            'kind': kind, 'logical_bytes': sum(p.stat().st_size for p in files), 'files': len(files)})
+            checked_path(root, folder)
+            if folder.parent == root/'generated/results' and not (folder/'archive.json').is_file():
+                return  # A new result archive is still being published.
+            seen.add(folder)
+            archive = archive or (folder/'archive.json').is_file()
+            if folder.parent in (root/'generated', root/'experiments'):
+                owner, kind = folder, 'diagnostic'
+            ownership = read_json(folder/'.main_output_owner.json')
+            if (folder/'colmap_workspace_summary.json').is_file() or (folder/'sparse_optimization.json').is_file():
+                owner, kind = folder, 'workspace'
+            elif (folder/'processing_summary.json').is_file() or (folder/'video_frames_summary.json').is_file():
+                owner, kind = folder, 'processed'
+            elif (folder/'export_summary.json').is_file():
+                owner, kind = folder, 'dataset'
+            elif ownership.get('root') == str(root) and ownership.get('role') in (0, 1, 2):
+                owner, kind = folder, ('processed', 'dataset', 'workspace')[ownership['role']]
+            # Partially generated frame directories may predate the summaries.
+            relative = folder.relative_to(root)
+            if len(relative.parts) == 1 and folder.name.startswith(('processed', 'colmap_workspace', 'reconstruction_dataset')):
+                owner = folder
+                kind = 'workspace' if folder.name.startswith('colmap_workspace') else 'processed' if folder.name.startswith('processed') else 'dataset'
+            for path in folder.iterdir():
+                if intersects(path, protected) and not path.is_dir():
+                    continue
+                checked_path(root, path)
+                if path.is_dir():
+                    walk(path, owner, kind, archive)
+                    continue
+                suffix, name = path.suffix.lower(), path.name.lower()
+                if name.startswith('.') or suffix in CODE_SUFFIXES or name in FINAL_NAMES or suffix in {'.mov', '.mp4', '.mkv', '.avi', '.m4v', '.webm', '.sess', '.dat', '.pt', '.pth', '.onnx', '.safetensors'}:
+                    continue
+                rel = path.relative_to(owner)
+                model_text = name in MODEL_FILES and any(part.lower().startswith('sparse') or part.lower() in ('model', 'models') for part in rel.parts[:-1])
+                temporary = suffix in TEMP_SUFFIXES or name.startswith('database.db-') or model_text
+                # All non-final PLY layers in generated runs are intermediate.
+                temporary |= suffix == '.ply'
+                if not archive:
+                    temporary |= suffix in IMAGES or suffix == '.csv'
+                    temporary |= name in {'image_list.txt', 'match_pairs.txt', 'match_pairs_route.txt', 'match_pairs_unfiltered.txt'}
+                    temporary |= kind == 'workspace' and suffix == '.cfg'
+                if temporary:
+                    info = path.stat()
+                    targets.append({'path': str(path.relative_to(root)), 'owner': str(owner.relative_to(root)),
+                                    'kind': 'generated_intermediate', 'logical_bytes': info.st_size,
+                                    'mtime_ns': info.st_mtime_ns, 'files': 1})
         except (OSError, ValueError) as exc:
             skipped.append({'path': str(folder), 'reason': str(exc)})
-    for workspace in workspaces:
-        for name in ('depth_maps', 'normal_maps', 'consistency_graphs'):
-            add(workspace/'dense/stereo'/name, workspace, 'recomputable_stereo', lambda p: p.suffix == '.bin')
-        # Original workspace images are deliberately retained, including old photos
-        # whose original capture may no longer exist elsewhere.
-        if (workspace/'images').is_dir() and (workspace/'dense/sparse').is_dir():
-            add(workspace/'dense/images', workspace, 'undistorted_image_copies', lambda p: p.suffix.lower() in IMAGES)
-        snapshots = workspace/'sparse_snapshots'
-        if snapshots.is_dir():
-            try:
-                files = files_in(root, snapshots)
-                models = {p.parent for p in files if p.name == 'images.bin' and
-                          all((p.parent/name).is_file() for name in ('cameras.bin', 'points3D.bin'))}
-                ordered = sorted(models, key=lambda p: ((p/'images.bin').stat().st_mtime_ns, str(p)), reverse=True)
-                for model in ordered[2:]:
-                    add(model, workspace, 'old_sparse_snapshot', lambda p: p.name in MODEL_FILES)
-            except (OSError, ValueError) as exc:
-                skipped.append({'path': str(snapshots), 'reason': str(exc)})
-    for folder in processed:
-        summary = read_json(folder/'video_frames_summary.json')
-        captures = [root/row['video'] for row in summary.get('videos', []) if isinstance(row, dict) and row.get('video')]
-        if not captures or not all(path.is_file() for path in captures):
+
+    for scope in sorted(set(scopes)):
+        if not scope.is_dir():
             continue
-        for name in ('video_frames', 'video_refinement', 'video_restoration'):
-            # Reports/configs must survive; remove only directories containing
-            # pure frame data, recursing past mixed report/frame directories.
-            base = folder/name
-            if not base.is_dir():
-                continue
-            try:
-                files = files_in(root, base)
-                image_parents = {p.parent for p in files if p.suffix.lower() in IMAGES}
-                for parent in sorted(image_parents):
-                    if not any(parent.is_relative_to(root/t['path']) for t in targets):
-                        add(parent, folder, 'reextractable_video_frames', lambda p: p.suffix.lower() in IMAGES)
-            except (OSError, ValueError) as exc:
-                skipped.append({'path': str(base), 'reason': str(exc)})
+        walk(scope, scope, 'diagnostic')
     return targets, skipped
 
 
 def cleanup_project(root, *, protected=(), apply=True):
     root = Path(root).resolve()
     protected = [Path(p).absolute() for p in protected]
-    # Keep the most recent/default workspace resumable, including failed runs.
-    protected += [root/'generated'/name for name in ('colmap_workspace', 'processed', 'reconstruction_dataset', 'results')]
     protected += [root/name for name in ('.git', '.venv', 'VideoScene', 'video', 'pic', 'colmap-x64-windows-cuda')]
     before = shutil.disk_usage(root).free
     result = {'timestamp_utc': datetime.now(timezone.utc).isoformat(), 'status': 'planned',
-              'scope': 'historical_caches_only',
-              'note': 'Selected run outputs are reset separately and are not counted in this report. Result archives are retained.',
+              'scope': 'other_generated_intermediates',
+              'note': 'Selected run outputs are reset separately. Final PLY/meshes, reports, code, captures and lock inodes are retained.',
               'removed_logical_bytes': 0, 'removed_files': 0, 'removed': [], 'protected': list(map(str, protected))}
+    print('[cleanup] Scanning generated intermediate data...', flush=True)
     targets, skipped = cleanup_plan(root, protected)
     result.update(targets=targets, skipped=skipped, candidate_logical_bytes=sum(t['logical_bytes'] for t in targets))
     if apply:
+        print(f"[cleanup] Found {len(targets):,} candidate files "
+              f"({format_bytes(result['candidate_logical_bytes'])} logical size); active owners will be skipped.", flush=True)
         try:
-            with workspace_lock(root/'generated/.storage_cleanup'), ExitStack() as locks:
-                for owner in sorted({t['owner'] for t in targets}):
-                    locks.enter_context(workspace_lock(checked_path(root, root/owner)))
-                # Rebuild under all owner locks; do not delete a stale plan.
-                refreshed, _ = cleanup_plan(root, protected)
-                if refreshed != targets:
-                    raise ValueError('Cleanup candidates changed; retry after writers stop')
+            with workspace_lock(root/'generated/.storage_cleanup'):
+                grouped = {}
                 for item in targets:
-                    target = checked_path(root, root/item['path'])
-                    if intersects(target, protected):
-                        raise ValueError('Cleanup target overlaps protected data')
-                    files_in(root, target)
-                    shutil.rmtree(target)
-                    result['removed'].append(item['path'])
-                    result['removed_logical_bytes'] += item['logical_bytes']
-                    result['removed_files'] += item['files']
-                result['status'] = 'completed'
+                    grouped.setdefault(item['owner'], []).append(item)
+                for relative_owner, items in sorted(grouped.items()):
+                    owner = root/relative_owner
+                    try:
+                        checked_path(root, owner)
+                        with ExitStack() as locks:
+                            dependencies = {owner}
+                            ownership = read_json(owner/'.main_output_owner.json')
+                            if ownership.get('root') == str(root) and ownership.get('workspace'):
+                                dependencies.add(checked_path(root, Path(ownership['workspace'])))
+                            for item in items:
+                                target = checked_path(root, root/item['path'])
+                                for parent in target.parents:
+                                    if parent == root:
+                                        break
+                                    if (parent/'.pipeline.lock').exists():
+                                        dependencies.add(parent)
+                            for dependency in sorted(dependencies):
+                                locks.enter_context(workspace_lock(dependency))
+                            # Validate the complete owner group after acquiring
+                            # every relevant lock, before deleting its first file.
+                            for item in items:
+                                target = checked_path(root, root/item['path'])
+                                info = target.stat()
+                                if intersects(target, protected) or not target.is_file() or (info.st_size, info.st_mtime_ns) != (item['logical_bytes'], item['mtime_ns']):
+                                    raise ValueError(f'Intermediate changed during cleanup planning: {target}')
+                            empty = set()
+                            for item in items:
+                                target = checked_path(root, root/item['path'])
+                                target.unlink()
+                                result['removed'].append(item['path'])
+                                result['removed_logical_bytes'] += item['logical_bytes']
+                                result['removed_files'] += 1
+                                for parent in target.parents:
+                                    if parent == owner:
+                                        break
+                                    empty.add(parent)
+                            for folder in sorted(empty, key=lambda p: len(p.parts), reverse=True):
+                                try:
+                                    checked_path(root, folder).rmdir()  # Empty only; never remove lock inodes.
+                                except OSError:
+                                    pass
+                    except (OSError, ValueError, WorkspaceBusyError) as exc:
+                        result['skipped'].append({'path': str(owner), 'reason': str(exc)})
+                result['status'] = 'completed' if not result['skipped'] else 'partial' if result['removed'] else 'deferred'
         except (OSError, ValueError, WorkspaceBusyError) as exc:
             result.update(status='deferred' if not result['removed'] else 'partial', error=str(exc))
     result['free_bytes_after'] = shutil.disk_usage(root).free
     result['observed_free_bytes_increase'] = result['free_bytes_after']-before
     if not targets:
-        print('[cleanup] Historical caches: no eligible files found.', flush=True)
+        print('[cleanup] Other generated intermediates: no eligible files found.', flush=True)
     else:
         size = result['removed_logical_bytes'] if apply else result['candidate_logical_bytes']
         count = result['removed_files'] if apply else sum(item['files'] for item in targets)
-        print(f"[cleanup] Historical caches: {'removed' if apply else 'eligible'} {count:,} files "
+        print(f"[cleanup] Other generated intermediates: {'removed' if apply else 'eligible'} {count:,} files "
               f"({format_bytes(size)} logical size); status={result['status']}.", flush=True)
-    print(f"[cleanup] This pass excludes selected run outputs and saved results. "
+    print(f"[cleanup] Selected outputs are reset next; final results and reports are retained. "
           f"Disk free space: {format_bytes(result['free_bytes_after'])}.", flush=True)
+    if result['skipped']:
+        print(f"[cleanup] Preserved {len(result['skipped'])} busy, changed or inaccessible path(s); see cleanup report.", flush=True)
     if result.get('error'):
         print(f"[cleanup] {result['error']}", flush=True)
     if apply:
@@ -193,23 +219,46 @@ def cleanup_project(root, *, protected=(), apply=True):
     return result
 
 
+def record_startup_cleanup(root, other, selected):
+    """Report both cleanup phases together, without equating logical and disk bytes."""
+    other = other or {'status': 'disabled', 'removed_files': 0, 'removed_logical_bytes': 0}
+    result = {
+        'timestamp_utc': datetime.now(timezone.utc).isoformat(),
+        'scope': 'startup_cleanup',
+        'status': 'completed' if other['status'] in ('completed', 'disabled') else 'partial',
+        'other_outputs': other, 'selected_outputs': selected,
+        'removed_files': other['removed_files'] + selected['removed_files'],
+        'removed_logical_bytes': other['removed_logical_bytes'] + selected['removed_logical_bytes'],
+        'free_bytes_after': selected['free_bytes_after'],
+        'note': 'Logical sizes count deleted paths, not physical space reclaimed. Final results, reports and active runs are retained.',
+    }
+    print(f"[cleanup] Startup total: removed {result['removed_files']:,} files "
+          f"({format_bytes(result['removed_logical_bytes'])} logical size); "
+          f"free now: {format_bytes(result['free_bytes_after'])}; status={result['status']}.", flush=True)
+    try:
+        write_provenance(Path(root)/'generated/startup_cleanup_report.json', result)
+    except OSError as exc:
+        print(f'[cleanup] Cannot write combined cleanup report: {exc}', flush=True)
+    return result
+
+
 def archive_results(root, workspace):
     """Keep PLY outputs and their interpretation before an authorized fresh run."""
     root, workspace = Path(root).resolve(), Path(workspace).resolve()
-    outputs = [p for p in files_in(root, workspace) if p.suffix.lower() == '.ply']
+    files = files_in(root, workspace)
+    outputs = [p for p in files if p.name.lower() in FINAL_NAMES]
     if not outputs:
         return None
     destination = checked_path(root, root/'generated/results'/
                                (workspace.name+'_'+datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')+'_'+uuid.uuid4().hex[:8]))
-    # Hard links preserve large final clouds on this same volume without a second
-    # allocation. Retain logs, metrics, metadata and camera models as context.
-    context = [p for p in files_in(root, workspace) if p.suffix.lower() in {'.json', '.csv', '.log', '.md', '.vis'}
-               or (p.name in MODEL_FILES and 'sparse_snapshots' not in p.parts)]
+    # Retain final deliverables and readable context, not raw fusion, evidence
+    # layers, visibility arrays or sparse trial models that keep caches alive.
+    context = [p for p in files if p.suffix.lower() in {'.json', '.csv', '.log', '.md'}]
     destination.mkdir(parents=True)
     for source in sorted(set(outputs+context)):
         target = checked_path(root, destination/source.relative_to(workspace))
         target.parent.mkdir(parents=True, exist_ok=True)
-        if source in outputs or source.name in MODEL_FILES or source.suffix == '.vis':
+        if source in outputs:
             try:
                 target.hardlink_to(source)
                 continue
